@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Environment / credentials
+.venv/
+.env
+credentials.json
+token.json
+
+# Runtime state
+agent_state.db
+logs/
+sandbox/
+
+# Temporary
+.tmp/
+.pip-audit-cache/
+*.diff

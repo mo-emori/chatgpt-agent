@@ -1,5 +1,8 @@
+import json
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -17,6 +20,14 @@ def make_job():
         callback_type="chatgpt_browser",
         callback_url="https://example.invalid/callback",
     )
+
+
+def parse_slack_payload(message):
+    prefix = "```json\n"
+    suffix = "\n```"
+    assert message.startswith(prefix)
+    assert message.endswith(suffix)
+    return json.loads(message[len(prefix):-len(suffix)])
 
 
 class ExecuteJobRefactorTests(unittest.TestCase):
@@ -81,6 +92,287 @@ class ExecuteJobRefactorTests(unittest.TestCase):
         dispatch.assert_called_once_with(job.workspace, say)
 
     @patch.object(agent_worker, "dispatch_next_queued")
+    @patch.object(agent_worker, "notify_chatgpt")
+    @patch.object(agent_worker.state_store, "mark_completed")
+    @patch.object(agent_worker, "run_agent")
+    @patch.object(agent_worker, "prepare_execution")
+    def test_bridge_error_publishes_before_failed_callback_and_saves_final_snapshot(
+        self,
+        prepare,
+        run_agent,
+        mark_completed,
+        notify,
+        dispatch,
+    ):
+        job = make_job()
+        events = []
+        slack_messages = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir)
+            prepare.return_value = ({}, "workdir", log_dir, {"head": "before"})
+            run_agent.side_effect = RuntimeError("bridge exploded")
+            notify.side_effect = lambda **kwargs: (
+                events.append("callback")
+                or (_ for _ in ()).throw(
+                    agent_worker.BrowserNotifyError("callback unavailable")
+                )
+            )
+
+            def say(message):
+                events.append("slack")
+                slack_messages.append(message)
+
+            agent_worker.execute_job(job, say)
+
+            local_result = json.loads(
+                (log_dir / "result.json").read_text(encoding="utf-8")
+            )
+
+        expected_slack = {
+            "protocol_version": "1",
+            "job_id": "JOB-001",
+            "actor": "claude",
+            "mode": "review",
+            "workspace": "argus",
+            "prompt_sha256": "a" * 64,
+            "status": "BRIDGE_ERROR",
+            "failure_class": "BRIDGE_ERROR",
+            "error_summary": "bridge exploded",
+        }
+        self.assertEqual(events, ["slack", "callback"])
+        self.assertEqual(parse_slack_payload(slack_messages[0]), expected_slack)
+        self.assertEqual(
+            local_result,
+            {
+                **expected_slack,
+                "callback": {
+                    "type": "chatgpt_browser",
+                    "status": "FAILED",
+                    "error": "callback unavailable",
+                    "url": job.callback_url,
+                },
+            },
+        )
+        mark_completed.assert_called_once_with(
+            job.job_id,
+            status="FAILED",
+            failure_class="BRIDGE_ERROR",
+        )
+        dispatch.assert_called_once_with(job.workspace, say)
+
+    @patch.object(agent_worker, "dispatch_next_queued")
+    @patch.object(agent_worker, "notify_chatgpt")
+    @patch.object(agent_worker.state_store, "mark_completed")
+    @patch.object(agent_worker, "collect_execution_evidence")
+    @patch.object(agent_worker, "run_agent")
+    @patch.object(agent_worker, "prepare_execution")
+    def test_actor_failure_keeps_git_evidence_and_isolates_callback_failure(
+        self,
+        prepare,
+        run_agent,
+        collect_evidence,
+        mark_completed,
+        notify,
+        dispatch,
+    ):
+        job = make_job()
+        before = {"head": "abc123"}
+        after = {"head": "def456"}
+        actor_result = SimpleNamespace(
+            returncode=17,
+            stdout="actor output",
+            stderr="actor error",
+        )
+        events = []
+        slack_messages = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir)
+            prepare.return_value = (
+                {"artifact_roots": ["artifacts"]},
+                "workdir",
+                log_dir,
+                before,
+            )
+            run_agent.return_value = actor_result
+            collect_evidence.return_value = (
+                after,
+                ["agent_worker.py", "tests/test_agent_worker_refactor.py"],
+            )
+            notify.side_effect = lambda **kwargs: (
+                events.append("callback")
+                or (_ for _ in ()).throw(
+                    agent_worker.BrowserNotifyError("browser offline")
+                )
+            )
+
+            def say(message):
+                events.append("slack")
+                slack_messages.append(message)
+
+            agent_worker.execute_job(job, say)
+            local_result = json.loads(
+                (log_dir / "result.json").read_text(encoding="utf-8")
+            )
+
+        expected_slack = {
+            "protocol_version": "1",
+            "job_id": "JOB-001",
+            "actor": "claude",
+            "mode": "review",
+            "workspace": "argus",
+            "prompt_sha256": "a" * 64,
+            "status": "FAILED",
+            "exit_code": 17,
+            "failure_class": "ACTOR_FAILED",
+            "error_summary": "actor error",
+            "git": {
+                "baseline_commit": "abc123",
+                "head_after": "def456",
+                "changed_paths": [
+                    "agent_worker.py",
+                    "tests/test_agent_worker_refactor.py",
+                ],
+            },
+        }
+        self.assertEqual(events, ["slack", "callback"])
+        self.assertEqual(parse_slack_payload(slack_messages[0]), expected_slack)
+        self.assertNotIn("callback", expected_slack)
+        self.assertEqual(
+            local_result,
+            {
+                **expected_slack,
+                "callback": {
+                    "type": "chatgpt_browser",
+                    "status": "FAILED",
+                    "error": "browser offline",
+                    "url": job.callback_url,
+                },
+            },
+        )
+        collect_evidence.assert_called_once_with(
+            actor_result,
+            workdir="workdir",
+            log_dir=log_dir,
+            before=before,
+        )
+        mark_completed.assert_called_once_with(
+            job.job_id,
+            status="FAILED",
+            exit_code=17,
+            failure_class="ACTOR_FAILED",
+        )
+        dispatch.assert_called_once_with(job.workspace, say)
+
+    @patch.object(agent_worker, "dispatch_next_queued")
+    @patch.object(agent_worker, "notify_chatgpt")
+    @patch.object(agent_worker.state_store, "mark_completed")
+    @patch.object(agent_worker, "process_artifacts")
+    @patch.object(agent_worker, "collect_execution_evidence")
+    @patch.object(agent_worker, "run_agent")
+    @patch.object(agent_worker, "prepare_execution")
+    def test_success_slack_and_local_result_snapshots_keep_all_status_domains(
+        self,
+        prepare,
+        run_agent,
+        collect_evidence,
+        process_artifacts,
+        mark_completed,
+        notify,
+        dispatch,
+    ):
+        job = make_job()
+        before = {"head": "base"}
+        after = {"head": "head"}
+        actor_result = SimpleNamespace(returncode=0, stdout="output", stderr="")
+        events = []
+        slack_messages = []
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            log_dir = Path(temp_dir)
+            prepare.return_value = (
+                {"artifact_roots": ["artifacts"]},
+                "workdir",
+                log_dir,
+                before,
+            )
+            run_agent.return_value = actor_result
+            collect_evidence.return_value = (after, ["artifacts/report.txt"])
+            process_artifacts.return_value = (
+                "completed with one rejection",
+                "PARTIAL_FAILURE",
+                [{
+                    "name": "report.txt",
+                    "source_path": "artifacts/report.txt",
+                    "drive_file_id": "drive-1",
+                }],
+                [{"path": "notes.txt", "reason": "outside allowed roots"}],
+            )
+
+            def notify_callback(**kwargs):
+                events.append("callback")
+
+            notify.side_effect = notify_callback
+
+            def say(message):
+                events.append("slack")
+                slack_messages.append(message)
+
+            agent_worker.execute_job(job, say)
+            local_result = json.loads(
+                (log_dir / "result.json").read_text(encoding="utf-8")
+            )
+
+        expected_slack = {
+            "protocol_version": "1",
+            "job_id": "JOB-001",
+            "actor": "claude",
+            "mode": "review",
+            "workspace": "argus",
+            "prompt_sha256": "a" * 64,
+            "status": "DONE",
+            "exit_code": 0,
+            "summary": "completed with one rejection",
+            "git": {
+                "baseline_commit": "base",
+                "head_after": "head",
+                "changed_paths": ["artifacts/report.txt"],
+            },
+            "artifact_status": "PARTIAL_FAILURE",
+            "artifacts": [{
+                "name": "report.txt",
+                "source_path": "artifacts/report.txt",
+                "drive_file_id": "drive-1",
+            }],
+            "rejected_artifacts": [{
+                "path": "notes.txt",
+                "reason": "outside allowed roots",
+            }],
+        }
+        self.assertEqual(events, ["slack", "callback"])
+        self.assertEqual(parse_slack_payload(slack_messages[0]), expected_slack)
+        self.assertNotIn("callback", expected_slack)
+        self.assertEqual(
+            local_result,
+            {
+                **expected_slack,
+                "callback": {
+                    "type": "chatgpt_browser",
+                    "status": "DONE",
+                    "url": job.callback_url,
+                },
+            },
+        )
+        mark_completed.assert_called_once_with(
+            job.job_id,
+            status="DONE",
+            exit_code=0,
+            failure_class="ARTIFACT_ERROR",
+        )
+        dispatch.assert_called_once_with(job.workspace, say)
+
+    @patch.object(agent_worker, "dispatch_next_queued")
     @patch.object(agent_worker, "handle_execution_failure")
     @patch.object(agent_worker, "run_agent")
     @patch.object(agent_worker, "prepare_execution")
@@ -137,6 +429,125 @@ class PublicationOrderTests(unittest.TestCase):
         )
 
         self.assertEqual(events, ["save", "slack", "callback", "save"])
+
+
+class ProcessArtifactsTests(unittest.TestCase):
+    def make_manifest(self, summary, artifacts):
+        return (
+            "actor output\n<AGENT_RESULT>\n"
+            + json.dumps({"summary": summary, "artifacts": artifacts})
+            + "\n</AGENT_RESULT>"
+        )
+
+    @patch.object(agent_worker, "upload_artifacts")
+    def test_valid_artifact_is_uploaded_and_preserved(self, upload):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact = root / "artifacts" / "report.txt"
+            artifact.parent.mkdir()
+            artifact.write_text("report", encoding="utf-8")
+            upload.return_value = [{
+                "name": "report.txt",
+                "drive_file_id": "drive-1",
+            }]
+            result = SimpleNamespace(
+                stdout=self.make_manifest("complete", ["artifacts/report.txt"])
+            )
+
+            actual = agent_worker.process_artifacts(
+                make_job(), result, {"artifact_roots": ["artifacts"]}, root
+            )
+
+        self.assertEqual(actual, (
+            "complete",
+            "DONE",
+            [{
+                "name": "report.txt",
+                "source_path": "artifacts/report.txt",
+                "drive_file_id": "drive-1",
+            }],
+            [],
+        ))
+        upload.assert_called_once_with("JOB-001", [artifact.resolve()])
+
+    @patch.object(agent_worker, "upload_artifacts")
+    def test_rejected_artifact_reports_failed_without_upload(self, upload):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            result = SimpleNamespace(
+                stdout=self.make_manifest("invalid", ["outside/report.txt"])
+            )
+            actual = agent_worker.process_artifacts(
+                make_job(), result, {"artifact_roots": ["artifacts"]}, root
+            )
+
+        self.assertEqual(actual[0:3], ("invalid", "FAILED", []))
+        self.assertEqual(actual[3][0]["path"], "outside/report.txt")
+        self.assertIn("outside allowed roots", actual[3][0]["reason"])
+        upload.assert_not_called()
+
+    @patch.object(agent_worker, "upload_artifacts")
+    def test_multiple_artifacts_keep_manifest_order(self, upload):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            paths = ["artifacts/first.txt", "artifacts/second.txt"]
+            for relative_path in paths:
+                path = root / relative_path
+                path.parent.mkdir(exist_ok=True)
+                path.write_text(relative_path, encoding="utf-8")
+            upload.return_value = [
+                {"name": "first.txt", "drive_file_id": "drive-1"},
+                {"name": "second.txt", "drive_file_id": "drive-2"},
+            ]
+            result = SimpleNamespace(
+                stdout=self.make_manifest("two files", paths)
+            )
+            actual = agent_worker.process_artifacts(
+                make_job(), result, {"artifact_roots": ["artifacts"]}, root
+            )
+
+        self.assertEqual(actual, (
+            "two files",
+            "DONE",
+            [
+                {
+                    "name": "first.txt",
+                    "source_path": "artifacts/first.txt",
+                    "drive_file_id": "drive-1",
+                },
+                {
+                    "name": "second.txt",
+                    "source_path": "artifacts/second.txt",
+                    "drive_file_id": "drive-2",
+                },
+            ],
+            [],
+        ))
+
+    @patch.object(agent_worker, "upload_artifacts")
+    def test_drive_upload_failure_stays_in_artifact_status_domain(self, upload):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            artifact = root / "artifacts" / "report.txt"
+            artifact.parent.mkdir()
+            artifact.write_text("report", encoding="utf-8")
+            upload.side_effect = RuntimeError("Drive unavailable")
+            result = SimpleNamespace(
+                stdout=self.make_manifest("complete", ["artifacts/report.txt"])
+            )
+            actual = agent_worker.process_artifacts(
+                make_job(), result, {"artifact_roots": ["artifacts"]}, root
+            )
+
+        self.assertEqual(actual, (
+            "complete",
+            "FAILED",
+            [],
+            [{
+                "path": None,
+                "reason": "Artifact processing error: Drive unavailable",
+            }],
+        ))
 
 
 if __name__ == "__main__":

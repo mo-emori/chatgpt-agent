@@ -236,53 +236,30 @@ def dispatch_next_queued(workspace, say):
     ).start()
 
 
-def execute_job(job, say):
-    status = "RUNNING"
-    exit_code = None
-
-    workspace = WORKSPACES[
-        job.workspace
-    ]
+def prepare_execution(job):
+    workspace = WORKSPACES[job.workspace]
     workdir = workspace["path"]
-
-    log_dir = create_job_log(
-        job.job_id
-    )
+    log_dir = create_job_log(job.job_id)
 
     save_json(
         log_dir,
         "request.json",
         {
-            "protocol_version":
-                job.protocol_version,
-            "job_id":
-                job.job_id,
-            "actor":
-                job.actor,
-            "mode":
-                job.mode,
-            "workspace":
-                job.workspace,
-            "prompt_sha256":
-                job.prompt_sha256,
+            "protocol_version": job.protocol_version,
+            "job_id": job.job_id,
+            "actor": job.actor,
+            "mode": job.mode,
+            "workspace": job.workspace,
+            "prompt_sha256": job.prompt_sha256,
             "callback": {
-                "type":
-                    job.callback_type,
-                "url":
-                    job.callback_url,
+                "type": job.callback_type,
+                "url": job.callback_url,
             },
         },
     )
 
-    before = get_git_snapshot(
-        workdir
-    )
-
-    save_git_snapshot(
-        log_dir,
-        "before",
-        before,
-    )
+    before = get_git_snapshot(workdir)
+    save_git_snapshot(log_dir, "before", before)
 
     print()
     print("==============================")
@@ -294,38 +271,204 @@ def execute_job(job, say):
     print("baseline :", before["head"])
     print("==============================")
 
+    return workspace, workdir, log_dir, before
+
+
+def collect_execution_evidence(
+    result,
+    *,
+    workdir,
+    log_dir,
+    before,
+):
+    save_text(log_dir, "stdout.txt", result.stdout)
+    save_text(log_dir, "stderr.txt", result.stderr)
+
+    after = get_git_snapshot(workdir)
+    save_git_snapshot(log_dir, "after", after)
+
+    return after, get_changed_paths(before, after)
+
+
+def process_artifacts(job, result, workspace, workdir):
+    artifact_status = "DONE"
+    artifacts = []
+    rejected_artifacts = []
+    agent_summary = result.stdout.strip()
+
+    try:
+        agent_result = parse_agent_result(result.stdout)
+        agent_summary = agent_result.summary
+        validated = []
+
+        for raw_path in agent_result.artifacts:
+            try:
+                path = validate_artifact_path(
+                    raw_path,
+                    workspace_root=workdir,
+                    artifact_roots=workspace["artifact_roots"],
+                )
+                validated.append((raw_path, path))
+            except ArtifactPathError as e:
+                rejected_artifacts.append({
+                    "path": raw_path,
+                    "reason": str(e),
+                })
+
+        # Validate every path before uploading the allowed artifacts.
+        if validated:
+            uploaded = upload_artifacts(
+                job.job_id,
+                [path for _, path in validated],
+            )
+            for (source_path, _), drive_item in zip(
+                validated,
+                uploaded,
+                strict=True,
+            ):
+                artifacts.append({
+                    "name": drive_item["name"],
+                    "source_path": source_path,
+                    "drive_file_id": drive_item["drive_file_id"],
+                })
+
+        if rejected_artifacts:
+            artifact_status = (
+                "PARTIAL_FAILURE" if artifacts else "FAILED"
+            )
+    except ManifestError as e:
+        artifact_status = "FAILED"
+        rejected_artifacts.append({
+            "path": None,
+            "reason": f"Manifest error: {e}",
+        })
+    except Exception as e:
+        # Artifact transport failure must not change execution status.
+        artifact_status = "FAILED"
+        rejected_artifacts.append({
+            "path": None,
+            "reason": f"Artifact processing error: {e}",
+        })
+
+    return (
+        agent_summary,
+        artifact_status,
+        artifacts,
+        rejected_artifacts,
+    )
+
+
+def build_result(
+    job,
+    *,
+    status,
+    failure_class=None,
+    exit_code=None,
+    error_summary=None,
+    execution_evidence=None,
+    artifact_result=None,
+):
+    response = {
+        "protocol_version": job.protocol_version,
+        "job_id": job.job_id,
+        "actor": job.actor,
+        "mode": job.mode,
+        "workspace": job.workspace,
+        "prompt_sha256": job.prompt_sha256,
+        "status": status,
+    }
+    if exit_code is not None:
+        response["exit_code"] = exit_code
+    if failure_class is not None:
+        response["failure_class"] = failure_class
+    if error_summary is not None:
+        response["error_summary"] = error_summary
+    if artifact_result is not None:
+        summary, artifact_status, artifacts, rejected = artifact_result
+        response["summary"] = summary
+    if execution_evidence is not None:
+        before, after, changed_paths = execution_evidence
+        response["git"] = {
+            "baseline_commit": before["head"],
+            "head_after": after["head"],
+            "changed_paths": changed_paths,
+        }
+    if artifact_result is not None:
+        response.update({
+            "artifact_status": artifact_status,
+            "artifacts": artifacts,
+            "rejected_artifacts": rejected,
+        })
+    return response
+
+
+def publish_slack_result(log_dir, say, response):
+    save_json(log_dir, "result.json", response)
+    send_json(say, response)
+
+
+def finalize_browser_callback(
+    job,
+    log_dir,
+    response,
+    *,
+    status,
+    artifact_status,
+):
+    response["callback"] = send_browser_callback(
+        job,
+        status=status,
+        artifact_status=artifact_status,
+    )
+    save_json(log_dir, "result.json", response)
+
+
+def handle_execution_failure(
+    job,
+    say,
+    log_dir,
+    *,
+    failure_class,
+    response_status,
+    artifact_status,
+    error_summary=None,
+):
+    state_store.mark_completed(
+        job.job_id,
+        status="FAILED",
+        failure_class=failure_class,
+    )
+    response = build_result(
+        job,
+        status=response_status,
+        failure_class=failure_class,
+        error_summary=error_summary,
+    )
+    publish_slack_result(log_dir, say, response)
+    finalize_browser_callback(
+        job,
+        log_dir,
+        response,
+        status=response_status,
+        artifact_status=artifact_status,
+    )
+
+
+def execute_job(job, say):
+    status = "RUNNING"
+    exit_code = None
+    workspace, workdir, log_dir, before = prepare_execution(job)
+
     try:
         result = run_agent(job)
 
         exit_code = result.returncode
 
-        # Raw Agent outputはArtifact処理の成否に
-        # 関係なく必ずローカル保存する。
-        save_text(
-            log_dir,
-            "stdout.txt",
-            result.stdout,
-        )
-
-        save_text(
-            log_dir,
-            "stderr.txt",
-            result.stderr,
-        )
-
-        after = get_git_snapshot(
-            workdir
-        )
-
-        save_git_snapshot(
-            log_dir,
-            "after",
-            after,
-        )
-
-        changed_paths = get_changed_paths(
-            before,
-            after,
+        after, changed_paths = collect_execution_evidence(
+            result,
+            workdir=workdir,
+            log_dir=log_dir,
+            before=before,
         )
 
         # -------------------------
@@ -342,68 +485,26 @@ def execute_job(job, say):
                 failure_class="ACTOR_FAILED",
             )
 
-            error = (
+            error_summary = (
                 result.stderr.strip()
                 or result.stdout.strip()
                 or "Actor failed"
+            )[-4000:]
+            response = build_result(
+                job,
+                status="FAILED",
+                failure_class="ACTOR_FAILED",
+                exit_code=result.returncode,
+                error_summary=error_summary,
+                execution_evidence=(before, after, changed_paths),
             )
-
-            response = {
-                "protocol_version":
-                    job.protocol_version,
-                "job_id": job.job_id,
-                "actor": job.actor,
-                "mode": job.mode,
-                "workspace": job.workspace,
-                "prompt_sha256": job.prompt_sha256,
-                "status": "FAILED",
-                "exit_code":
-                    result.returncode,
-                "failure_class":
-                    "ACTOR_FAILED",
-                "error_summary":
-                    error[-4000:],
-                "git": {
-                    "baseline_commit":
-                        before["head"],
-                    "head_after":
-                        after["head"],
-                    "changed_paths":
-                        changed_paths,
-                },
-            }
-
-            # Authoritative Resultを先にSlackへ
-            save_json(
+            publish_slack_result(log_dir, say, response)
+            finalize_browser_callback(
+                job,
                 log_dir,
-                "result.json",
                 response,
-            )
-
-            send_json(
-                say,
-                response,
-            )
-
-            # その後ChatGPTをwake
-            callback_result = (
-                send_browser_callback(
-                    job,
-                    status="FAILED",
-                    artifact_status=
-                        "NOT_RUN",
-                )
-            )
-
-            response["callback"] = (
-                callback_result
-            )
-
-            # callback結果はLocal Evidenceへ追記
-            save_json(
-                log_dir,
-                "result.json",
-                response,
+                status="FAILED",
+                artifact_status="NOT_RUN",
             )
 
             return
@@ -414,129 +515,17 @@ def execute_job(job, say):
 
         status = "DONE"
 
-        artifact_status = "DONE"
-        artifacts = []
-        rejected_artifacts = []
-
-        agent_summary = (
-            result.stdout.strip()
+        (
+            agent_summary,
+            artifact_status,
+            artifacts,
+            rejected_artifacts,
+        ) = process_artifacts(
+            job,
+            result,
+            workspace,
+            workdir,
         )
-
-        try:
-            agent_result = (
-                parse_agent_result(
-                    result.stdout
-                )
-            )
-
-            agent_summary = (
-                agent_result.summary
-            )
-
-            validated = []
-
-            for raw_path in (
-                agent_result.artifacts
-            ):
-                try:
-                    path = (
-                        validate_artifact_path(
-                            raw_path,
-                            workspace_root=
-                                workdir,
-                            artifact_roots=
-                                workspace[
-                                    "artifact_roots"
-                                ],
-                        )
-                    )
-
-                    validated.append(
-                        (
-                            raw_path,
-                            path,
-                        )
-                    )
-
-                except ArtifactPathError as e:
-                    rejected_artifacts.append(
-                        {
-                            "path":
-                                raw_path,
-                            "reason":
-                                str(e),
-                        }
-                    )
-
-            # Validationを全件先に完了。
-            # 許可されたものだけupload。
-            if validated:
-                uploaded = (
-                    upload_artifacts(
-                        job.job_id,
-                        [
-                            path
-                            for _, path
-                            in validated
-                        ],
-                    )
-                )
-
-                for (
-                    (source_path, _),
-                    drive_item,
-                ) in zip(
-                    validated,
-                    uploaded,
-                    strict=True,
-                ):
-                    artifacts.append(
-                        {
-                            "name":
-                                drive_item[
-                                    "name"
-                                ],
-                            "source_path":
-                                source_path,
-                            "drive_file_id":
-                                drive_item[
-                                    "drive_file_id"
-                                ],
-                        }
-                    )
-
-            if rejected_artifacts:
-                artifact_status = (
-                    "PARTIAL_FAILURE"
-                    if artifacts
-                    else "FAILED"
-                )
-
-        except ManifestError as e:
-            # Agent自体は成功。
-            # Artifact Manifestだけ失敗。
-            artifact_status = "FAILED"
-
-            rejected_artifacts.append(
-                {
-                    "path": None,
-                    "reason":
-                        f"Manifest error: {e}",
-                }
-            )
-
-        except Exception as e:
-            # Drive等のArtifact後処理失敗。
-            # Actor実行結果はDONEのまま。
-            artifact_status = "FAILED"
-
-            rejected_artifacts.append(
-                {
-                    "path": None,
-                    "reason":
-                        f"Artifact processing error: {e}",
-                }
-            )
 
         state_store.mark_completed(
             job.job_id,
@@ -549,209 +538,50 @@ def execute_job(job, say):
             ),
         )
 
-        response = {
-            "protocol_version":
-                job.protocol_version,
-            "job_id":
-                job.job_id,
-            "actor":
-                job.actor,
-            "mode":
-                job.mode,
-            "workspace":
-                job.workspace,
-            "prompt_sha256":
-                job.prompt_sha256,
-
-            # Actor execution
-            "status":
-                "DONE",
-            "exit_code":
-                result.returncode,
-            "summary":
+        response = build_result(
+            job,
+            status="DONE",
+            exit_code=result.returncode,
+            execution_evidence=(before, after, changed_paths),
+            artifact_result=(
                 agent_summary,
-
-            # Git evidence
-            "git": {
-                "baseline_commit":
-                    before["head"],
-                "head_after":
-                    after["head"],
-                "changed_paths":
-                    changed_paths,
-            },
-
-            # Artifact transport
-            "artifact_status":
                 artifact_status,
-            "artifacts":
                 artifacts,
-            "rejected_artifacts":
                 rejected_artifacts,
-        }
-
-        # --------------------------------
-        # Slack Result
-        # --------------------------------
-        # Browser callbackより先に、
-        # authoritative resultをSlackへ送る。
-        save_json(
+            ),
+        )
+        publish_slack_result(log_dir, say, response)
+        finalize_browser_callback(
+            job,
             log_dir,
-            "result.json",
             response,
-        )
-
-        send_json(
-            say,
-            response,
-        )
-
-        # --------------------------------
-        # Browser Callback
-        # --------------------------------
-        # callback失敗はexecution/artifactの
-        # statusへ影響させない。
-        callback_result = (
-            send_browser_callback(
-                job,
-                status="DONE",
-                artifact_status=
-                    artifact_status,
-            )
-        )
-
-        # callback結果はLocal Evidenceへ追記。
-        response["callback"] = (
-            callback_result
-        )
-
-        save_json(
-            log_dir,
-            "result.json",
-            response,
+            status="DONE",
+            artifact_status=artifact_status,
         )
 
     except subprocess.TimeoutExpired:
         status = "FAILED"
 
-        state_store.mark_completed(
-            job.job_id,
-            status="FAILED",
-            failure_class="TIMEOUT",
-        )
-
-        response = {
-            "protocol_version":
-                job.protocol_version,
-            "job_id":
-                job.job_id,
-            "actor":
-                job.actor,
-            "mode":
-                job.mode,
-            "workspace":
-                job.workspace,
-            "prompt_sha256":
-                job.prompt_sha256,
-            "status":
-                "FAILED",
-            "failure_class":
-                "TIMEOUT",
-        }
-
-        # Slack Resultを先に確定。
-        save_json(
-            log_dir,
-            "result.json",
-            response,
-        )
-
-        send_json(
+        handle_execution_failure(
+            job,
             say,
-            response,
-        )
-
-        # その後ChatGPTをwake。
-        callback_result = (
-            send_browser_callback(
-                job,
-                status="FAILED",
-                artifact_status=
-                    "NOT_RUN",
-            )
-        )
-
-        response["callback"] = (
-            callback_result
-        )
-
-        save_json(
             log_dir,
-            "result.json",
-            response,
+            failure_class="TIMEOUT",
+            response_status="FAILED",
+            artifact_status="NOT_RUN",
         )
 
     except Exception as e:
         status = "FAILED"
 
-        state_store.mark_completed(
-            job.job_id,
-            status="FAILED",
-            failure_class="BRIDGE_ERROR",
-        )
-
-        response = {
-            "protocol_version":
-                job.protocol_version,
-            "job_id":
-                job.job_id,
-            "actor":
-                job.actor,
-            "mode":
-                job.mode,
-            "workspace":
-                job.workspace,
-            "prompt_sha256":
-                job.prompt_sha256,
-            "status":
-                "BRIDGE_ERROR",
-            "failure_class":
-                "BRIDGE_ERROR",
-            "error_summary":
-                str(e)[:4000],
-        }
-
-        # Slack Resultを先に確定。
-        save_json(
-            log_dir,
-            "result.json",
-            response,
-        )
-
-        send_json(
+        handle_execution_failure(
+            job,
             say,
-            response,
-        )
-
-        # execute_job()まで到達したJOBなので、
-        # callbackがあれば失敗通知する。
-        callback_result = (
-            send_browser_callback(
-                job,
-                status="BRIDGE_ERROR",
-                artifact_status=
-                    "UNKNOWN",
-            )
-        )
-
-        response["callback"] = (
-            callback_result
-        )
-
-        save_json(
             log_dir,
-            "result.json",
-            response,
+            failure_class="BRIDGE_ERROR",
+            response_status="BRIDGE_ERROR",
+            artifact_status="UNKNOWN",
+            error_summary=str(e)[:4000],
         )
 
         print(

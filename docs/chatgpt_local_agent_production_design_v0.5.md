@@ -1,10 +1,10 @@
-# ChatGPT Local Agent 本番設計 v0.4.1
+# ChatGPT Local Agent 本番設計 v0.5
 
 ``` text
 Document Role: PRODUCTION_DESIGN
-Version: 0.4.1
+Version: 0.5
 Status: IMPLEMENTED_BASELINE
-Supersedes: ChatGPT Local Agent 本番設計 v0.4
+Supersedes: ChatGPT Local Agent 本番設計 v0.4.1
 ```
 
 ## 1. 目的
@@ -87,12 +87,15 @@ approval境界を設計する。
 
 ## 4. JOB Protocol
 
-v0.4標準JOBはPrompt Provenanceとoptional Browser Callbackを持つ。
+v0.5標準JOB Protocolは `protocol_version=2` とする。
 
-``` json
+PromptはSlackによる本文変形を回避するためBase64でtransportする。
+ChatGPTはPrompt SHA-256を生成しない。
+
+```json
 {
-  "protocol_version": "1",
-  "job_id": "ARGUS-P-0114-v1",
+  "protocol_version": "2",
+  "job_id": "ARGUS-P-0114-v2",
   "actor": "codex",
   "mode": "implementation",
   "workspace": "argus",
@@ -101,23 +104,31 @@ v0.4標準JOBはPrompt Provenanceとoptional Browser Callbackを持つ。
     "url": "https://chatgpt.com/c/..."
   },
   "prompt_encoding": "base64",
-  "prompt_sha256": "<64 lowercase hex>",
   "prompt": "<base64 encoded UTF-8 prompt>"
 }
 ```
 
-`prompt_sha256` はBase64 encoding前のPrompt UTF-8 byte
-sequenceのSHA-256とする。 `workspace=argus` ではhashを必須とし、missing
-/ format invalid / mismatch / invalid Base64は Actor起動前にFail
-Closedで拒否する。Actorには検証済みdecoded Promptだけを渡す。
+WorkerはBase64をstrict decodeし、decoded Prompt bytesを
+authoritative execution Promptとする。
 
-`callback` はrouting metadataでありPrompt hash対象外。初期typeは
-`chatgpt_browser`。 URLは `https://chatgpt.com/` 配下のみ許可し、Slackの
-`<URL>` / `<URL|label>` 表現は routing
-metadataとして正規化してから検証する。callbackなしJOBも許容する。
+同一decoded Prompt bytesを起点として、
 
-同一 `job_id`
-はretry理由を問わず再利用しない。ローカル絶対パスをJOBから指定しない。
+- SHA-256
+- Actor stdin
+- Local Execution Evidence
+
+を生成する。
+
+```text
+Slack Base64 Prompt
+        ↓
+strict Base64 decode
+        ↓
+decoded_prompt_bytes
+   ├─ SHA-256
+   ├─ Local Execution Evidence
+   └─ Actor stdin
+```
 
 ## 5. Workspace Registry
 
@@ -338,7 +349,7 @@ Actor executionとArtifact deliveryを独立状態として扱う。
 
 ``` json
 {
-  "protocol_version": "1",
+  "protocol_version": "2",
   "job_id": "ARGUS-P-0114-v1",
   "actor": "codex",
   "mode": "implementation",
@@ -357,6 +368,10 @@ Actor executionとArtifact deliveryを独立状態として扱う。
   "rejected_artifacts": []
 }
 ```
+
+v2の `prompt_sha256` は、WorkerがBase64 decode後のauthoritative
+Prompt bytesから生成したSHA-256である。
+request由来のhashではない。
 
 `status=DONE / exit_code=0 / artifact_status=PARTIAL_FAILURE`
 は有効な状態である。 Artifact validation / Drive upload
@@ -555,11 +570,24 @@ Local Repo   = Source of Truth
 Python WorkerからNotionを直接更新しない。Workerの責務はJOB実行、Result
 Manifest / Artifact返却、Browser wake-upまでとする。
 
-ChatGPTがAgent JOBを発行する場合、実行前にInstructionとPrompt
-SHA-256をNotionへ登録する。 完了後はSlack Result
-Manifestのhashを照合し、Result / Executed By / Exit Code / Artifact
-Status / Artifact refs / Changed Paths / Completed At等を同じJob
-Registryへ反映してcloseする。
+ChatGPTがv2 Agent JOBを発行する場合、実行前に以下をNotionへ登録する。
+
+- Submitted Instruction
+- Job ID
+- Actor
+- Mode
+- Workspace
+- その他Human-facing metadata
+
+ChatGPTは実行前Prompt SHA-256を生成しない。
+Workerは実際にActorへ渡すdecoded Prompt bytesからSHA-256を生成し、
+Result Manifestへ記録する。
+JOB完了後、ChatGPTはResult ManifestのWorker-generated
+Prompt SHA-256をExecution FactとしてNotionへ反映する。
+v2におけるPrompt SHA-256はInstruction submission時の属性ではなく、
+実際に実行されたPrompt bytesの識別子である。
+
+Python WorkerからNotionを直接read/writeしない。
 
 Notion更新が必要な場合は、原則として以下の境界を維持する。
 
@@ -666,7 +694,12 @@ Agent専用Opera起動時の正常系E2Eと、Opera停止時の `ECONNREFUSED`
 
 -   Slack Channel / Sender Authorization
 -   JSON / Markdown code-fence parse
--   Base64 Prompt transport / Prompt SHA-256 Provenance / Fail Closed
+-   Protocol v1/v2 coexistence
+-   v2 Base64 Prompt transport
+-   Worker-generated Prompt SHA-256
+-   v2 invalid Base64 / empty Prompt / invalid UTF-8 Fail Closed
+-   v2 request prompt_sha256 rejection
+-   decoded Prompt byte identity regression test
 -   SQLite Job State / idempotency / Workspace Lock / persistent FIFO
 -   PID / host / heartbeat / Crash Recovery
 -   CLI Version Gate / Git Workspace Validation
@@ -694,9 +727,14 @@ Agent専用Opera起動時の正常系E2Eと、Opera停止時の `ECONNREFUSED`
 -   Claude Code非対話Read-only
 -   Python → Claude Code
 -   ChatGPT → Slack → Python → Claude Code → Drive / Slack → ChatGPT E2E
--   ChatGPT-issued Prompt SHA-256 = Worker verified SHA-256 = Result
-    Manifest SHA-256
--   SHA mismatch時Actor未起動 / Fail Closed
+-   v2 decoded Prompt bytes
+    = Worker SHA-256 input bytes
+    = Actor stdin source bytes
+-   Worker-generated Prompt SHA-256
+    = Result Manifest prompt_sha256
+- v1 SHA mismatch時Actor未起動 / Fail Closed
+- v2 invalid Base64 / empty Prompt / invalid UTF-8時Actor未起動 /
+  Fail Closed
 -   Slack Result → Agent専用Opera/CDP → 発行元ChatGPT
     conversation自動wake-up
 -   Opera停止時もActor/Artifact成功を維持しcallbackだけFAILED

@@ -14,6 +14,12 @@ SHA256_RE = re.compile(
     r"^[0-9a-f]{64}$"
 )
 
+SUPPORTED_PROTOCOL_VERSIONS = {
+    "1",
+    "2",
+}
+
+
 class JobValidationError(ValueError):
     pass
 
@@ -72,27 +78,15 @@ def decode_and_verify_prompt(data):
 
     workspace = data.get(
         "workspace"
-    )
+)
 
     if workspace == "argus":
-        if expected_hash is None:
+        if not expected_hash:
             raise JobValidationError(
                 "PROMPT_SHA256_REQUIRED"
             )
 
-        if not SHA256_RE.fullmatch(
-            expected_hash
-        ):
-            raise JobValidationError(
-                "INVALID_PROMPT_SHA256_FORMAT"
-            )
-
-        if actual_hash != expected_hash:
-            raise JobValidationError(
-                "PROMPT_SHA256_MISMATCH"
-            )
-
-    elif expected_hash is not None:
+    if expected_hash is not None:
         if not SHA256_RE.fullmatch(
             expected_hash
         ):
@@ -107,7 +101,8 @@ def decode_and_verify_prompt(data):
 
     try:
         prompt = prompt_bytes.decode(
-            "utf-8"
+            "utf-8",
+            errors="strict",
         )
     except UnicodeDecodeError as e:
         raise JobValidationError(
@@ -115,6 +110,40 @@ def decode_and_verify_prompt(data):
         ) from e
 
     return prompt, actual_hash
+
+
+def decode_prompt_v2(data):
+    if (
+        data.get("prompt_encoding")
+        != "base64"
+    ):
+        raise JobValidationError(
+            "INVALID_PROMPT_ENCODING"
+        )
+
+    encoded = data.get("prompt")
+
+    if not isinstance(encoded, str):
+        raise JobValidationError(
+            "INVALID_PROMPT_BASE64"
+        )
+
+    try:
+        prompt_bytes = base64.b64decode(
+            encoded,
+            validate=True,
+        )
+    except Exception as e:
+        raise JobValidationError(
+            "INVALID_PROMPT_BASE64"
+        ) from e
+
+    if not prompt_bytes:
+        raise JobValidationError(
+            "EMPTY_PROMPT"
+        )
+
+    return prompt_bytes
 
 
 def parse_job(text: str) -> Job:
@@ -182,7 +211,14 @@ def parse_job(text: str) -> Job:
             f"Missing fields: {', '.join(missing)}"
         )
 
-    if data["protocol_version"] != PROTOCOL_VERSION:
+    protocol_version = data[
+        "protocol_version"
+    ]
+
+    if (
+        protocol_version
+        not in SUPPORTED_PROTOCOL_VERSIONS
+    ):
         raise JobValidationError(
             "UNKNOWN_PROTOCOL_VERSION"
         )
@@ -212,9 +248,34 @@ def parse_job(text: str) -> Job:
             "prompt must be non-empty"
         )
 
-    prompt, verified_hash = (
-        decode_and_verify_prompt(data)
-    )
+    if protocol_version == "1":
+        # 現行処理をそのまま維持
+        prompt, verified_hash = (
+            decode_and_verify_prompt(data)
+        )
+    elif protocol_version == "2":
+        if "prompt_sha256" in data:
+            raise JobValidationError(
+                "PROMPT_SHA256_NOT_ALLOWED"
+            )
+
+        prompt_bytes = decode_prompt_v2(
+            data
+        )
+
+        verified_hash = hashlib.sha256(
+            prompt_bytes
+        ).hexdigest()
+
+        try:
+            prompt = prompt_bytes.decode(
+                "utf-8",
+                errors="strict",
+            )
+        except UnicodeDecodeError as e:
+            raise JobValidationError(
+                "PROMPT_NOT_UTF8"
+            ) from e
 
     # callback
     callback = data.get(

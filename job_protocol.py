@@ -8,6 +8,7 @@ from config import (
 )
 import hashlib
 import re
+from urllib.parse import urlparse
 
 SHA256_RE = re.compile(
     r"^[0-9a-f]{64}$"
@@ -304,8 +305,14 @@ def parse_job(text: str) -> Job:
         # Allowed callback origin
         # -------------------------
 
-        if not callback_url.startswith(
-            "https://chatgpt.com/"
+        parsed = urlparse(
+            callback_url
+        )
+
+        if (
+            parsed.scheme != "https"
+            or parsed.hostname
+            != "chatgpt.com"
         ):
             raise JobValidationError(
                 "INVALID_CALLBACK_URL"

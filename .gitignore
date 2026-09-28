@@ -17,3 +17,6 @@ sandbox/
 .tmp/
 .pip-audit-cache/
 *.diff
+
+# Agent browser runtime profile
+browser-profile/

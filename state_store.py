@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     workspace TEXT NOT NULL,
     prompt TEXT NOT NULL,
     prompt_sha256 TEXT,
+    callback_type TEXT,
+    callback_url TEXT,
     status TEXT NOT NULL,
     pid INTEGER,
     host TEXT,
@@ -56,6 +58,22 @@ def initialize():
                 ADD COLUMN prompt_sha256 TEXT
                 """
             )
+        
+        if "callback_type" not in columns:
+            db.execute(
+                """
+                ALTER TABLE jobs
+                ADD COLUMN callback_type TEXT
+                """
+            )
+
+        if "callback_url" not in columns:
+            db.execute(
+                """
+                ALTER TABLE jobs
+                ADD COLUMN callback_url TEXT
+                """
+            )
 
 
 def create_job(job):
@@ -70,10 +88,12 @@ def create_job(job):
                 workspace,
                 prompt,
                 prompt_sha256,
+                callback_type,
+                callback_url,
                 status,
                 received_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'RECEIVED', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVED', ?)
             """,
             (
                 job.job_id,
@@ -83,6 +103,8 @@ def create_job(job):
                 job.workspace,
                 job.prompt,
                 job.prompt_sha256,
+                job.callback_type,
+                job.callback_url,
                 now_iso(),
             ),
         )

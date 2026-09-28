@@ -1,12 +1,11 @@
 import os
 import socket
+import json
 from pathlib import Path
-
 from dotenv import load_dotenv
 
 
 load_dotenv()
-
 
 PROTOCOL_VERSION = "1"
 
@@ -35,30 +34,6 @@ EXPECTED_CLI = {
     "claude": "2.1.280 (Claude Code)",
 }
 
-WORKSPACES = {
-    "sandbox": {
-        "path": Path(
-            r"C:\dev\chatgpt-agent\sandbox"
-        ).resolve(),
-        "git_required": False,
-        "allow_skip_git_repo_check": True,
-        "artifact_roots": [],
-    },
-
-    "argus": {
-        "path": Path(
-            r"C:\dev\argus"
-        ).resolve(),
-        "git_required": True,
-        "allow_skip_git_repo_check": False,
-        "artifact_roots": [
-            "validation/reports",
-            "validation/metrics",
-            "tests",
-        ],
-    },
-}
-
 ALLOWED_ACTOR_MODES = {
     ("codex", "implementation"),
     ("claude", "review"),
@@ -78,6 +53,29 @@ HEARTBEAT_INTERVAL_SECONDS = int(
 
 HOSTNAME = socket.gethostname()
 
-STATE_DB = Path(
-    r"C:\dev\chatgpt-agent\agent_state.db"
-)
+BASE_DIR = Path(__file__).parent
+
+STATE_DB = BASE_DIR / "agent_state.db"
+
+CONFIG_FILE = BASE_DIR / "config.json"
+
+with CONFIG_FILE.open(
+    encoding="utf-8"
+) as f:
+    FILE_CONFIG = json.load(f)
+
+WORKSPACES = {}
+
+for name, cfg in FILE_CONFIG[
+    "workspaces"
+].items():
+    WORKSPACES[name] = {
+        **cfg,
+        "path": Path(
+            cfg["path"]
+        ).resolve(),
+    }
+
+BROWSER_CONFIG = FILE_CONFIG[
+    "browser"
+]

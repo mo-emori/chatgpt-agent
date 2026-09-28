@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "composer": {
+    "selectors": [
+      "form [contenteditable='true'][role='textbox']",
+      "form [contenteditable='true']"
+    ]
+  },
+  "send_button": {
+    "selectors": [
+      "form button[aria-label='送信']",
+      "form button[type='submit']"
+    ]
+  }
+}

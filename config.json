@@ -1,0 +1,24 @@
+{
+  "workspaces": {
+    "sandbox": {
+      "path": "C:\\dev\\chatgpt-agent\\sandbox",
+      "git_required": false,
+      "allow_skip_git_repo_check": true,
+      "artifact_roots": []
+    },
+    "argus": {
+      "path": "C:\\dev\\argus",
+      "git_required": true,
+      "allow_skip_git_repo_check": false,
+      "artifact_roots": [
+        "validation/reports",
+        "validation/metrics",
+        "tests"
+      ]
+    }
+  },
+  "browser": {
+    "enabled": true,
+    "cdp_url": "http://127.0.0.1:9222"
+  }
+}

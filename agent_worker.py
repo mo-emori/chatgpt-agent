@@ -30,6 +30,10 @@ from job_log import (
     save_json,
     save_text,
 )
+from browser.notify import (
+    BrowserNotifyError,
+    notify_chatgpt,
+)
 
 def send_json(say, data):
     say(
@@ -41,6 +45,77 @@ def send_json(say, data):
         )
         + "\n```"
     )
+
+
+def send_browser_callback(
+    job,
+    *,
+    status,
+    artifact_status,
+):
+    if (
+        job.callback_type is None
+        or job.callback_url is None
+    ):
+        return {
+            "type": None,
+            "status": "NOT_REQUESTED",
+        }
+
+    if (
+        job.callback_type
+        != "chatgpt_browser"
+    ):
+        return {
+            "type":
+                job.callback_type,
+            "status": "FAILED",
+            "error":
+                "UNKNOWN_CALLBACK_TYPE",
+        }
+
+    message = (
+        "LOCAL_AGENT_JOB_COMPLETED\n\n"
+        f"job_id: {job.job_id}\n"
+        f"actor: {job.actor}\n"
+        f"workspace: {job.workspace}\n"
+        f"status: {status}\n"
+        f"artifact_status: "
+        f"{artifact_status}\n\n"
+        "Slack Result Manifestを確認して"
+        "Job Closureを続行してください。"
+    )
+
+    try:
+        notify_chatgpt(
+            target_url=
+                job.callback_url,
+            message=message,
+        )
+
+        return {
+            "type":
+                "chatgpt_browser",
+            "status":
+                "DONE",
+            "url": job.callback_url,
+        }
+
+    except BrowserNotifyError as e:
+        print(
+            "BROWSER CALLBACK FAILED:",
+            str(e),
+        )
+
+        return {
+            "type":
+                "chatgpt_browser",
+            "status":
+                "FAILED",
+            "error":
+                str(e),
+            "url": job.callback_url,
+        }
 
 
 def process_message(
@@ -161,67 +236,6 @@ def dispatch_next_queued(workspace, say):
     ).start()
 
 
-def collect_artifacts(job, stdout):
-    agent_result = parse_agent_result(
-        stdout
-    )
-
-    workspace = WORKSPACES[
-        job.workspace
-    ]
-
-    validated = []
-
-    for raw_path in agent_result.artifacts:
-        path = validate_artifact_path(
-            raw_path,
-            workspace_root=workspace["path"],
-            artifact_roots=workspace[
-                "artifact_roots"
-            ],
-        )
-
-        validated.append(
-            (raw_path, path)
-        )
-
-    uploaded = upload_artifacts(
-        job.job_id,
-        [
-            path
-            for _, path in validated
-        ],
-    )
-
-    artifacts = []
-
-    for (
-        (source_path, _),
-        drive_item,
-    ) in zip(
-        validated,
-        uploaded,
-        strict=True,
-    ):
-        artifacts.append(
-            {
-                "name":
-                    drive_item["name"],
-                "source_path":
-                    source_path,
-                "drive_file_id":
-                    drive_item[
-                        "drive_file_id"
-                    ],
-            }
-        )
-
-    return (
-        agent_result.summary,
-        artifacts,
-    )
-
-
 def execute_job(job, say):
     status = "RUNNING"
     exit_code = None
@@ -251,6 +265,12 @@ def execute_job(job, say):
                 job.workspace,
             "prompt_sha256":
                 job.prompt_sha256,
+            "callback": {
+                "type":
+                    job.callback_type,
+                "url":
+                    job.callback_url,
+            },
         },
     )
 
@@ -353,6 +373,7 @@ def execute_job(job, say):
                 },
             }
 
+            # Authoritative Resultを先にSlackへ
             save_json(
                 log_dir,
                 "result.json",
@@ -361,6 +382,27 @@ def execute_job(job, say):
 
             send_json(
                 say,
+                response,
+            )
+
+            # その後ChatGPTをwake
+            callback_result = (
+                send_browser_callback(
+                    job,
+                    status="FAILED",
+                    artifact_status=
+                        "NOT_RUN",
+                )
+            )
+
+            response["callback"] = (
+                callback_result
+            )
+
+            # callback結果はLocal Evidenceへ追記
+            save_json(
+                log_dir,
+                "result.json",
                 response,
             )
 
@@ -510,14 +552,20 @@ def execute_job(job, say):
         response = {
             "protocol_version":
                 job.protocol_version,
-            "job_id": job.job_id,
-            "actor": job.actor,
-            "mode": job.mode,
-            "workspace": job.workspace,
-            "prompt_sha256": job.prompt_sha256,
+            "job_id":
+                job.job_id,
+            "actor":
+                job.actor,
+            "mode":
+                job.mode,
+            "workspace":
+                job.workspace,
+            "prompt_sha256":
+                job.prompt_sha256,
 
             # Actor execution
-            "status": "DONE",
+            "status":
+                "DONE",
             "exit_code":
                 result.returncode,
             "summary":
@@ -542,6 +590,11 @@ def execute_job(job, say):
                 rejected_artifacts,
         }
 
+        # --------------------------------
+        # Slack Result
+        # --------------------------------
+        # Browser callbackより先に、
+        # authoritative resultをSlackへ送る。
         save_json(
             log_dir,
             "result.json",
@@ -550,6 +603,31 @@ def execute_job(job, say):
 
         send_json(
             say,
+            response,
+        )
+
+        # --------------------------------
+        # Browser Callback
+        # --------------------------------
+        # callback失敗はexecution/artifactの
+        # statusへ影響させない。
+        callback_result = (
+            send_browser_callback(
+                job,
+                status="DONE",
+                artifact_status=
+                    artifact_status,
+            )
+        )
+
+        # callback結果はLocal Evidenceへ追記。
+        response["callback"] = (
+            callback_result
+        )
+
+        save_json(
+            log_dir,
+            "result.json",
             response,
         )
 
@@ -565,13 +643,23 @@ def execute_job(job, say):
         response = {
             "protocol_version":
                 job.protocol_version,
-            "job_id": job.job_id,
-            "actor": job.actor,
-            "prompt_sha256": job.prompt_sha256,
-            "status": "FAILED",
-            "failure_class": "TIMEOUT",
+            "job_id":
+                job.job_id,
+            "actor":
+                job.actor,
+            "mode":
+                job.mode,
+            "workspace":
+                job.workspace,
+            "prompt_sha256":
+                job.prompt_sha256,
+            "status":
+                "FAILED",
+            "failure_class":
+                "TIMEOUT",
         }
 
+        # Slack Resultを先に確定。
         save_json(
             log_dir,
             "result.json",
@@ -580,6 +668,26 @@ def execute_job(job, say):
 
         send_json(
             say,
+            response,
+        )
+
+        # その後ChatGPTをwake。
+        callback_result = (
+            send_browser_callback(
+                job,
+                status="FAILED",
+                artifact_status=
+                    "NOT_RUN",
+            )
+        )
+
+        response["callback"] = (
+            callback_result
+        )
+
+        save_json(
+            log_dir,
+            "result.json",
             response,
         )
 
@@ -595,13 +703,25 @@ def execute_job(job, say):
         response = {
             "protocol_version":
                 job.protocol_version,
-            "job_id": job.job_id,
-            "prompt_sha256": job.prompt_sha256,
-            "status": "BRIDGE_ERROR",
+            "job_id":
+                job.job_id,
+            "actor":
+                job.actor,
+            "mode":
+                job.mode,
+            "workspace":
+                job.workspace,
+            "prompt_sha256":
+                job.prompt_sha256,
+            "status":
+                "BRIDGE_ERROR",
+            "failure_class":
+                "BRIDGE_ERROR",
             "error_summary":
                 str(e)[:4000],
         }
 
+        # Slack Resultを先に確定。
         save_json(
             log_dir,
             "result.json",
@@ -613,6 +733,27 @@ def execute_job(job, say):
             response,
         )
 
+        # execute_job()まで到達したJOBなので、
+        # callbackがあれば失敗通知する。
+        callback_result = (
+            send_browser_callback(
+                job,
+                status="BRIDGE_ERROR",
+                artifact_status=
+                    "UNKNOWN",
+            )
+        )
+
+        response["callback"] = (
+            callback_result
+        )
+
+        save_json(
+            log_dir,
+            "result.json",
+            response,
+        )
+
         print(
             "BRIDGE ERROR:",
             job.job_id,
@@ -620,11 +761,16 @@ def execute_job(job, say):
         )
 
     finally:
-        print(
-            f"JOB END: {job.job_id} "
-            f"status={status} "
-            f"exit_code={exit_code}"
-        )
+        print()
+        print("==============================")
+        print("JOB END")
+        print("job_id   :", job.job_id)
+        print("actor    :", job.actor)
+        print("mode     :", job.mode)
+        print("workspace:", job.workspace)
+        print("status   :", status)
+        print("exit_code:", exit_code)
+        print("==============================")
 
         dispatch_next_queued(
             job.workspace,

@@ -68,6 +68,7 @@ def run_process(
         text=True,
         encoding="utf-8",
         errors="replace",
+        bufsize=1,
     )
 
     state_store.mark_running(
@@ -75,6 +76,59 @@ def run_process(
         process.pid,
         HOSTNAME,
     )
+
+    stdout_lines = []
+    stderr_lines = []
+
+    def read_stream(
+        stream,
+        collector,
+        label,
+    ):
+        try:
+            for line in iter(
+                stream.readline,
+                "",
+            ):
+                collector.append(line)
+
+                print(
+                    f"[{label}] "
+                    f"{line.rstrip()}",
+                    flush=True,
+                )
+        finally:
+            stream.close()
+
+    stdout_thread = threading.Thread(
+        target=read_stream,
+        args=(
+            process.stdout,
+            stdout_lines,
+            "AGENT",
+        ),
+        daemon=True,
+    )
+
+    stderr_thread = threading.Thread(
+        target=read_stream,
+        args=(
+            process.stderr,
+            stderr_lines,
+            "AGENT-ERR",
+        ),
+        daemon=True,
+    )
+
+    stdout_thread.start()
+    stderr_thread.start()
+
+    # stdinへPromptを渡したら閉じる。
+    if input_text is not None:
+        process.stdin.write(
+            input_text
+        )
+        process.stdin.close()
 
     stop_heartbeat = threading.Event()
 
@@ -93,22 +147,37 @@ def run_process(
     heartbeat_thread.start()
 
     try:
-        stdout, stderr = process.communicate(
-            input=input_text,
-            timeout=timeout,
+        process.wait(
+            timeout=timeout
         )
 
     except subprocess.TimeoutExpired:
         process.kill()
-        stdout, stderr = process.communicate()
+        process.wait()
+
         raise
 
     finally:
         stop_heartbeat.set()
-        heartbeat_thread.join(timeout=2)
+
+        heartbeat_thread.join(
+            timeout=2
+        )
+
+        stdout_thread.join(
+            timeout=5
+        )
+
+        stderr_thread.join(
+            timeout=5
+        )
 
     return ProcessResult(
         returncode=process.returncode,
-        stdout=stdout,
-        stderr=stderr,
+        stdout="".join(
+            stdout_lines
+        ),
+        stderr="".join(
+            stderr_lines
+        ),
     )

@@ -26,6 +26,8 @@ class Job:
     workspace: str
     prompt: str
     prompt_sha256: str | None
+    callback_type: str | None = None
+    callback_url: str | None = None
 
 
 def decode_and_verify_prompt(data):
@@ -213,14 +215,121 @@ def parse_job(text: str) -> Job:
         decode_and_verify_prompt(data)
     )
 
+    # callback
+    callback = data.get(
+        "callback"
+    )
+
+    callback_type = None
+    callback_url = None
+
+    if callback is not None:
+        if not isinstance(
+            callback,
+            dict,
+        ):
+            raise JobValidationError(
+                "INVALID_CALLBACK"
+            )
+
+        callback_type = (
+            callback.get("type")
+        )
+        
+        callback_url = callback.get(
+            "url"
+        )
+
+        # -------------------------
+        # Callback type validation
+        # -------------------------
+
+        if (
+            callback_type
+            != "chatgpt_browser"
+        ):
+            raise JobValidationError(
+                "UNKNOWN_CALLBACK_TYPE"
+            )
+
+        # -------------------------
+        # Callback URL validation
+        # -------------------------
+
+        if not isinstance(
+            callback_url,
+            str,
+        ):
+            raise JobValidationError(
+                "INVALID_CALLBACK_URL"
+            )
+
+        callback_url = (
+            callback_url.strip()
+        )
+
+        # Slack mrkdwn normalization
+        #
+        # https://chatgpt.com/c/...
+        #
+        # ↓ Slackで以下になる場合がある
+        #
+        # <https://chatgpt.com/c/...>
+        #
+        # または
+        #
+        # <https://chatgpt.com/c/...|label>
+
+        if (
+            callback_url.startswith("<")
+            and callback_url.endswith(">")
+        ):
+            callback_url = (
+                callback_url[1:-1]
+            )
+
+        if "|" in callback_url:
+            callback_url = (
+                callback_url.split(
+                    "|",
+                    1,
+                )[0]
+            )
+
+        callback_url = (
+            callback_url.strip()
+        )
+
+        # -------------------------
+        # Allowed callback origin
+        # -------------------------
+
+        if not callback_url.startswith(
+            "https://chatgpt.com/"
+        ):
+            raise JobValidationError(
+                "INVALID_CALLBACK_URL"
+            )
+
     return Job(
-        protocol_version=data["protocol_version"],
-        job_id=data["job_id"],
-        actor=data["actor"],
-        mode=data["mode"],
-        workspace=data["workspace"],
-        prompt=prompt,
-        prompt_sha256=verified_hash,
+        protocol_version=
+            data["protocol_version"],
+        job_id=
+            data["job_id"],
+        actor=
+            data["actor"],
+        mode=
+            data["mode"],
+        workspace=
+            data["workspace"],
+        prompt=
+            prompt,
+        prompt_sha256=
+            verified_hash,
+        callback_type=
+            callback_type,
+        callback_url=
+            callback_url,
     )
 
 
@@ -233,5 +342,7 @@ def job_from_row(row):
         workspace=row["workspace"],
         prompt=row["prompt"],
         prompt_sha256=row["prompt_sha256"],
+        callback_type=row["callback_type"],
+        callback_url=row["callback_url"],
     )
 

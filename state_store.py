@@ -272,6 +272,33 @@ def list_queued(workspace=None):
     return [dict(row) for row in rows]
 
 
+def list_queued_workspaces():
+    with connect() as db:
+        rows = db.execute(
+            """
+            SELECT workspace, MIN(queued_at) AS first_queued_at
+            FROM jobs
+            WHERE status = 'QUEUED'
+            GROUP BY workspace
+            ORDER BY first_queued_at ASC
+            """
+        ).fetchall()
+
+    return [row["workspace"] for row in rows]
+
+
+def restore_dispatching_jobs():
+    """Return startup-abandoned claims to the persisted FIFO queue."""
+    with connect() as db:
+        db.execute(
+            """
+            UPDATE jobs
+            SET status = 'QUEUED'
+            WHERE status = 'DISPATCHING'
+            """
+        )
+
+
 def is_workspace_busy(workspace):
     with connect() as db:
         row = db.execute(
@@ -279,7 +306,7 @@ def is_workspace_busy(workspace):
             SELECT 1
             FROM jobs
             WHERE workspace = ?
-              AND status = 'RUNNING'
+              AND status IN ('DISPATCHING', 'RUNNING')
             LIMIT 1
             """,
             (workspace,),
@@ -303,6 +330,70 @@ def get_next_queued(workspace):
         ).fetchone()
 
     return dict(row) if row else None
+
+
+def claim_next_queued(workspace):
+    """Atomically claim the FIFO queue head if the workspace is idle."""
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+
+        busy = db.execute(
+            """
+            SELECT 1
+            FROM jobs
+            WHERE workspace = ?
+              AND status IN ('DISPATCHING', 'RUNNING')
+            LIMIT 1
+            """,
+            (workspace,),
+        ).fetchone()
+        if busy is not None:
+            return None
+
+        row = db.execute(
+            """
+            SELECT *
+            FROM jobs
+            WHERE workspace = ?
+              AND status = 'QUEUED'
+            ORDER BY queued_at ASC, rowid ASC
+            LIMIT 1
+            """,
+            (workspace,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        updated = db.execute(
+            """
+            UPDATE jobs
+            SET status = 'DISPATCHING'
+            WHERE job_id = ?
+              AND status = 'QUEUED'
+            """,
+            (row["job_id"],),
+        )
+        if updated.rowcount != 1:
+            return None
+
+        claimed = dict(row)
+        claimed["status"] = "DISPATCHING"
+        return claimed
+
+
+def restore_claim(job_id):
+    """Safely put an unstarted claim back without overwriting later state."""
+    with connect() as db:
+        result = db.execute(
+            """
+            UPDATE jobs
+            SET status = 'QUEUED'
+            WHERE job_id = ?
+              AND status = 'DISPATCHING'
+            """,
+            (job_id,),
+        )
+    return result.rowcount == 1
 
 
 def mark_interrupted(job_id):

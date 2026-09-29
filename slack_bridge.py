@@ -63,3 +63,13 @@ class SlackBridge:
             self.app,
             SLACK_APP_TOKEN,
         ).start()
+
+    def say(self, message):
+        # Startup recovery has no Slack event-bound say callback. Jobs are
+        # accepted only from the configured channel set, which is currently
+        # the durable routing information available to the worker.
+        channel = next(iter(ALLOWED_CHANNEL_IDS))
+        self.app.client.chat_postMessage(
+            channel=channel,
+            text=message,
+        )

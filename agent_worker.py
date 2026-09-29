@@ -1,4 +1,5 @@
 import json
+import hashlib
 import subprocess
 import threading
 
@@ -231,12 +232,16 @@ def process_message(
         "VALIDATED",
     )
 
-    if state_store.is_workspace_busy(
-        job.workspace
-    ):
-        state_store.mark_queued(
-            job.job_id
-        )
+    state_store.mark_queued(
+        job.job_id
+    )
+
+    dispatch_next_queued(
+        job.workspace,
+        say,
+    )
+
+    if state_store.get_job(job.job_id)["status"] == "QUEUED":
 
         send_json(
             say,
@@ -253,39 +258,138 @@ def process_message(
             "JOB QUEUED:",
             job.job_id,
         )
-        return
-
-    # workspaceが空いているので非同期実行
-    threading.Thread(
-        target=execute_job,
-        args=(job, say),
-        daemon=True,
-    ).start()
 
     return
 
 
 def dispatch_next_queued(workspace, say):
-    if state_store.is_workspace_busy(workspace):
-        return
+    while True:
+        row = state_store.claim_next_queued(workspace)
 
-    row = state_store.get_next_queued(workspace)
+        if row is None:
+            return
 
-    if row is None:
-        return
+        try:
+            job = job_from_row(row)
+            validate_recoverable_queued_job(job)
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as e:
+            state_store.mark_completed(
+                row["job_id"],
+                status="FAILED",
+                failure_class="INCOMPLETE_QUEUED_STATE",
+            )
+            print(
+                "UNRECOVERABLE QUEUED JOB:",
+                row["job_id"],
+                str(e),
+            )
+            send_json(
+                say,
+                {
+                    "protocol_version": row["protocol_version"],
+                    "job_id": row["job_id"],
+                    "status": "FAILED",
+                    "failure_class": "INCOMPLETE_QUEUED_STATE",
+                    "error_summary": str(e),
+                },
+            )
+            continue
 
-    job = job_from_row(row)
+        break
 
     print(
         "DISPATCH QUEUED JOB:",
         job.job_id,
     )
 
-    threading.Thread(
-        target=execute_job,
+    thread = threading.Thread(
+        target=execute_claimed_job,
         args=(job, say),
         daemon=True,
-    ).start()
+    )
+    try:
+        thread.start()
+    except Exception:
+        if not state_store.restore_claim(job.job_id):
+            state_store.mark_completed(
+                job.job_id,
+                status="FAILED",
+                failure_class="DISPATCH_START_FAILED",
+            )
+        raise
+
+
+def execute_claimed_job(job, say):
+    """Run a claimed job and fail closed if setup fails before execution."""
+    try:
+        execute_job(job, say)
+    except Exception as e:
+        state_store.mark_completed(
+            job.job_id,
+            status="FAILED",
+            failure_class="DISPATCH_START_FAILED",
+        )
+        send_json(
+            say,
+            {
+                "protocol_version": job.protocol_version,
+                "job_id": job.job_id,
+                "status": "FAILED",
+                "failure_class": "DISPATCH_START_FAILED",
+                "error_summary": str(e)[:4000],
+            },
+        )
+        print(
+            "DISPATCH START FAILED:",
+            job.job_id,
+            repr(e),
+        )
+        dispatch_next_queued(job.workspace, say)
+
+
+def validate_recoverable_queued_job(job):
+    if job.protocol_version != "3":
+        return
+
+    if not isinstance(job.prompt, str) or not job.prompt:
+        raise ValueError("persisted v3 prompt snapshot is missing")
+
+    if (
+        not isinstance(job.prompt_sha256, str)
+        or len(job.prompt_sha256) != 64
+        or any(c not in "0123456789abcdef" for c in job.prompt_sha256)
+    ):
+        raise ValueError("persisted v3 prompt SHA-256 is missing or invalid")
+
+    actual_sha256 = hashlib.sha256(
+        job.prompt.encode("utf-8")
+    ).hexdigest()
+    if actual_sha256 != job.prompt_sha256:
+        raise ValueError("persisted v3 prompt snapshot SHA-256 mismatch")
+
+    ref = job.instruction_ref
+    if (
+        not isinstance(ref, dict)
+        or ref.get("type") != "notion_page"
+        or not isinstance(ref.get("page_id"), str)
+        or not ref["page_id"].strip()
+    ):
+        raise ValueError("persisted v3 instruction_ref is missing or invalid")
+
+
+def recover_queued_jobs(say):
+    state_store.restore_dispatching_jobs()
+    workspaces = state_store.list_queued_workspaces()
+
+    if not workspaces:
+        return
+
+    print(
+        f"Queue recovery: {len(workspaces)} workspace(s)"
+    )
+
+    for workspace in workspaces:
+        dispatch_next_queued(workspace, say)
 
 
 def prepare_execution(job):
@@ -788,6 +892,12 @@ def main():
 
     recover_running_jobs()
 
+    bridge = SlackBridge(
+        process_message
+    )
+
+    recover_queued_jobs(bridge.say)
+
     print(
         "ChatGPT Local Agent Worker started."
     )
@@ -795,10 +905,6 @@ def main():
         "Authorization and state store enabled."
     )
     print("Press Ctrl+C to stop.")
-
-    bridge = SlackBridge(
-        process_message
-    )
 
     bridge.start()
 

@@ -17,6 +17,7 @@ SHA256_RE = re.compile(
 SUPPORTED_PROTOCOL_VERSIONS = {
     "1",
     "2",
+    "3",
 }
 
 
@@ -31,8 +32,9 @@ class Job:
     actor: str
     mode: str
     workspace: str
-    prompt: str
-    prompt_sha256: str | None
+    prompt: str | None = None
+    prompt_sha256: str | None = None
+    instruction_ref: dict | None = None
     callback_type: str | None = None
     callback_url: str | None = None
 
@@ -191,18 +193,17 @@ def parse_job(text: str) -> Job:
             "JOB must be a JSON object"
         )
 
-    required = (
+    base_required = (
         "protocol_version",
         "job_id",
         "actor",
         "mode",
         "workspace",
-        "prompt",
     )
 
     missing = [
         key
-        for key in required
+        for key in base_required
         if key not in data
     ]
 
@@ -222,6 +223,18 @@ def parse_job(text: str) -> Job:
         raise JobValidationError(
             "UNKNOWN_PROTOCOL_VERSION"
         )
+
+    if protocol_version in {"1", "2"}:
+        if "prompt" not in data:
+            raise JobValidationError(
+                "Missing fields: prompt"
+            )
+
+    elif protocol_version == "3":
+        if "instruction_ref" not in data:
+            raise JobValidationError(
+                "Missing fields: instruction_ref"
+            )
 
     actor_mode = (
         data["actor"],
@@ -243,16 +256,26 @@ def parse_job(text: str) -> Job:
             "job_id must be non-empty"
         )
 
-    if not isinstance(data["prompt"], str) or not data["prompt"].strip():
-        raise JobValidationError(
-            "prompt must be non-empty"
-        )
+    if protocol_version in {"1", "2"}:
+        if (
+            not isinstance(
+                data["prompt"],
+                str,
+            )
+            or not data["prompt"].strip()
+        ):
+            raise JobValidationError(
+                "prompt must be non-empty"
+            )
 
     if protocol_version == "1":
         # 現行処理をそのまま維持
         prompt, verified_hash = (
             decode_and_verify_prompt(data)
         )
+
+        instruction_ref = None
+
     elif protocol_version == "2":
         if "prompt_sha256" in data:
             raise JobValidationError(
@@ -276,6 +299,54 @@ def parse_job(text: str) -> Job:
             raise JobValidationError(
                 "PROMPT_NOT_UTF8"
             ) from e
+
+        instruction_ref = None
+
+    elif protocol_version == "3":
+        if "prompt" in data:
+            raise JobValidationError(
+                "PROMPT_NOT_ALLOWED"
+            )
+
+        if "prompt_encoding" in data:
+            raise JobValidationError(
+                "PROMPT_ENCODING_NOT_ALLOWED"
+            )
+
+        if "prompt_sha256" in data:
+            raise JobValidationError(
+                "PROMPT_SHA256_NOT_ALLOWED"
+            )
+
+        ref = data.get(
+            "instruction_ref"
+        )
+
+        if not isinstance(ref, dict):
+            raise JobValidationError(
+                "INSTRUCTION_REF_INVALID"
+            )
+
+        if ref.get("type") != "notion_page":
+            raise JobValidationError(
+                "INSTRUCTION_REF_INVALID"
+            )
+
+        page_id = ref.get(
+            "page_id"
+        )
+
+        if (
+            not isinstance(page_id, str)
+            or not page_id.strip()
+        ):
+            raise JobValidationError(
+                "INSTRUCTION_REF_INVALID"
+            )
+        
+        prompt = None
+        verified_hash = None
+        instruction_ref = ref
 
     # callback
     callback = data.get(
@@ -380,24 +451,16 @@ def parse_job(text: str) -> Job:
             )
 
     return Job(
-        protocol_version=
-            data["protocol_version"],
-        job_id=
-            data["job_id"],
-        actor=
-            data["actor"],
-        mode=
-            data["mode"],
-        workspace=
-            data["workspace"],
-        prompt=
-            prompt,
-        prompt_sha256=
-            verified_hash,
-        callback_type=
-            callback_type,
-        callback_url=
-            callback_url,
+        protocol_version=data["protocol_version"],
+        job_id=data["job_id"],
+        actor=data["actor"],
+        mode=data["mode"],
+        workspace=data["workspace"],
+        prompt=prompt,
+        prompt_sha256=verified_hash,
+        instruction_ref=instruction_ref,
+        callback_type=callback_type,
+        callback_url=callback_url,
     )
 
 
@@ -410,6 +473,11 @@ def job_from_row(row):
         workspace=row["workspace"],
         prompt=row["prompt"],
         prompt_sha256=row["prompt_sha256"],
+        instruction_ref=(
+            json.loads(row["instruction_ref"])
+            if row["instruction_ref"]
+            else None
+        ),
         callback_type=row["callback_type"],
         callback_url=row["callback_url"],
     )

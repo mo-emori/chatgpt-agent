@@ -34,6 +34,11 @@ from browser.notify import (
     BrowserNotifyError,
     notify_chatgpt,
 )
+from dataclasses import replace
+from notion_client import (
+    NotionInstructionError,
+    fetch_instruction,
+)
 
 def send_json(say, data):
     say(
@@ -118,6 +123,20 @@ def send_browser_callback(
         }
 
 
+def resolve_v3_instruction(job):
+    instruction = fetch_instruction(
+        job.instruction_ref["page_id"]
+    )
+
+    return replace(
+        job,
+        prompt=instruction["text"],
+        prompt_sha256=instruction[
+            "sha256"
+        ],
+    )
+
+
 def process_message(
     *,
     text,
@@ -169,6 +188,39 @@ def process_message(
             },
         )
         return
+
+    if job.protocol_version == "3":
+        try:
+            job = resolve_v3_instruction(
+                job
+            )
+
+        except NotionInstructionError as e:
+            failure_class = str(e)
+
+            print(
+                "INSTRUCTION RESOLVE FAILED:",
+                job.job_id,
+                failure_class
+            )
+
+            send_json(
+                say,
+                {
+                    "protocol_version":
+                        job.protocol_version,
+                    "job_id":
+                        job.job_id,
+                    "status":
+                        "BRIDGE_ERROR",
+                    "failure_class":
+                        failure_class,
+                    "error_summary":
+                        failure_class,
+                },
+            )
+
+            return
 
     # RECEIVED
     state_store.create_job(job)
@@ -241,21 +293,31 @@ def prepare_execution(job):
     workdir = workspace["path"]
     log_dir = create_job_log(job.job_id)
 
+    request_data = {
+        "protocol_version": job.protocol_version,
+        "job_id": job.job_id,
+        "actor": job.actor,
+        "mode": job.mode,
+        "workspace": job.workspace,
+        "prompt_sha256": job.prompt_sha256,
+        "callback": {
+            "type": job.callback_type,
+            "url": job.callback_url,
+        },
+    }
+
+    if job.protocol_version == "3":
+        request_data["instruction_ref"] = (
+            job.instruction_ref
+        )
+        request_data["instruction_sha256"] = (
+            job.prompt_sha256
+        )
+
     save_json(
         log_dir,
         "request.json",
-        {
-            "protocol_version": job.protocol_version,
-            "job_id": job.job_id,
-            "actor": job.actor,
-            "mode": job.mode,
-            "workspace": job.workspace,
-            "prompt_sha256": job.prompt_sha256,
-            "callback": {
-                "type": job.callback_type,
-                "url": job.callback_url,
-            },
-        },
+        request_data,
     )
 
     before = get_git_snapshot(workdir)
@@ -399,6 +461,14 @@ def build_result(
             "artifacts": artifacts,
             "rejected_artifacts": rejected,
         })
+    if job.protocol_version == "3":
+        response[
+            "instruction_ref"
+        ] = job.instruction_ref
+
+        response[
+            "instruction_sha256"
+        ] = job.prompt_sha256
     return response
 
 

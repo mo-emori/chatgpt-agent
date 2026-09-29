@@ -1,4 +1,5 @@
 import sqlite3
+import json
 from datetime import datetime, timezone
 
 from config import STATE_DB
@@ -13,6 +14,7 @@ CREATE TABLE IF NOT EXISTS jobs (
     workspace TEXT NOT NULL,
     prompt TEXT NOT NULL,
     prompt_sha256 TEXT,
+    instruction_ref TEXT,
     callback_type TEXT,
     callback_url TEXT,
     status TEXT NOT NULL,
@@ -74,6 +76,14 @@ def initialize():
                 ADD COLUMN callback_url TEXT
                 """
             )
+        
+        if "instruction_ref" not in columns:
+            db.execute(
+                """
+                ALTER TABLE jobs
+                ADD COLUMN instruction_ref TEXT
+                """
+            )
 
 
 def create_job(job):
@@ -88,12 +98,13 @@ def create_job(job):
                 workspace,
                 prompt,
                 prompt_sha256,
+                instruction_ref,
                 callback_type,
                 callback_url,
                 status,
                 received_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVED', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVED', ?)
             """,
             (
                 job.job_id,
@@ -103,6 +114,15 @@ def create_job(job):
                 job.workspace,
                 job.prompt,
                 job.prompt_sha256,
+                (
+                    json.dumps(
+                        job.instruction_ref,
+                        ensure_ascii=False,
+                    )
+                    if job.instruction_ref
+                    is not None
+                    else None
+                ),
                 job.callback_type,
                 job.callback_url,
                 now_iso(),

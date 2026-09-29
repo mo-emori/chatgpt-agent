@@ -1,3 +1,4 @@
+import os
 import subprocess
 import threading
 import time
@@ -55,9 +56,17 @@ def run_process(
     timeout,
     input_text=None,
 ):
+    actor_env = os.environ.copy()
+
+    actor_env.pop(
+        "NOTION_WORKER_TOKEN",
+        None,
+    )
+
     process = subprocess.Popen(
         args,
         cwd=cwd,
+        env=actor_env,
         stdin=(
             subprocess.PIPE
             if input_text is not None

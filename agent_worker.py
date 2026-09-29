@@ -1,5 +1,6 @@
 import json
 import hashlib
+import logging
 import subprocess
 import threading
 
@@ -40,6 +41,9 @@ from notion_client import (
     NotionInstructionError,
     fetch_instruction,
 )
+from operational_logging import configure_logging
+
+logger = logging.getLogger(__name__)
 
 def send_json(say, data):
     say(
@@ -72,6 +76,11 @@ def send_browser_callback(
         job.callback_type
         != "chatgpt_browser"
     ):
+        logger.warning(
+            "Browser callback failed: job_id=%s unknown callback type=%s",
+            job.job_id,
+            job.callback_type,
+        )
         return {
             "type":
                 job.callback_type,
@@ -98,6 +107,7 @@ def send_browser_callback(
                 job.callback_url,
             message=message,
         )
+        logger.info("Browser callback succeeded: job_id=%s", job.job_id)
 
         return {
             "type":
@@ -108,10 +118,7 @@ def send_browser_callback(
         }
 
     except BrowserNotifyError as e:
-        print(
-            "BROWSER CALLBACK FAILED:",
-            str(e),
-        )
+        logger.warning("BROWSER CALLBACK FAILED: %s", e)
 
         return {
             "type":
@@ -153,7 +160,7 @@ def process_message(
         job = parse_job(text)
 
     except JobValidationError as e:
-        print("JOB validation failed:", e)
+        logger.error("JOB validation failed: %s", e)
 
         send_json(
             say,
@@ -171,11 +178,7 @@ def process_message(
     )
 
     if existing is not None:
-        print(
-            "Duplicate JOB ignored:",
-            job.job_id,
-            existing["status"],
-        )
+        logger.info("Duplicate JOB ignored: job_id=%s status=%s", job.job_id, existing["status"])
 
         send_json(
             say,
@@ -199,11 +202,7 @@ def process_message(
         except NotionInstructionError as e:
             failure_class = str(e)
 
-            print(
-                "INSTRUCTION RESOLVE FAILED:",
-                job.job_id,
-                failure_class
-            )
+            logger.error("INSTRUCTION RESOLVE FAILED: job_id=%s failure=%s", job.job_id, failure_class)
 
             send_json(
                 say,
@@ -254,10 +253,7 @@ def process_message(
             },
         )
 
-        print(
-            "JOB QUEUED:",
-            job.job_id,
-        )
+        logger.info("JOB QUEUED: job_id=%s", job.job_id)
 
     return
 
@@ -278,11 +274,7 @@ def dispatch_next_queued(workspace, say):
                 status="FAILED",
                 failure_class="INCOMPLETE_QUEUED_STATE",
             )
-            print(
-                "UNRECOVERABLE QUEUED JOB:",
-                row["job_id"],
-                str(e),
-            )
+            logger.warning("UNRECOVERABLE QUEUED JOB: job_id=%s error=%s", row["job_id"], e)
             send_json(
                 say,
                 {
@@ -297,10 +289,7 @@ def dispatch_next_queued(workspace, say):
 
         break
 
-    print(
-        "DISPATCH QUEUED JOB:",
-        job.job_id,
-    )
+    logger.info("DISPATCH QUEUED JOB: job_id=%s", job.job_id)
 
     thread = threading.Thread(
         target=execute_claimed_job,
@@ -339,11 +328,7 @@ def execute_claimed_job(job, say):
                 "error_summary": str(e)[:4000],
             },
         )
-        print(
-            "DISPATCH START FAILED:",
-            job.job_id,
-            repr(e),
-        )
+        logger.exception("DISPATCH START FAILED: job_id=%s", job.job_id)
         dispatch_next_queued(job.workspace, say)
 
 
@@ -384,9 +369,7 @@ def recover_queued_jobs(say):
     if not workspaces:
         return
 
-    print(
-        f"Queue recovery: {len(workspaces)} workspace(s)"
-    )
+    logger.warning("Queue recovery: %d workspace(s)", len(workspaces))
 
     for workspace in workspaces:
         dispatch_next_queued(workspace, say)
@@ -427,15 +410,12 @@ def prepare_execution(job):
     before = get_git_snapshot(workdir)
     save_git_snapshot(log_dir, "before", before)
 
-    print()
-    print("==============================")
-    print("JOB START")
-    print("job_id   :", job.job_id)
-    print("actor    :", job.actor)
-    print("mode     :", job.mode)
-    print("workspace:", job.workspace)
-    print("baseline :", before["head"])
-    print("==============================")
+    logger.info(
+        "\n==============================\n"
+        "JOB START\njob_id   : %s\nactor    : %s\nmode     : %s\n"
+        "workspace: %s\nbaseline : %s\n==============================",
+        job.job_id, job.actor, job.mode, job.workspace, before["head"],
+    )
 
     return workspace, workdir, log_dir, before
 
@@ -476,6 +456,10 @@ def process_artifacts(job, result, workspace, workdir):
                 )
                 validated.append((raw_path, path))
             except ArtifactPathError as e:
+                logger.warning(
+                    "Rejected artifact: job_id=%s path=%s reason=%s",
+                    job.job_id, raw_path, e,
+                )
                 rejected_artifacts.append({
                     "path": raw_path,
                     "reason": str(e),
@@ -503,12 +487,14 @@ def process_artifacts(job, result, workspace, workdir):
                 "PARTIAL_FAILURE" if artifacts else "FAILED"
             )
     except ManifestError as e:
+        logger.warning("Rejected artifact manifest: job_id=%s reason=%s", job.job_id, e)
         artifact_status = "FAILED"
         rejected_artifacts.append({
             "path": None,
             "reason": f"Manifest error: {e}",
         })
     except Exception as e:
+        logger.exception("Artifact processing failed: job_id=%s", job.job_id)
         # Artifact transport failure must not change execution status.
         artifact_status = "FAILED"
         rejected_artifacts.append({
@@ -651,6 +637,7 @@ def execute_job(job, say):
 
         if result.returncode != 0:
             status = "FAILED"
+            logger.error("Actor failure: job_id=%s exit_code=%s", job.job_id, result.returncode)
 
             state_store.mark_completed(
                 job.job_id,
@@ -758,23 +745,16 @@ def execute_job(job, say):
             error_summary=str(e)[:4000],
         )
 
-        print(
-            "BRIDGE ERROR:",
-            job.job_id,
-            repr(e),
-        )
+        logger.exception("BRIDGE ERROR: job_id=%s", job.job_id)
 
     finally:
-        print()
-        print("==============================")
-        print("JOB END")
-        print("job_id   :", job.job_id)
-        print("actor    :", job.actor)
-        print("mode     :", job.mode)
-        print("workspace:", job.workspace)
-        print("status   :", status)
-        print("exit_code:", exit_code)
-        print("==============================")
+        logger.info(
+            "\n==============================\n"
+            "JOB END\njob_id   : %s\nactor    : %s\nmode     : %s\n"
+            "workspace: %s\nstatus   : %s\nexit_code: %s\n"
+            "==============================",
+            job.job_id, job.actor, job.mode, job.workspace, status, exit_code,
+        )
 
         dispatch_next_queued(
             job.workspace,
@@ -830,10 +810,7 @@ def recover_running_jobs():
     if not running:
         return
 
-    print(
-        f"Crash recovery: "
-        f"{len(running)} RUNNING job(s)"
-    )
+    logger.warning("Crash recovery: %d RUNNING job(s)", len(running))
 
     for row in running:
         job_id = row["job_id"]
@@ -847,11 +824,7 @@ def recover_running_jobs():
                 job_id
             )
 
-            print(
-                "RECOVERY_REQUIRED:",
-                job_id,
-                "host mismatch",
-            )
+            logger.warning("RECOVERY_REQUIRED: job_id=%s host mismatch", job_id)
             continue
 
         alive = process_exists(pid)
@@ -861,11 +834,7 @@ def recover_running_jobs():
                 job_id
             )
 
-            print(
-                "INTERRUPTED:",
-                job_id,
-                "process not found",
-            )
+            logger.warning("INTERRUPTED: job_id=%s process not found", job_id)
 
         else:
             # process alive または
@@ -878,14 +847,11 @@ def recover_running_jobs():
                 job_id
             )
 
-            print(
-                "RECOVERY_REQUIRED:",
-                job_id,
-                f"pid={pid}",
-            )
+            logger.warning("RECOVERY_REQUIRED: job_id=%s pid=%s", job_id, pid)
 
 
 def main():
+    configure_logging()
     state_store.initialize()
 
     cli_available = check_cli_versions()
@@ -898,13 +864,9 @@ def main():
 
     recover_queued_jobs(bridge.say)
 
-    print(
-        "ChatGPT Local Agent Worker started."
-    )
-    print(
-        "Authorization and state store enabled."
-    )
-    print("Press Ctrl+C to stop.")
+    logger.info("ChatGPT Local Agent Worker started.")
+    logger.info("Authorization and state store enabled.")
+    logger.info("Press Ctrl+C to stop.")
 
     bridge.start()
 

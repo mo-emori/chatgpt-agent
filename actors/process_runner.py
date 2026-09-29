@@ -1,3 +1,4 @@
+import logging
 import os
 import subprocess
 import threading
@@ -9,6 +10,8 @@ from config import (
     HEARTBEAT_INTERVAL_SECONDS,
     HOSTNAME,
 )
+
+logger = logging.getLogger(__name__)
 
 @dataclass
 class ProcessResult:
@@ -101,11 +104,7 @@ def run_process(
             ):
                 collector.append(line)
 
-                print(
-                    f"[{label}] "
-                    f"{line.rstrip()}",
-                    flush=True,
-                )
+                logger.info("[%s] %s", label, line.rstrip())
         finally:
             stream.close()
 

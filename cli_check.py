@@ -1,3 +1,4 @@
+import logging
 import subprocess
 
 from config import (
@@ -5,6 +6,8 @@ from config import (
     CODEX_CMD,
     EXPECTED_CLI,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class CliVersionError(RuntimeError):
@@ -43,10 +46,9 @@ def check_cli_versions():
         ok = version == expected
         available[actor] = ok
 
-        print(
-            f"{actor}: "
-            f"{version} "
-            f"{'OK' if ok else 'VERSION MISMATCH'}"
+        logger.info(
+            "%s: %s %s", actor, version,
+            "OK" if ok else "VERSION MISMATCH",
         )
 
     return available

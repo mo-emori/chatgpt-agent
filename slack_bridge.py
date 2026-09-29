@@ -1,3 +1,6 @@
+import json
+import logging
+
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
@@ -7,6 +10,8 @@ from config import (
     SLACK_APP_TOKEN,
     SLACK_BOT_TOKEN,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class SlackBridge:
@@ -27,29 +32,28 @@ class SlackBridge:
 
         # Authorization
         if channel not in ALLOWED_CHANNEL_IDS:
-            print(
-                "Slack message ignored:"
-                " unauthorized channel",
-                channel,
-            )
+            logger.warning("Slack message ignored: unauthorized channel %s", channel)
             return
 
         if sender not in ALLOWED_SENDER_IDS:
-            print(
-                "Slack message ignored:"
-                " unauthorized sender",
-                sender,
-            )
+            logger.warning("Slack message ignored: unauthorized sender %s", sender)
             return
 
         text = event.get("text", "").strip()
 
-        print()
-        print("===== AUTHORIZED SLACK EVENT =====")
-        print("channel:", channel)
-        print("sender :", sender)
-        print("text   :", repr(text))
-        print("==================================")
+        metadata = {}
+        try:
+            payload = json.loads(text)
+            if isinstance(payload, dict):
+                metadata = payload
+        except (json.JSONDecodeError, TypeError):
+            pass
+        logger.info(
+            "Authorized Slack event: channel=%s sender=%s job_id=%s protocol_version=%s",
+            channel, sender, metadata.get("job_id", "unknown"),
+            metadata.get("protocol_version", "unknown"),
+        )
+        logger.debug("Authorized Slack event raw text: %r", text)
 
         self.message_handler(
             text=text,

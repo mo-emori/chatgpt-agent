@@ -5,7 +5,7 @@ from dotenv import load_dotenv
 
 
 PAGE_ID = (
-    "3e930bde-8a72-806b-b974-e4419233781a"
+    "3ea30bde-8a72-81d6-a782-ca2a14e7bb5d"
 )
 
 NOTION_VERSION = "2025-09-03"

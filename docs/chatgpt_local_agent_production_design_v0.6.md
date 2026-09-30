@@ -75,12 +75,26 @@ Channel allowed? ─ No → Ignore + Operational Log
   ↓ Yes
 Sender allowed?  ─ No → Ignore + Operational Log
   ↓ Yes
+Control message match? ─ Yes → Handle PING / PONG without Job State
+  ↓ No
 JOB parse / validate / accept
 ```
 
 認可不一致はSlackへ `BRIDGE_ERROR` を返さず、ローカルOperational Logだけに記録する。
 初期本番ではHumanがChatGPTへ実行依頼を出した時点をHuman Authorizationとみなす。
 自動JOB連鎖や自動修正ループを導入する場合は、別途Human approval境界を設計する。
+
+認可後の制御・liveness messageとして、次のplaintext PING / PONGを正式にサポートする。
+
+```text
+Request:  LOCAL-AGENT PING
+Response: LOCAL-AGENT PONG — Worker ready
+```
+
+これはProtocol v1 / v2 / v3のJOB JSONではなく、Channel / Sender認可後にだけ処理する。
+Job State rowを作成せず、JOB parser / dispatchには入らない。未認可のPINGにはPONGを返さず、
+通常のnon-JOB textも従来どおりignoreする。目的はChatGPT → Slack → Worker → Slackの
+軽量なliveness / preflightであり、Notion / Actors / Drive / Browserのdeep health checkではない。
 
 ## 4. JOB Protocol
 
@@ -255,6 +269,11 @@ job, end = decoder.raw_decode(text)
 Parse前にChannel / Sender authorizationを行う。v3 parserはPrompt本文やrequest hashを許容せず、
 `instruction_ref.type == "notion_page"` と `page_id` を検証する。
 
+PINGはJSON decodeより前の、認可済みplaintext control messageの完全一致として扱う。
+ChatGPT Slack transportが付加する既知のattribution付き形式、例えば
+`LOCAL-AGENT PING *使用して送信されました* <@...>` は受理する。ただし、
+`LOCAL-AGENT PING SOMETHING` のような任意のlookalikeはPINGとして受理しない。
+
 ## 10. Job State Store / State Machine
 
 SQLiteをJob State Storeとして使用する。
@@ -368,7 +387,8 @@ v3では `prompt_sha256 == instruction_sha256` であり、Workerがacceptance-t
 `status=DONE / exit_code=0 / artifact_status=PARTIAL_FAILURE` は有効である。
 Drive失敗を理由に成功したActor executionをFAILEDへ変更しない。
 
-Slack Result ManifestはBrowser Callbackより先に送信する。Browser CallbackはResult authorityではない。
+Slack Result Manifestは、成功・失敗のどちらでもBrowser Callbackより先に送信する。
+Browser CallbackはResult authorityではない。
 callback結果はLocal `result.json` に記録し、callback失敗によってexecution / artifact statusを変更しない。
 
 ## 14. Artifact Manifest
@@ -509,6 +529,9 @@ Evidence本体はLocal Repo / Local Execution Evidence / 必要に応じたDrive
 
 Browser CallbackはJOBごとのoptional routing metadataであり、Result authorityではなくwake-up notificationである。
 固定conversation URLをWorker設定に持たず、ChatGPTがJOB発行時に自分のconversation URLを渡す。
+Workerは発行元conversationを推定または自動発見しない。新しいLocal Agent利用conversationでは、
+Humanがそのconversation URLをChatGPTに一度渡し、ChatGPTはそのconversationから発行するJOBの
+`callback.url` に使う。別conversationのcallback URLを流用しない。
 
 ```text
 Actor execution
@@ -524,12 +547,39 @@ Local result.jsonへcallback結果追記
 JOB END
 ```
 
-CallbackではResult全文やArtifactを配送せず、job_id / actor / workspace / execution status /
-artifact statusとSlack Result確認要求だけを送る。callback失敗はActor / Artifact結果を変更しない。
+terminal successでは `LOCAL_AGENT_JOB_COMPLETED`、trustworthyなcallback metadataを持つ
+supported terminal failureでは `LOCAL_AGENT_JOB_FAILED` を送る。失敗callbackには
+job_id / actor / workspace / status / 取得できる場合のfailure_class / artifact_statusと、
+Slack Result Manifestを確認する指示のみを含める。Prompt / Instruction本文、stdout / stderr dump、
+secrets、Artifactは含めない。malformed / unparseable / unauthorized inputなど、trustworthyな
+callback destinationを得られない場合はBrowser Callbackを行わない。
+
+Slack Result Manifestを必ずBrowser Callbackより先に公開し、成功・失敗のどちらでも
+この順序を守る。Slack Result Manifestがauthorityであり、callback失敗はActor execution / Artifact statusを変更しない。
 callbackでwake-upしたChatGPTがHumanの確認なしに次のJOBを発行してはならない。
 
-Agent専用Browser profile、CDP endpoint、selector一意性のFail Closed規則を維持する。
-正常系E2EとBrowser停止時 `ECONNREFUSED` のfailure isolation E2Eを確認済みである。
+Browser UIはlive DOMを毎回検査し、次の観測済みstateを使う。
+
+| State | Observed action control |
+|---|---|
+| IDLE / empty | 右側action `aria-label="音声会話を開始"` |
+| SEND-ready / text present | `button type="submit"`, `aria-label="送信"` |
+| GENERATING | `button type="button"`, `aria-label="停止"` |
+
+`aria-label="停止"` がvisibleな間はChatGPTが生成中である。WorkerはSTOPをクリックせず、
+callback textも書き込まず、約120秒を上限として約500 ms間隔で終了を待つ。
+生成終了後にuniqueなvisible composerを再取得・再検証する。composerが非空ならHuman draftとして
+Fail Closedにし、overwrite / clear / append / sendのいずれも行わない。観測したliveな空contenteditableは
+`innerText="\n"`, `textContent=""`, placeholder paragraph HTMLであり、whitespace-onlyの `innerText` は空と扱う。
+
+空composerの確認後にのみcallback textをfillし、uniqueなvisible SEND buttonを約5秒まで待つ。
+SENDがenabledであることを必須としてからclickする。callback text挿入後、send前に失敗した場合のcleanupは
+best-effortであり、現在のcomposer textがそのinvocationが挿入したcallback messageと完全一致する場合に限ってclearする。
+Humanが変更した、またはそれ以外のcomposer textは決してclearしない。unknown / ambiguous DOM stateは
+Fail Closedとし、Agent専用Browser profile、CDP endpoint、selectorのuniqueness / visibility safetyを維持する。
+
+`tests/manual/inspect_chatgpt_buttons.py` は現在のChatGPT composer / action button stateを調べる
+手動DOM diagnostic helperであり、通常のWorker executionの一部ではない。
 
 ## 23. 初期本番で導入しないもの
 
@@ -560,7 +610,9 @@ Agent専用Browser profile、CDP endpoint、selector一意性のFail Closed規�
 - Execution Status / Artifact Status分離
 - Artifact Manifest / Windows Path Validation / conditional Drive upload
 - centralized rotating Operational Log
-- Result Manifest before Browser Callback / callback failure isolation
+- 認可後のformal plaintext PING / PONG（attribution付き許容、lookalike拒否）
+- success / supported terminal failure Browser Callback、Result Manifest before Callback、callback failure isolation
+- Browser Callbackのgeneration wait / STOP非操作 / composer draft protection / DOM Fail Closed
 
 ## 25. 実装・E2E確認済み
 
@@ -582,9 +634,20 @@ v1 / v2の既存baselineに加え、v3について以下を確認済みとする
 - Result Manifest `prompt_sha256 == instruction_sha256`
 - atomic `DISPATCHING` claim
 - concurrent new-job same-workspace serialization
+- formal plaintext PING / PONGのChatGPT → Slack → Worker → Slack E2E
+- Slack attribution付きPINGの受理
+- valid callback metadataを持つterminal failure callback
+- `INSTRUCTION_NOT_FOUND` → Slack failure Result Manifest → `LOCAL_AGENT_JOB_FAILED` によるChatGPT wake-up
+- failure pathのResult-before-Callback ordering
+- busy ChatGPT callback: GENERATING / `aria-label="停止"` → Worker wait → generation end →
+  empty composer認識 → callback fill → `aria-label="送信"` → send → `LOCAL_AGENT_JOB_FAILED` がChatGPTに到達
+- generation wait中にSTOPをclickしないこと
+- 既存composer draftの保護
+- full local regression suite: 41 tests PASS
 
 既存E2Eとして、ChatGPT → Slack → Worker → Codex / Claude、Local Workspace書込み、
-条件付きDrive upload、Slack Result、Browser callback正常系、およびBrowser停止時failure isolationを維持する。
+条件付きDrive upload、Slack Result、Browser callback成功・失敗終端系、busy state synchronization、
+およびBrowser停止時failure isolationを維持する。
 
 ## 26. 設計原則
 

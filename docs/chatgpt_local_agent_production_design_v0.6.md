@@ -242,11 +242,30 @@ claude -p <prompt>
 CodexはWorkspace Registryに応じて実行する。
 
 ```text
-sandbox:       codex exec --skip-git-repo-check --sandbox workspace-write <prompt>
-git workspace: codex exec --sandbox workspace-write <prompt>
+sandbox:       codex exec --skip-git-repo-check --sandbox workspace-write -
+git workspace: codex exec --sandbox workspace-write -
 ```
 
 Codex implementationとClaude independent reviewの境界を維持し、CodexからClaude Codeを直接起動させない。
+
+### 7.1 Windows Codex sandbox backend decision
+
+Windows上の本Local Agent環境では、Codex設定のsandbox backendを次のとおり固定する。
+
+```toml
+[windows]
+sandbox = "mxc"
+```
+
+Local Agentの実行contractは変更しない。Codexは引き続き `codex exec --sandbox workspace-write -` で起動し、subprocessの`cwd`はWorkspace Registryに登録されたworkspace pathとする。`--sandbox workspace-write`はCodex sandboxの境界を指定し、Windows上でその境界を実装するbackendはCodex configのMXCである。approval behaviorも変更しない。sandboxを削除する判断ではなく、`workspace-write`をMXCで実装する判断である。
+
+本環境では`elevated` backendを承認しない。また、MXCを利用できない場合に`elevated`へsilent fallbackしてはならない。ARGUS（`C:\dev\argus`）で`elevated`を使用した際、workspace rootへの持続的なsandbox ALLOW ACE（`ares\CodexSandboxUsers`および未解決sandbox SID）、`.git`へのsandbox SID明示DENY ACE、tree内の不整合なACL、書込み可能fileだけに付加されたsandbox SID ACE、およびcanonical docsへの実際のwrite failureを観測した。既存の影響pathはARGUS作業で別途修復済みである。
+
+これらのローカル観測と後述のcontrolled A/Bは、同世代Windows Codex CLIの`elevated` / `workspace-write`周辺で知られているACL mutation defectと整合し、backendが原因であることを強く支持する。ただし、観測範囲を超えてCLI全体または全Windows環境へ一般化しない。
+
+### 7.2 Workspace validation and filesystem integrity scope
+
+本incidentのprimary remediationはWindows sandbox backendをMXCに固定することである。広範なFilesystem Preflight frameworkはprimary remediationとして要求せず、Planner / Operation-Preflight architectureをv0.6へ導入しない。軽量なworkspace integrity checkは、必要性を別途評価したうえで将来追加してよい。
 
 ## 8. CLI Version Policy
 
@@ -259,7 +278,17 @@ EXPECTED_CLI = {
 }
 ```
 
-Version不一致時は該当ActorをUnavailableとする。CLI更新時はsandboxで回帰テストを実施し、確認後に設定を更新する。
+Version不一致時は該当ActorをUnavailableとする。WindowsでCodex CLIを更新する場合、`EXPECTED_CLI`を更新する前に次のsandbox-backend regressionを完了しなければならない。
+
+- backendがMXCのままであることを確認する
+- fresh scratch workspaceを用意する
+- `--sandbox workspace-write`でfile createおよび同一fileのrewriteを確認する
+- workspace root ACLのbefore / afterを比較する
+- `.git` ACLのbefore / afterを比較する
+- new file ACLにsandbox ACE pollutionがないことを確認する
+- 実行可能な場合はLocal Agent E2Eを行う
+
+regressionがpassした後にのみ`EXPECTED_CLI`を更新する。現在の`codex-cli 0.157.1`を普遍的に安全とみなしてはならない。本環境で確認された安全性は、テスト済みのMXC backend configurationと`workspace-write` execution contractの組合せに依存する。
 
 ## 9. Slack Message Parse
 
@@ -490,6 +519,8 @@ Operational LogとJOB単位Local Execution Evidenceは別物である。
 EvidenceはWorkspace repo外・Git管理外・通常のDrive Artifact対象外とする。
 Worker取得Git Evidenceを変更事実のauthorityとする。Slackへstdout/stderrのraw全文を流さない。
 
+Windowsでは、WorkerによるGit before / after evidenceはCodex actor sandboxの外側から収集する。一方、`elevated` backendで`.git`へsandbox SIDの明示DENY ACEが付与されたことは、許容できないworkspace side effectである。したがってGit content evidenceとは別に、`.git` ACLのbefore / afterをWindows sandbox regressionの必須確認対象とする。
+
 ## 19. Timeout
 
 ```python
@@ -624,6 +655,8 @@ Fail Closedとし、Agent専用Browser profile、CDP endpoint、selectorのuniqu
 - persistent QUEUED restart recoveryとincomplete legacy v3 state Fail Closed
 - PID / host / heartbeat / RUNNING Crash Recovery
 - CLI Version Gate / Git Workspace Validation
+- Windows Codex sandbox backend MXC requirement / no silent fallback to elevated
+- Windows sandbox regression（workspace root / `.git` / new file ACL、create / rewrite）
 - Codex implementation / Claude Code read-only independent review
 - JOB単位Local Execution Evidence / Git before-after Evidence
 - Execution Status / Artifact Status分離
@@ -672,6 +705,40 @@ v1 / v2の既存baselineに加え、v3について以下を確認済みとする
 - generation wait中にSTOPをclickしないこと
 - 既存composer draftの保護
 - full local regression suite: 45 tests PASS
+
+### 25.1 Windows sandbox controlled A/B and Local Agent E2E
+
+fresh scratch repo `C:\dev\codex-sandbox-test`をcontrolled validation専用に使用した。初期ACLは通常の継承Windows ACLのみであり、Codex sandbox SID ALLOW ACE、`ares\CodexSandboxUsers` ACE、`.git` sandbox DENY ACEはいずれも存在しなかった。
+
+MXCでのinteractive Codex testでは`mxc-test.txt`の作成に成功した。実行後もworkspace root、`.git`、`baseline.txt`のACLは不変で、新規fileは通常の継承ACLのみを持った。
+
+Local-Agent-equivalent direct CLI testでは、workdirを`C:\dev\codex-sandbox-test`として、次のcontractを実行した。
+
+```text
+"Create local-agent-mxc-test.txt ..." | codex exec --sandbox workspace-write -
+approval: never
+sandbox: workspace-write
+```
+
+file createに成功し、同一fileを再open / rewriteして内容を検証した。workspace root、`.git`、`baseline.txt`のACLは不変で、新規fileにもsandbox ACE pollutionはなかった。
+
+full Local Agent E2E `LOCAL-AGENT-MXC-E2E-20261001-001`は次の実経路を検証した。
+
+```text
+actor=codex
+mode=implementation
+workspace=codex-sandbox-test
+
+ChatGPT -> Slack -> Local Agent Worker -> Workspace Registry
+-> C:\dev\codex-sandbox-test
+-> codex exec --sandbox workspace-write -> MXC
+```
+
+結果は`status=DONE`、`exit_code=0`、`artifact_status=DONE`であった。Codexは`local-agent-e2e-mxc.txt`を作成して内容を検証し、同一fileを再open / rewriteできた。callbackも正常に返却された。
+
+callback後のhost-side ACL inspectionでは、workspace root、`.git`、`baseline.txt`はいずれも不変で、`local-agent-e2e-mxc.txt`は通常の継承ACLのみを持った。sandbox SID ALLOW ACE、`CodexSandboxUsers` ACE、`.git` sandbox DENY ACEは再現しなかった。したがって、このcontrolled testではMXCを使用するLocal Agentの実execution pathが`elevated`で観測したACL pollutionを再現しないことを確認した。
+
+`codex-sandbox-test`はcontrolled validationの一時workspaceであり、恒久的なproduction workspace要件またはWorkspace Registry entryではない。
 
 既存E2Eとして、ChatGPT → Slack → Worker → Codex / Claude、Local Workspace書込み、
 条件付きDrive upload、Slack Result、Browser callback成功・失敗終端系、busy state synchronization、

@@ -22,7 +22,33 @@ SUPPORTED_PROTOCOL_VERSIONS = {
 
 
 class JobValidationError(ValueError):
-    pass
+    def __init__(self, message, *, callback_job=None):
+        super().__init__(message)
+        self.callback_job = callback_job
+
+
+def validated_callback(data):
+    callback = data.get("callback")
+    if callback is None:
+        return None, None
+    if not isinstance(callback, dict):
+        raise JobValidationError("INVALID_CALLBACK")
+    callback_type = callback.get("type")
+    callback_url = callback.get("url")
+    if callback_type != "chatgpt_browser":
+        raise JobValidationError("UNKNOWN_CALLBACK_TYPE")
+    if not isinstance(callback_url, str):
+        raise JobValidationError("INVALID_CALLBACK_URL")
+    callback_url = callback_url.strip()
+    if callback_url.startswith("<") and callback_url.endswith(">"):
+        callback_url = callback_url[1:-1]
+    if "|" in callback_url:
+        callback_url = callback_url.split("|", 1)[0]
+    callback_url = callback_url.strip()
+    parsed = urlparse(callback_url)
+    if parsed.scheme != "https" or parsed.hostname != "chatgpt.com":
+        raise JobValidationError("INVALID_CALLBACK_URL")
+    return callback_type, callback_url
 
 
 @dataclass(frozen=True)
@@ -216,25 +242,37 @@ def parse_job(text: str) -> Job:
         "protocol_version"
     ]
 
-    if (
-        protocol_version
-        not in SUPPORTED_PROTOCOL_VERSIONS
-    ):
-        raise JobValidationError(
-            "UNKNOWN_PROTOCOL_VERSION"
-        )
+    if not isinstance(protocol_version, str) or not protocol_version.strip():
+        raise JobValidationError("UNKNOWN_PROTOCOL_VERSION")
+    if not isinstance(data["job_id"], str) or not data["job_id"].strip():
+        raise JobValidationError("job_id must be non-empty")
+    for key in ("actor", "mode", "workspace"):
+        if not isinstance(data[key], str) or not data[key].strip():
+            raise JobValidationError(f"{key} must be non-empty")
 
-    if protocol_version in {"1", "2"}:
-        if "prompt" not in data:
-            raise JobValidationError(
-                "Missing fields: prompt"
-            )
+    # Once this succeeds, later semantic failures may safely wake exactly the
+    # callback supplied by this authorized request without accepting the job.
+    callback_type, callback_url = validated_callback(data)
+    callback_job = Job(
+        protocol_version=protocol_version,
+        job_id=data["job_id"],
+        actor=data["actor"],
+        mode=data["mode"],
+        workspace=data["workspace"],
+        callback_type=callback_type,
+        callback_url=callback_url,
+    )
 
-    elif protocol_version == "3":
-        if "instruction_ref" not in data:
-            raise JobValidationError(
-                "Missing fields: instruction_ref"
-            )
+    def reject(message):
+        raise JobValidationError(message, callback_job=callback_job)
+
+    if protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
+        reject("UNKNOWN_PROTOCOL_VERSION")
+
+    if protocol_version in {"1", "2"} and "prompt" not in data:
+        reject("Missing fields: prompt")
+    if protocol_version == "3" and "instruction_ref" not in data:
+        reject("Missing fields: instruction_ref")
 
     actor_mode = (
         data["actor"],
@@ -242,19 +280,10 @@ def parse_job(text: str) -> Job:
     )
 
     if actor_mode not in ALLOWED_ACTOR_MODES:
-        raise JobValidationError(
-            f"Actor/mode not allowed: {actor_mode}"
-        )
+        reject(f"Actor/mode not allowed: {actor_mode}")
 
     if data["workspace"] not in WORKSPACES:
-        raise JobValidationError(
-            f"Unknown workspace: {data['workspace']}"
-        )
-
-    if not isinstance(data["job_id"], str) or not data["job_id"].strip():
-        raise JobValidationError(
-            "job_id must be non-empty"
-        )
+        reject(f"Unknown workspace: {data['workspace']}")
 
     if protocol_version in {"1", "2"}:
         if (
@@ -264,27 +293,25 @@ def parse_job(text: str) -> Job:
             )
             or not data["prompt"].strip()
         ):
-            raise JobValidationError(
-                "prompt must be non-empty"
-            )
+            reject("prompt must be non-empty")
 
     if protocol_version == "1":
         # 現行処理をそのまま維持
-        prompt, verified_hash = (
-            decode_and_verify_prompt(data)
-        )
+        try:
+            prompt, verified_hash = decode_and_verify_prompt(data)
+        except JobValidationError as e:
+            reject(str(e))
 
         instruction_ref = None
 
     elif protocol_version == "2":
         if "prompt_sha256" in data:
-            raise JobValidationError(
-                "PROMPT_SHA256_NOT_ALLOWED"
-            )
+            reject("PROMPT_SHA256_NOT_ALLOWED")
 
-        prompt_bytes = decode_prompt_v2(
-            data
-        )
+        try:
+            prompt_bytes = decode_prompt_v2(data)
+        except JobValidationError as e:
+            reject(str(e))
 
         verified_hash = hashlib.sha256(
             prompt_bytes
@@ -296,41 +323,29 @@ def parse_job(text: str) -> Job:
                 errors="strict",
             )
         except UnicodeDecodeError as e:
-            raise JobValidationError(
-                "PROMPT_NOT_UTF8"
-            ) from e
+            reject("PROMPT_NOT_UTF8")
 
         instruction_ref = None
 
     elif protocol_version == "3":
         if "prompt" in data:
-            raise JobValidationError(
-                "PROMPT_NOT_ALLOWED"
-            )
+            reject("PROMPT_NOT_ALLOWED")
 
         if "prompt_encoding" in data:
-            raise JobValidationError(
-                "PROMPT_ENCODING_NOT_ALLOWED"
-            )
+            reject("PROMPT_ENCODING_NOT_ALLOWED")
 
         if "prompt_sha256" in data:
-            raise JobValidationError(
-                "PROMPT_SHA256_NOT_ALLOWED"
-            )
+            reject("PROMPT_SHA256_NOT_ALLOWED")
 
         ref = data.get(
             "instruction_ref"
         )
 
         if not isinstance(ref, dict):
-            raise JobValidationError(
-                "INSTRUCTION_REF_INVALID"
-            )
+            reject("INSTRUCTION_REF_INVALID")
 
         if ref.get("type") != "notion_page":
-            raise JobValidationError(
-                "INSTRUCTION_REF_INVALID"
-            )
+            reject("INSTRUCTION_REF_INVALID")
 
         page_id = ref.get(
             "page_id"
@@ -340,9 +355,7 @@ def parse_job(text: str) -> Job:
             not isinstance(page_id, str)
             or not page_id.strip()
         ):
-            raise JobValidationError(
-                "INSTRUCTION_REF_INVALID"
-            )
+            reject("INSTRUCTION_REF_INVALID")
         
         prompt = None
         verified_hash = None

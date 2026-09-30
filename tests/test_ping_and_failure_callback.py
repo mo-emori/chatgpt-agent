@@ -99,6 +99,68 @@ class PingTests(unittest.TestCase):
 
 
 class FailureCallbackTests(unittest.TestCase):
+    def actor_mode_payload(self, callback=True):
+        data = {
+            "protocol_version": "3",
+            "job_id": "V3-ACTOR-MODE-REJECT",
+            "actor": "codex",
+            "mode": "review",
+            "workspace": "argus",
+            "instruction_ref": {"type": "notion_page", "page_id": "page-1"},
+        }
+        if callback:
+            data["callback"] = {"type": "chatgpt_browser", "url": CALLBACK_URL}
+        return json.dumps(data)
+
+    def test_actor_mode_rejection_publishes_slack_before_failed_callback(self):
+        events = []
+        with (
+            patch.object(agent_worker, "send_browser_callback",
+                         side_effect=lambda *a, **k: events.append(("callback", a, k))),
+            patch.object(agent_worker.state_store, "create_job") as create_job,
+            patch.object(agent_worker, "dispatch_next_queued") as dispatch,
+            patch.object(agent_worker, "resolve_v3_instruction") as resolve,
+        ):
+            agent_worker.process_message(
+                text=self.actor_mode_payload(), channel="C", sender="U",
+                say=lambda message: events.append(("slack", message)),
+            )
+        self.assertEqual([event[0] for event in events], ["slack", "callback"])
+        self.assertIn('"failure_class": "INVALID_JOB"', events[0][1])
+        self.assertEqual(events[1][2]["status"], "BRIDGE_ERROR")
+        self.assertEqual(events[1][2]["artifact_status"], "NOT_RUN")
+        create_job.assert_not_called()
+        dispatch.assert_not_called()
+        resolve.assert_not_called()
+
+    def test_actor_mode_rejection_without_callback_only_publishes_slack(self):
+        say = Mock()
+        with patch.object(agent_worker, "send_browser_callback") as callback:
+            agent_worker.process_message(
+                text=self.actor_mode_payload(callback=False), channel="C", sender="U", say=say
+            )
+        say.assert_called_once()
+        callback.assert_not_called()
+
+    def test_invalid_callback_metadata_never_attempts_callback(self):
+        payload = json.loads(self.actor_mode_payload())
+        payload["callback"]["url"] = "https://evil.example/c/x"
+        with patch.object(agent_worker, "send_browser_callback") as callback:
+            agent_worker.process_message(
+                text=json.dumps(payload), channel="C", sender="U", say=Mock()
+            )
+        callback.assert_not_called()
+
+    def test_unauthorized_job_event_never_reaches_callback(self):
+        bridge = slack_bridge.SlackBridge.__new__(slack_bridge.SlackBridge)
+        bridge.message_handler = Mock()
+        bridge._handle_message({
+            "channel": "UNAUTHORIZED",
+            "user": next(iter(slack_bridge.ALLOWED_SENDER_IDS)),
+            "text": self.actor_mode_payload(),
+        }, Mock())
+        bridge.message_handler.assert_not_called()
+
     def test_notion_resolve_failure_publishes_slack_before_callback(self):
         payload = json.dumps({
             "protocol_version": "3",

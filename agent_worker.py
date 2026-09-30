@@ -160,6 +160,29 @@ def resolve_v3_instruction(job):
     )
 
 
+def reject_pre_dispatch(say, job, *, failure_class, error_summary):
+    """Publish the authoritative Slack rejection before an optional wake-up."""
+    response = {
+        "status": "BRIDGE_ERROR",
+        "failure_class": failure_class,
+        "error_summary": error_summary,
+    }
+    if job is not None:
+        response.update({"protocol_version": job.protocol_version, "job_id": job.job_id})
+    send_json(say, response)
+    if (
+        job is not None
+        and job.callback_type is not None
+        and job.callback_url is not None
+    ):
+        send_browser_callback(
+            job,
+            status="BRIDGE_ERROR",
+            artifact_status="NOT_RUN",
+            failure_class=failure_class,
+        )
+
+
 def process_message(
     *,
     text,
@@ -176,14 +199,11 @@ def process_message(
 
     except JobValidationError as e:
         logger.error("JOB validation failed: %s", e)
-
-        send_json(
+        reject_pre_dispatch(
             say,
-            {
-                "status": "BRIDGE_ERROR",
-                "failure_class": "INVALID_JOB",
-                "error_summary": str(e),
-            },
+            getattr(e, "callback_job", None),
+            failure_class="INVALID_JOB",
+            error_summary=str(e),
         )
         return
 
@@ -219,24 +239,11 @@ def process_message(
 
             logger.error("INSTRUCTION RESOLVE FAILED: job_id=%s failure=%s", job.job_id, failure_class)
 
-            response = {
-                    "protocol_version":
-                        job.protocol_version,
-                    "job_id":
-                        job.job_id,
-                    "status":
-                        "BRIDGE_ERROR",
-                    "failure_class":
-                        failure_class,
-                    "error_summary":
-                        failure_class,
-                }
-            send_json(say, response)
-            send_browser_callback(
+            reject_pre_dispatch(
+                say,
                 job,
-                status="BRIDGE_ERROR",
-                artifact_status="NOT_RUN",
                 failure_class=failure_class,
+                error_summary=failure_class,
             )
 
             return

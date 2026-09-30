@@ -225,7 +225,12 @@ ALLOWED_ACTOR_MODES = {
 }
 ```
 
-未知の組合せは拒否する。Claude reviewはread-only構成とする。
+未知の組合せはActor起動前のterminal validation failureとして拒否する。現在の外部failure contractは
+`status=BRIDGE_ERROR`、`failure_class=INVALID_JOB` であり、例えば `codex + review` の
+`error_summary` は `Actor/mode not allowed: ('codex', 'review')` となる。認可済みrequestが安全なrouting metadataと
+trustworthyなcallback destinationを確立できるところまでparseされている場合、この拒否はSlack failure Resultを先に公開し、
+続いて `LOCAL_AGENT_JOB_FAILED` を通知する。通知はJOB acceptanceではなく、許可されていないActor / Modeを実行する権限を
+作らない。Actorは起動しない。Claude reviewはread-only構成とする。
 
 ```text
 claude -p <prompt>
@@ -268,6 +273,11 @@ job, end = decoder.raw_decode(text)
 
 Parse前にChannel / Sender authorizationを行う。v3 parserはPrompt本文やrequest hashを許容せず、
 `instruction_ref.type == "notion_page"` と `page_id` を検証する。
+認可後、requestがjob_id / actor / workspaceとtrustworthyな `chatgpt_browser` callback destinationを安全に確立できるまで
+parseされた後のterminal validation failureは、shared rejection pathでSlack failure Resultを公開してから
+`LOCAL_AGENT_JOB_FAILED` を送る。これはvalidation成功またはJOB acceptanceを意味せず、Actorを起動しない。
+unauthorized、callback destinationを安全に確立できないmalformed / unparseable request、invalid / untrusted callback metadataは
+Fail Closedかつno-callbackとする。previous / global conversation URLを推定または再利用しない。
 
 PINGはJSON decodeより前の、認可済みplaintext control messageの完全一致として扱う。
 ChatGPT Slack transportが付加する既知のattribution付き形式、例えば
@@ -534,25 +544,34 @@ Humanがそのconversation URLをChatGPTに一度渡し、ChatGPTはそのconver
 `callback.url` に使う。別conversationのcallback URLを流用しない。
 
 ```text
-Actor execution
-  ↓
-Git Evidence / Artifact processing
-  ↓
-Slack Result Manifest
-  ↓
-Browser Callback
-  ↓
-Local result.jsonへcallback結果追記
-  ↓
-JOB END
+Accepted execution terminal path:
+Actor execution → Git Evidence / Artifact processing → Slack Result Manifest → Browser Callback
+                → Local result.jsonへcallback結果追記 → JOB END
+
+Callback-eligible pre-dispatch rejection path:
+terminal validation failure → Slack failure Result → Browser Callback LOCAL_AGENT_JOB_FAILED
+                            → Local result.jsonへcallback結果追記 → JOB END
+                              （Actorは起動しない）
 ```
 
 terminal successでは `LOCAL_AGENT_JOB_COMPLETED`、trustworthyなcallback metadataを持つ
-supported terminal failureでは `LOCAL_AGENT_JOB_FAILED` を送る。失敗callbackには
+supported terminal failureでは `LOCAL_AGENT_JOB_FAILED` を送る。supported failureには、通常のJOB acceptance / execution後の
+failureだけでなく、認可済みrequestがcallback destinationと安全なrouting metadataを確立できるところまでparseされた後の
+terminal pre-dispatch validation rejectionを含む。この場合もshared rejection pathはfailure determination →
+Slack failure Result → Browser Callbackの順で処理し、Actorを起動しない。失敗callbackには
 job_id / actor / workspace / status / 取得できる場合のfailure_class / artifact_statusと、
 Slack Result Manifestを確認する指示のみを含める。Prompt / Instruction本文、stdout / stderr dump、
-secrets、Artifactは含めない。malformed / unparseable / unauthorized inputなど、trustworthyな
-callback destinationを得られない場合はBrowser Callbackを行わない。
+secrets、Artifactは含めない。
+
+Failure notification boundaryは次のとおりとする。
+
+- callback eligible: authorizedで、job_id / actor / workspace等のsafe routing metadataまで十分にparseでき、
+  request自身からtrustworthyなcallback destinationを確立済みであるterminal validation failure
+- callback ineligible: unauthorized channel / sender、callback destinationを安全に確立できないmalformed / unparseable request、
+  invalid / untrusted callback metadata
+
+callback-ineligible failureはFail Closedかつno-callbackとする。Workerはcallback URLを推定せず、previous / global conversation URLや
+別conversationのURLを再利用しない。したがって、すべてのmalformed requestがcallback可能であるとは限らない。
 
 Slack Result Manifestを必ずBrowser Callbackより先に公開し、成功・失敗のどちらでも
 この順序を守る。Slack Result Manifestがauthorityであり、callback失敗はActor execution / Artifact statusを変更しない。
@@ -611,7 +630,9 @@ Fail Closedとし、Agent専用Browser profile、CDP endpoint、selectorのuniqu
 - Artifact Manifest / Windows Path Validation / conditional Drive upload
 - centralized rotating Operational Log
 - 認可後のformal plaintext PING / PONG（attribution付き許容、lookalike拒否）
-- success / supported terminal failure Browser Callback、Result Manifest before Callback、callback failure isolation
+- success / supported terminal failure Browser Callback（trustworthy metadataを持つpre-dispatch validation rejectionを含む）、
+  Result Manifest before Callback、callback failure isolation
+- pre-dispatch invalid actor / modeのshared rejection path、Slack `BRIDGE_ERROR / INVALID_JOB`、Actor非起動
 - Browser Callbackのgeneration wait / STOP非操作 / composer draft protection / DOM Fail Closed
 
 ## 25. 実装・E2E確認済み
@@ -639,11 +660,18 @@ v1 / v2の既存baselineに加え、v3について以下を確認済みとする
 - valid callback metadataを持つterminal failure callback
 - `INSTRUCTION_NOT_FOUND` → Slack failure Result Manifest → `LOCAL_AGENT_JOB_FAILED` によるChatGPT wake-up
 - failure pathのResult-before-Callback ordering
+- pre-dispatch invalid actor / mode failure callback automated regression
+- `V3-PREDISPATCH-INVALID-ACTOR-MODE-E2E-001`: authorized / parsed `codex + review`、workspace `sandbox`、
+  valid callbackをActor起動前に拒否
+- 同E2EでSlack Resultを先に送信: `status=BRIDGE_ERROR`、`failure_class=INVALID_JOB`、
+  `error_summary="Actor/mode not allowed: ('codex', 'review')"`
+- 同E2EでActor非起動を確認後、`LOCAL_AGENT_JOB_FAILED` がjob_id / actor / workspace / `BRIDGE_ERROR` /
+  `INVALID_JOB` / `artifact_status=NOT_RUN` を通知し、ChatGPT conversationのwake-up成功を確認
 - busy ChatGPT callback: GENERATING / `aria-label="停止"` → Worker wait → generation end →
   empty composer認識 → callback fill → `aria-label="送信"` → send → `LOCAL_AGENT_JOB_FAILED` がChatGPTに到達
 - generation wait中にSTOPをclickしないこと
 - 既存composer draftの保護
-- full local regression suite: 41 tests PASS
+- full local regression suite: 45 tests PASS
 
 既存E2Eとして、ChatGPT → Slack → Worker → Codex / Claude、Local Workspace書込み、
 条件付きDrive upload、Slack Result、Browser callback成功・失敗終端系、busy state synchronization、

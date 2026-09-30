@@ -62,6 +62,7 @@ def send_browser_callback(
     *,
     status,
     artifact_status,
+    failure_class=None,
 ):
     if (
         job.callback_type is None
@@ -89,16 +90,30 @@ def send_browser_callback(
                 "UNKNOWN_CALLBACK_TYPE",
         }
 
+    terminal_marker = (
+        "LOCAL_AGENT_JOB_COMPLETED"
+        if status == "DONE"
+        else "LOCAL_AGENT_JOB_FAILED"
+    )
+    failure_line = (
+        f"failure_class: {failure_class}\n"
+        if failure_class is not None
+        else ""
+    )
+    closure = (
+        "Inspect the Slack Result Manifest and continue Job Closure."
+        if status == "DONE"
+        else "Inspect the Slack Result Manifest and continue Failure Closure."
+    )
     message = (
-        "LOCAL_AGENT_JOB_COMPLETED\n\n"
+        f"{terminal_marker}\n\n"
         f"job_id: {job.job_id}\n"
         f"actor: {job.actor}\n"
         f"workspace: {job.workspace}\n"
         f"status: {status}\n"
-        f"artifact_status: "
-        f"{artifact_status}\n\n"
-        "Slack Result Manifestを確認して"
-        "Job Closureを続行してください。"
+        f"{failure_line}"
+        f"artifact_status: {artifact_status}\n\n"
+        f"{closure}"
     )
 
     try:
@@ -204,9 +219,7 @@ def process_message(
 
             logger.error("INSTRUCTION RESOLVE FAILED: job_id=%s failure=%s", job.job_id, failure_class)
 
-            send_json(
-                say,
-                {
+            response = {
                     "protocol_version":
                         job.protocol_version,
                     "job_id":
@@ -217,7 +230,13 @@ def process_message(
                         failure_class,
                     "error_summary":
                         failure_class,
-                },
+                }
+            send_json(say, response)
+            send_browser_callback(
+                job,
+                status="BRIDGE_ERROR",
+                artifact_status="NOT_RUN",
+                failure_class=failure_class,
             )
 
             return
@@ -267,6 +286,26 @@ def dispatch_next_queued(workspace, say):
 
         try:
             job = job_from_row(row)
+        except (TypeError, ValueError, KeyError, json.JSONDecodeError) as e:
+            state_store.mark_completed(
+                row["job_id"],
+                status="FAILED",
+                failure_class="INCOMPLETE_QUEUED_STATE",
+            )
+            logger.warning("UNRECOVERABLE QUEUED JOB: job_id=%s error=%s", row["job_id"], e)
+            send_json(
+                say,
+                {
+                    "protocol_version": row["protocol_version"],
+                    "job_id": row["job_id"],
+                    "status": "FAILED",
+                    "failure_class": "INCOMPLETE_QUEUED_STATE",
+                    "error_summary": str(e),
+                },
+            )
+            continue
+
+        try:
             validate_recoverable_queued_job(job)
         except (TypeError, ValueError, KeyError, json.JSONDecodeError) as e:
             state_store.mark_completed(
@@ -284,6 +323,12 @@ def dispatch_next_queued(workspace, say):
                     "failure_class": "INCOMPLETE_QUEUED_STATE",
                     "error_summary": str(e),
                 },
+            )
+            send_browser_callback(
+                job,
+                status="FAILED",
+                artifact_status="NOT_RUN",
+                failure_class="INCOMPLETE_QUEUED_STATE",
             )
             continue
 
@@ -305,6 +350,18 @@ def dispatch_next_queued(workspace, say):
                 status="FAILED",
                 failure_class="DISPATCH_START_FAILED",
             )
+            response = build_result(
+                job,
+                status="FAILED",
+                failure_class="DISPATCH_START_FAILED",
+            )
+            send_json(say, response)
+            send_browser_callback(
+                job,
+                status="FAILED",
+                artifact_status="NOT_RUN",
+                failure_class="DISPATCH_START_FAILED",
+            )
         raise
 
 
@@ -318,15 +375,18 @@ def execute_claimed_job(job, say):
             status="FAILED",
             failure_class="DISPATCH_START_FAILED",
         )
-        send_json(
-            say,
-            {
-                "protocol_version": job.protocol_version,
-                "job_id": job.job_id,
-                "status": "FAILED",
-                "failure_class": "DISPATCH_START_FAILED",
-                "error_summary": str(e)[:4000],
-            },
+        response = build_result(
+            job,
+            status="FAILED",
+            failure_class="DISPATCH_START_FAILED",
+            error_summary=str(e)[:4000],
+        )
+        send_json(say, response)
+        send_browser_callback(
+            job,
+            status="FAILED",
+            artifact_status="NOT_RUN",
+            failure_class="DISPATCH_START_FAILED",
         )
         logger.exception("DISPATCH START FAILED: job_id=%s", job.job_id)
         dispatch_next_queued(job.workspace, say)
@@ -574,11 +634,13 @@ def finalize_browser_callback(
     *,
     status,
     artifact_status,
+    failure_class=None,
 ):
     response["callback"] = send_browser_callback(
         job,
         status=status,
         artifact_status=artifact_status,
+        failure_class=failure_class,
     )
     save_json(log_dir, "result.json", response)
 
@@ -611,6 +673,7 @@ def handle_execution_failure(
         response,
         status=response_status,
         artifact_status=artifact_status,
+        failure_class=failure_class,
     )
 
 
@@ -666,6 +729,7 @@ def execute_job(job, say):
                 response,
                 status="FAILED",
                 artifact_status="NOT_RUN",
+                failure_class="ACTOR_FAILED",
             )
 
             return

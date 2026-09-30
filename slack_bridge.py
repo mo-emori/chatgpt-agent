@@ -39,7 +39,21 @@ class SlackBridge:
             logger.warning("Slack message ignored: unauthorized sender %s", sender)
             return
 
-        text = event.get("text", "").strip()
+        raw_text = event.get("text", "")
+
+        text = raw_text.strip()
+
+        if (
+            text == "LOCAL-AGENT PING"
+            or text.startswith("LOCAL-AGENT PING *")
+        ):
+            logger.info(
+                "Accepted LOCAL-AGENT PING: channel=%s sender=%s",
+                channel,
+                sender,
+            )
+            say("LOCAL-AGENT PONG — Worker ready")
+            return
 
         metadata = {}
         try:

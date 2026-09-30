@@ -254,8 +254,11 @@ class QueueRecoveryTests(unittest.TestCase):
 
     @patch.object(agent_worker, "fetch_instruction")
     @patch.object(agent_worker, "run_agent")
+    @patch.object(agent_worker, "notify_chatgpt")
     @patch.object(agent_worker.threading, "Thread", ImmediateThread)
-    def test_incomplete_legacy_v3_fails_closed(self, run_agent, fetch_instruction):
+    def test_incomplete_legacy_v3_fails_closed(
+        self, notify_chatgpt, run_agent, fetch_instruction
+    ):
         self.queue_job("Q-INCOMPLETE")
         with state_store.connect() as db:
             db.execute(
@@ -271,6 +274,7 @@ class QueueRecoveryTests(unittest.TestCase):
         self.assertEqual(ImmediateThread.starts, [])
         fetch_instruction.assert_not_called()
         run_agent.assert_not_called()
+        notify_chatgpt.assert_called_once()
 
     @patch.object(agent_worker, "resolve_v3_instruction")
     def test_duplicate_behavior_remains_unchanged(self, resolve_instruction):

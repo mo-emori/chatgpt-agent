@@ -11,5 +11,10 @@
       "form button[aria-label='送信']",
       "form button[type='submit']"
     ]
+  },
+  "stop_button": {
+    "selectors": [
+      "form button[aria-label='停止']"
+    ]
   }
 }

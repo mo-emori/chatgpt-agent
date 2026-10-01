@@ -14,6 +14,7 @@ logger = logging.getLogger(__name__)
 
 CHATGPT_READY_TIMEOUT_SECONDS = 120
 SEND_BUTTON_TIMEOUT_SECONDS = 5
+DELIVERY_ACK_TIMEOUT_SECONDS = 10
 STATE_POLL_INTERVAL_MS = 500
 
 
@@ -140,6 +141,82 @@ def composer_is_empty(composer):
     return composer_text(composer).strip() == ""
 
 
+def element_text(element):
+    value = element.evaluate("element => element.innerText")
+    return (value or "").replace("\r\n", "\n")
+
+
+def matching_user_message_count(page, selectors, message):
+    expected = message.replace("\r\n", "\n")
+
+    for selector in selectors:
+        locator = page.locator(selector)
+        count = locator.count()
+        if count:
+            return sum(
+                element_text(locator.nth(i)) == expected
+                for i in range(count)
+            )
+
+    return 0
+
+
+def callback_log_identity(message):
+    safe = {}
+    for line in message.splitlines():
+        if line.startswith("LOCAL_AGENT_JOB_"):
+            safe["marker"] = line
+        elif line.startswith("job_id: "):
+            safe["job_id"] = line.removeprefix("job_id: ")
+        elif line.startswith("status: "):
+            safe["status"] = line.removeprefix("status: ")
+    return " ".join(f"{key}={value}" for key, value in safe.items())
+
+
+def wait_for_delivery_ack(
+    page, *, composer_selectors, stop_selectors, user_message_selectors,
+    message, pre_send_match_count,
+):
+    deadline = time.monotonic() + DELIVERY_ACK_TIMEOUT_SECONDS
+    saw_composer_empty = False
+    saw_stop_visible = False
+
+    while True:
+        match_count = matching_user_message_count(
+            page, user_message_selectors, message
+        )
+        if match_count > pre_send_match_count:
+            logger.info(
+                "Browser callback DELIVERY_CONFIRMED: %s",
+                callback_log_identity(message),
+            )
+            return
+
+        try:
+            composer = find_optional_unique_visible(
+                page, composer_selectors, name="composer"
+            )
+            saw_composer_empty = saw_composer_empty or (
+                composer is not None and composer_is_empty(composer)
+            )
+            stop_button = find_optional_unique_visible(
+                page, stop_selectors, name="stop_button"
+            )
+            saw_stop_visible = saw_stop_visible or stop_button is not None
+        except BrowserNotifyError as e:
+            logger.info("Browser callback ACK secondary observation failed: %s", e)
+
+        if time.monotonic() >= deadline:
+            logger.warning(
+                "Browser callback DELIVERY_ACK_TIMEOUT/DELIVERY_UNKNOWN: %s "
+                "composer_empty=%s stop_visible=%s",
+                callback_log_identity(message), saw_composer_empty, saw_stop_visible,
+            )
+            raise BrowserNotifyError("DELIVERY_UNKNOWN: DELIVERY_ACK_TIMEOUT")
+
+        page.wait_for_timeout(STATE_POLL_INTERVAL_MS)
+
+
 def cleanup_inserted_callback(page, composer_selectors, message):
     try:
         composer = find_optional_unique_visible(
@@ -239,7 +316,12 @@ def notify_chatgpt(
             if not composer_is_empty(composer):
                 raise BrowserNotifyError("COMPOSER_NOT_EMPTY")
 
+            pre_send_match_count = matching_user_message_count(
+                page, dom["user_message"]["selectors"], message
+            )
+
             filled = False
+            click_attempted = False
             try:
                 composer.fill(message)
                 filled = True
@@ -251,15 +333,34 @@ def notify_chatgpt(
                 if not send_button.is_enabled():
                     raise BrowserNotifyError("SEND_BUTTON_DISABLED")
 
-                send_button.click()
+                click_attempted = True
+                try:
+                    send_button.click()
+                except Exception as e:
+                    raise BrowserNotifyError(
+                        "DELIVERY_UNKNOWN: CLICK_RESULT_UNKNOWN"
+                    ) from e
+                logger.info(
+                    "Browser callback CLICK_SUCCEEDED: %s",
+                    callback_log_identity(message),
+                )
             except Exception:
-                if filled:
+                if filled and not click_attempted:
                     cleanup_inserted_callback(
                         page,
                         dom["composer"]["selectors"],
                         message,
                     )
                 raise
+
+            wait_for_delivery_ack(
+                page,
+                composer_selectors=dom["composer"]["selectors"],
+                stop_selectors=dom["stop_button"]["selectors"],
+                user_message_selectors=dom["user_message"]["selectors"],
+                message=message,
+                pre_send_match_count=pre_send_match_count,
+            )
 
     except BrowserNotifyError:
         raise

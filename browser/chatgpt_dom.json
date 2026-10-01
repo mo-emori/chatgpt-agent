@@ -16,5 +16,10 @@
     "selectors": [
       "form button[aria-label='停止']"
     ]
+  },
+  "user_message": {
+    "selectors": [
+      "[data-message-author-role='user']"
+    ]
   }
 }

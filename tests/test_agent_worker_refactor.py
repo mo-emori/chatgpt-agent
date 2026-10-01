@@ -31,6 +31,40 @@ def parse_slack_payload(message):
 
 
 class ExecuteJobRefactorTests(unittest.TestCase):
+    @patch.object(agent_worker, "notify_chatgpt")
+    def test_browser_callback_success_log_requires_notify_return(self, notify):
+        job = make_job()
+
+        with self.assertLogs(agent_worker.logger, level="INFO") as captured:
+            result = agent_worker.send_browser_callback(
+                job, status="DONE", artifact_status="DONE"
+            )
+
+        self.assertEqual(result["status"], "DONE")
+        self.assertTrue(any(
+            "Browser callback succeeded" in line for line in captured.output
+        ))
+        notify.assert_called_once()
+
+    @patch.object(agent_worker, "notify_chatgpt")
+    def test_delivery_unknown_is_failed_and_never_logs_success(self, notify):
+        job = make_job()
+        notify.side_effect = agent_worker.BrowserNotifyError(
+            "DELIVERY_UNKNOWN: DELIVERY_ACK_TIMEOUT"
+        )
+
+        with self.assertLogs(agent_worker.logger, level="INFO") as captured:
+            result = agent_worker.send_browser_callback(
+                job, status="DONE", artifact_status="DONE"
+            )
+
+        self.assertEqual(result["status"], "FAILED")
+        self.assertEqual(result["error"], "DELIVERY_UNKNOWN: DELIVERY_ACK_TIMEOUT")
+        self.assertFalse(any(
+            "Browser callback succeeded" in line for line in captured.output
+        ))
+        notify.assert_called_once()
+
     @patch.object(agent_worker, "dispatch_next_queued")
     @patch.object(agent_worker, "finalize_browser_callback")
     @patch.object(agent_worker, "publish_slack_result")

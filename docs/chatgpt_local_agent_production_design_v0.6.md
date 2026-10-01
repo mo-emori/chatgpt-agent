@@ -656,6 +656,18 @@ best-effortであり、現在のcomposer textがそのinvocationが挿入したc
 Humanが変更した、またはそれ以外のcomposer textは決してclearしない。unknown / ambiguous DOM stateは
 Fail Closedとし、Agent専用Browser profile、CDP endpoint、selectorのuniqueness / visibility safetyを維持する。
 
+click正常終了は `CLICK_SUCCEEDED` であり、callback成功ではない。Workerはclick前に
+`[data-message-author-role="user"]` のうちcallback textと完全一致するmessage数を取得し、click後は約10秒を上限として
+約500 ms間隔で同じselectorを再検査する。事前値より完全一致message数が増えた場合だけ
+`DELIVERY_CONFIRMED` とし、`notify_chatgpt` の成功returnおよびWorkerの `Browser callback succeeded` を許可する。
+これにより、同一callbackが過去に存在しても新規deliveryのACKにはならない。composerが空になったこと、およびSTOPが
+visibleになったことはsecondary diagnostic evidenceに限り、delivery authorityにはしない。
+
+click後にACK timeout、DOM変化の不確定、またはその他のambiguous stateが生じた場合は
+`DELIVERY_UNKNOWN` としてcallback failureを記録する。この状態では既にsendが受理された可能性があるため、自動retry / resendを
+行わず、composer cleanupも行わない。これによりduplicate callbackと、send受理後にHumanが入力したreplacementの破壊を防ぐ。
+Slack Result ManifestのauthorityとCallbackより先に公開する順序は変えない。
+
 `tests/manual/inspect_chatgpt_buttons.py` は現在のChatGPT composer / action button stateを調べる
 手動DOM diagnostic helperであり、通常のWorker executionの一部ではない。
 
@@ -668,7 +680,6 @@ Fail Closedとし、Agent専用Browser profile、CDP endpoint、selectorのuniqu
 - Claude implementation mode
 - 複数PC Worker
 - 専用Secret Vault / 複雑なDLP / SIEM
-- Browser Callbackのdelivery acknowledgement semantics。Workerがcallback成功を記録してもChatGPT側のcallback turnを観測できない場合があり、別件として調査を継続する。root causeは未確定である。
 
 ## 24. 実装・Acceptance状態
 

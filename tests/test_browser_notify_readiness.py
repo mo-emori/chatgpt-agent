@@ -8,14 +8,16 @@ from browser import notify
 COMPOSER = "composer"
 STOP = "stop"
 SEND = "send"
+USER_MESSAGE = "user-message"
 
 
 class Element:
-    def __init__(self, *, text="", enabled=True):
+    def __init__(self, *, text="", enabled=True, on_click=None):
         self.text = text
         self.enabled = enabled
         self.fills = []
         self.clicks = 0
+        self.on_click = on_click
 
     def is_visible(self):
         return True
@@ -32,6 +34,8 @@ class Element:
 
     def click(self):
         self.clicks += 1
+        if self.on_click is not None:
+            self.on_click()
 
 
 class Locator:
@@ -46,12 +50,20 @@ class Locator:
 
 
 class Page:
-    def __init__(self, composer, *, stops=None, sends=None):
+    def __init__(self, composer, *, stops=None, sends=None, messages=None):
         self.url = "https://chatgpt.com/c/test"
         self.composer = composer
         self.stops = list(stops or [[]])
         self.sends = list(sends or [[]])
+        self.messages = list(messages or [[], [Element(text="callback")]])
         self.waits = []
+        for send_state in self.sends:
+            for send in send_state:
+                send.on_click = self._after_click
+
+    def _after_click(self):
+        if len(self.messages) > 1:
+            self.messages.pop(0)
 
     def bring_to_front(self):
         pass
@@ -63,6 +75,8 @@ class Page:
             return Locator(self.stops[0])
         if selector == SEND:
             return Locator(self.sends[0])
+        if selector == USER_MESSAGE:
+            return Locator(self.messages[0])
         return Locator([])
 
     def wait_for_timeout(self, milliseconds):
@@ -83,6 +97,7 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
             "composer": {"selectors": [COMPOSER]},
             "stop_button": {"selectors": [STOP]},
             "send_button": {"selectors": [SEND]},
+            "user_message": {"selectors": [USER_MESSAGE]},
         }
         patches = [
             patch.object(notify, "BROWSER_CONFIG", {
@@ -111,6 +126,76 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
 
         self.assertEqual(composer.fills, ["callback"])
         self.assertEqual(send.clicks, 1)
+
+    def test_click_without_new_matching_message_is_delivery_unknown(self):
+        composer = Element()
+        send = Element()
+        page = Page(composer, sends=[[send]], messages=[[]])
+        send.on_click = lambda: setattr(composer, "text", "user replacement")
+
+        with self.assertRaisesRegex(notify.BrowserNotifyError, "DELIVERY_UNKNOWN"):
+            self.run_notify(page, monotonic=[0, 0, 0, 11])
+
+        self.assertEqual(send.clicks, 1)
+        self.assertEqual(composer.fills, ["callback"])
+        self.assertEqual(composer.text, "user replacement")
+
+    def test_old_identical_message_does_not_acknowledge_delivery(self):
+        composer = Element()
+        send = Element()
+        old = Element(text="callback")
+        page = Page(composer, sends=[[send]], messages=[[old]])
+
+        with self.assertRaisesRegex(notify.BrowserNotifyError, "DELIVERY_UNKNOWN"):
+            self.run_notify(page, monotonic=[0, 0, 0, 11])
+
+        self.assertEqual(send.clicks, 1)
+
+    def test_click_exception_is_unknown_and_does_not_cleanup_or_retry(self):
+        composer = Element()
+        send = Element()
+        page = Page(composer, sends=[[send]])
+        send.on_click = Mock(side_effect=RuntimeError("CDP response lost"))
+
+        with self.assertRaisesRegex(notify.BrowserNotifyError, "DELIVERY_UNKNOWN"):
+            self.run_notify(page)
+
+        self.assertEqual(send.clicks, 1)
+        self.assertEqual(composer.fills, ["callback"])
+
+    def test_new_identical_message_after_old_one_confirms_delivery(self):
+        composer = Element()
+        send = Element()
+        old = Element(text="callback")
+        new = Element(text="callback")
+        page = Page(
+            composer, sends=[[send]], messages=[[old], [old, new]]
+        )
+
+        self.run_notify(page)
+
+        self.assertEqual(send.clicks, 1)
+
+    def test_composer_empty_without_matching_message_is_not_confirmed(self):
+        composer = Element()
+        send = Element(on_click=lambda: setattr(composer, "text", ""))
+        page = Page(composer, sends=[[send]], messages=[[]])
+        send.on_click = lambda: setattr(composer, "text", "")
+
+        with self.assertRaisesRegex(notify.BrowserNotifyError, "DELIVERY_UNKNOWN"):
+            self.run_notify(page, monotonic=[0, 0, 0, 11])
+
+    def test_stop_visible_without_matching_message_is_not_confirmed(self):
+        composer = Element()
+        send = Element()
+        stop = Element()
+        page = Page(composer, sends=[[send]], messages=[[]])
+        send.on_click = lambda: page.stops.__setitem__(0, [stop])
+
+        with self.assertRaisesRegex(notify.BrowserNotifyError, "DELIVERY_UNKNOWN"):
+            self.run_notify(page, monotonic=[0, 0, 0, 11])
+
+        self.assertEqual(stop.clicks, 0)
 
     def test_generating_waits_for_stop_to_disappear_then_sends(self):
         composer = Element()

@@ -230,7 +230,7 @@ ALLOWED_ACTOR_MODES = {
 `error_summary` は `Actor/mode not allowed: ('codex', 'review')` となる。認可済みrequestが安全なrouting metadataと
 trustworthyなcallback destinationを確立できるところまでparseされている場合、この拒否はSlack failure Resultを先に公開し、
 続いて `LOCAL_AGENT_JOB_FAILED` を通知する。通知はJOB acceptanceではなく、許可されていないActor / Modeを実行する権限を
-作らない。Actorは起動しない。Claude reviewはread-only構成とする。
+作らない。Actorは起動しない。Claude review isolation v0.1では、reviewは実行可能な独立clone上で行う。canonical workspaceへの実行権限は与えず、Workerが入力provenance、canonical保護、実行証跡、採用可否を所有する。
 
 ```text
 claude -p <prompt>
@@ -429,6 +429,9 @@ Drive失敗を理由に成功したActor executionをFAILEDへ変更しない。
 Slack Result Manifestは、成功・失敗のどちらでもBrowser Callbackより先に送信する。
 Browser CallbackはResult authorityではない。
 callback結果はLocal `result.json` に記録し、callback失敗によってexecution / artifact statusを変更しない。
+Claude reviewのResultは共通fieldに加え、input manifest provenance、raw / normalized stream evidence、
+`review_boundary_status`、`adoptable`、`partial_evidence_available`、`cleanup_status`を保持する。
+これらはactor、boundary、artifact、cleanupの各status domainを相互に上書きせず表現する。
 
 ## 14. Artifact Manifest
 
@@ -513,6 +516,7 @@ Operational LogとJOB単位Local Execution Evidenceは別物である。
 - `request.json`
 - `stdout.txt`
 - `stderr.txt`
+- Claude reviewではraw `stream-json` transcriptと、そこから導出したnormalized event evidence
 - Git before/afterのHEAD / status / diff / cached diff
 - `result.json`
 
@@ -530,9 +534,33 @@ ACTOR_TIMEOUT = {
 }
 ```
 
-Timeoutは `FAILED / TIMEOUT` とする。
+Timeoutはactor domainの `TIMEOUT` とする。Claude reviewではtimeoutまでにreaderが取得したpartial stdout / stderr / raw
+`stream-json` とnormalized eventを失わずEvidenceへ永続化し、Workerはその後もreview boundary verificationとterminal
+closureを実行する。partial evidenceが存在してもactorをDONEへ昇格せず、reviewはadoptableにならない。
 
 ## 20. Codex → Claude Independent Review
+
+### 20.1 Claude Review Isolation v0.1（IMPLEMENTED_BASELINE）
+
+Claude reviewはcanonical workspace単位のqueue lockをactor timeoutまで保持する。このためreviewは同一workspaceの他jobを最大actor timeoutまで直列化し得る。actorのcwdはWorker所有のjob固有disposable directoryに作る独立local cloneであり、worktreeではない。作成は `git clone --no-hardlinks --no-checkout <canonical> <review_dir>`、続いてcanonical HEADのdetached checkoutを行う。
+
+Review Input Manifest v1は `git ls-files --cached --others --exclude-standard` が列挙し、現在のfilesystemに通常fileとして存在するpathを対象とする。pathはworkspace-relative slash-normalized、byte順で決定的に整列し、各fileのraw bytesのSHA-256とsize、決定的JSON serialization全体の `input_manifest_sha256` を記録する。staged/unstaged区別はreview cloneへ再現しない。staged deletionを含むcanonicalで現存しないfileは入力集合に含めず、clone側から削除する。Git LFS、submoduleの完全なsnapshot semanticsはv0.1の保証外である。
+
+Workerはclone内を入力集合と完全一致させ、Claude開始前にmanifestを再計算する。不一致はpreparation domainの `REVIEW_SNAPSHOT_MISMATCH` としactorを起動しない。作成・snapshot取得失敗はそれぞれ `REVIEW_WORKSPACE_CREATE_FAILED` / `REVIEW_SNAPSHOT_FAILED` とする。
+
+Claude Code 2.1.280は `-p --restricted --tools Read,Glob,Grep,Bash --settings <Worker-managed settings> --safe-mode --strict-mcp-config --permission-mode dontAsk --permission-prompts none --no-session-persistence --output-format stream-json --verbose` で起動する。`--tools` はBashを公開するだけで実行承認を意味しないため、Worker-managed settingsはhooksを空にしたうえで `permissions.allow: ["Bash"]` を明示する。これにより `restricted + dontAsk` / promptなしでもBashを利用でき、実E2EではBash経由のPython、git、focused unittest実行を確認した。repo `.venv` にはpytest自体が存在しなかったため、pytest実行を確認済みとはしない。command allowlistをsecurity boundaryとはしない。safe modeによりCLAUDE.md、skills、plugins、project hooks等を無効化する。restricted modeはproject/local settingsを無視し、strict MCPはproject `.mcp.json` を無視する。Bashはreview capabilityであり、native Windows上のfilesystem security boundaryではない。Edit、Write、PowerShellは公開しない。repo外absolute writeを完全には防止できず、別Windows user+ACLは将来の強化案である。
+
+Actor環境はactor別explicit allowlistから構築する。Slack、Notion、Worker用Google/Drive credentialはClaudeにもCodexにも継承しない。Claudeには認証providerに必要な限定envに加え `PYTHONDONTWRITEBYTECODE=1`、`PYTEST_ADDOPTS=-p no:cacheprovider`、`GIT_OPTIONAL_LOCKS=0` を設定する。Codexの `workspace-write` / Windows MXC decisionは変更しない。
+
+stream-json raw transcriptをprimary execution evidenceとして保存し、tool_use/command、tool_result、result/exit、順序、final result textをnormalized evidenceへ派生する。final result textだけを既存の `<AGENT_RESULT>` extraction/artifact pipelineへ渡す。secret値はResultへ転記しない。timeout時もreaderが既に収集したstdout/stderr/raw stream-jsonを例外に保持し、raw transcript、stderr、取得できたnormalized eventを永続化する。final result eventがなくても `partial_evidence_available=true` により証跡の存在をResultへ公開するが、actor statusはTIMEOUTのままであり採用可能にはならない。
+
+Actor終了（timeout/errorを含む）後、Workerは所有するprocess treeをsettleし、全original input fileの最終hashを検証する。`Popen`成功をprocess ownership境界とし、Job attach、`mark_running`、reader起動、stdin write/closeを含む以後の全例外経路で、当該actor treeだけをterminateしてJob handleをcloseする。Windowsではjob固有のJob ObjectへClaudeを割り当て、normal completionとtimeoutの双方で残存childを終了する。reader joinより先にowned descendantsをsettleし、継承されたpipe handleによる不要な待ちを避ける。PID/image-name横断killは行わず、無関係processを対象にしない。標準 `subprocess.Popen` はprimary thread handleを公開しないため、CREATE_SUSPENDEDから安全にresumeする実装へは置換していない。このためprocess作成からJob Object割当までにchildをspawnし得る小さいraceをv0.1のaccepted limitationとする。
+
+一時変更が復元されていれば許容し、未復元ならboundary `INPUT_MODIFIED` とする。新規fileは自動違反ではなく、`.git`を除くrecursive traversalでignored fileも含め `review_workspace.outputs` に列挙する。canonicalはlock下でHEAD、index/staged state、tracked current contents、non-ignored untracked contentsをbefore/after比較する。変化時は原因を帰属せず `CANONICAL_STATE_CHANGED` とする。canonical ignored filesはv0.1では監視しない。disposable review cloneのGit HEAD/index/stateの移動自体は証跡であってboundary判定条件ではない。`head_before` / `head_after` は常に記録するが、boundaryはcanonical stateとoriginal input fileの最終content hashだけで決める。したがってcanonicalが不変でoriginal input contentsが最終的に復元されていれば、cloneのGit stateが移動していてもreviewはCLEANになり得る。これは意図したsemanticsであり実装欠陥ではない。
+
+状態domainはpreparation、actor（DONE/AGENT_ERROR/TIMEOUT）、review boundary（CLEAN/INPUT_MODIFIED/CANONICAL_STATE_CHANGED）、artifact、cleanup（DONE/FAILED/PENDING）に分離する。採用可能条件はactor DONEかつboundary CLEANかつrequired execution evidence永続化済みである。reviewer proseが `CHANGES REQUESTED` でもこの条件を満たせばadoptableであり、adoptableはreview賛否ではなくexecution/provenanceの信頼性を表す。actor DONEでboundaryがnon-CLEANの場合もactor statusをFAILEDへ変換せず、`adoptable=false` とし、v0.1ではnon-authoritativeなreview cloneからartifact uploadを行わず理由をResultへ記録する。
+
+accepted/start後のlog directory作成を含むpreparation、actor、evidence parse、boundary verification、Result assembly/persistence例外は、単一のterminal closureへ収束する。terminal DB state、Slack Result、Browser Callback attempt、final local Resultを相互に分離し、あるsinkの失敗が後続sinkを抑止しない。Slack terminal Resultは1回だけ公開する。cleanupは正しさ・採用条件に含めず、Slack Result、Browser Callback後にbounded cleanupし、その最終状態をlocal operational stateへ記録する。公開済みResultの `cleanup_status=PENDING` と、後続のlocal operational Resultに記録されるDONE/FAILEDの差は意図的である。cleanup完了をResult/callbackのcritical pathへ入れず、review correctnessと分離するためである。Windows cleanupはdisposable clone配下のread-only属性を必要時だけ解除し、canonical ACLには触れない。cleanup failure/PENDINGはDONE+CLEAN+evidenceを無効化しない。
 
 ```text
 Human → ChatGPT → Codex implementation → DONE / Evidence
@@ -640,6 +668,7 @@ Fail Closedとし、Agent専用Browser profile、CDP endpoint、selectorのuniqu
 - Claude implementation mode
 - 複数PC Worker
 - 専用Secret Vault / 複雑なDLP / SIEM
+- Browser Callbackのdelivery acknowledgement semantics。Workerがcallback成功を記録してもChatGPT側のcallback turnを観測できない場合があり、別件として調査を継続する。root causeは未確定である。
 
 ## 24. 実装・Acceptance状態
 
@@ -657,7 +686,9 @@ Fail Closedとし、Agent専用Browser profile、CDP endpoint、selectorのuniqu
 - CLI Version Gate / Git Workspace Validation
 - Windows Codex sandbox backend MXC requirement / no silent fallback to elevated
 - Windows sandbox regression（workspace root / `.git` / new file ACL、create / rewrite）
-- Codex implementation / Claude Code read-only independent review
+- Codex implementation / Claude Code isolated independent review（job固有disposable clone）
+- Review Input Manifest v1、actor別environment allowlist、Worker-managed Bash permission、raw stream evidence
+- owned process tree settlement、timeout partial evidence、review boundary / adoptability、cleanup domain分離
 - JOB単位Local Execution Evidence / Git before-after Evidence
 - Execution Status / Artifact Status分離
 - Artifact Manifest / Windows Path Validation / conditional Drive upload
@@ -670,7 +701,8 @@ Fail Closedとし、Agent専用Browser profile、CDP endpoint、selectorのuniqu
 
 ## 25. 実装・E2E確認済み
 
-v1 / v2の既存baselineに加え、v3について以下を確認済みとする。
+v1 / v2の既存baselineに加え、v3について以下を確認済みとする。Claude review isolationの最終correction cycleは
+`local-agent-review-isolation-final-fixes-20261002-001` と、その後のuser local `.venv` regressionで確認した。
 
 - Notion page resolve
 - Worker integration access boundary（Notion READのみ、update不可）
@@ -704,7 +736,15 @@ v1 / v2の既存baselineに加え、v3について以下を確認済みとする
   empty composer認識 → callback fill → `aria-label="送信"` → send → `LOCAL_AGENT_JOB_FAILED` がChatGPTに到達
 - generation wait中にSTOPをclickしないこと
 - 既存composer draftの保護
-- full local regression suite: 45 tests PASS
+- Claude review isolation real E2E: managed Bash permission under `restricted + dontAsk`、Bash / Python / git / focused unittestを実行し、focused review-isolation unittest 16 / 16 PASS。repo `.venv` にpytest自体は未導入
+- `mark_running` failureおよびstdin write / close failure後に、owned process treeだけをsettleしてhandleをclose
+- timeout時のpartial stdout / stderr / raw stream evidence保持、Workerによるpartial transcript永続化、actor `TIMEOUT`維持、boundary verification継続
+- disposable cloneのHEAD / index / state移動はevidenceのみとし、canonical state不変かつoriginal input content hash復元時はCLEANとするsemantics
+- boundary verification exception、evidence parse exception、log directory creation failure、transient terminal DB-state failureがterminal closureへ収束し、Slack terminal Resultを重複publishしない
+- `INPUT_MODIFIED` / `CANONICAL_STATE_CHANGED`でもactor `DONE`を保持し、`adoptable=false`としてauthoritative review artifactをskip
+- Windows read-only fileを含むdisposable clone cleanup
+- managed settings欠落時のlauncher fail-fastと、Worker settingsによるBash明示承認
+- repository `.venv` full unittest regression: `Ran 67 tests in 4.173s`, `OK`, skip 0
 
 ### 25.1 Windows sandbox controlled A/B and Local Agent E2E
 

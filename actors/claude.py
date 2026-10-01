@@ -1,11 +1,8 @@
-import subprocess
-
 from config import (
     ACTOR_TIMEOUT,
     CLAUDE_CMD,
     WORKSPACES,
 )
-from actors.process_runner import run_process
 from artifacts.manifest import (
     append_manifest_instruction,
 )
@@ -14,20 +11,31 @@ from actors.process_runner import (
     validate_workspace,
 )
 
-def run(job):
+def run(job, *, workdir=None, settings_path=None):
     config = WORKSPACES[job.workspace]
     validate_workspace(config)
-    workdir = config["path"]
+    workdir = workdir or config["path"]
+    if settings_path is None:
+        raise ValueError("Claude review requires a managed settings_path")
 
     args = [
         CLAUDE_CMD,
         "-p",
+        "--restricted",
+        "--tools",
+        "Read,Glob,Grep,Bash",
+        "--settings",
+        str(settings_path),
+        "--safe-mode",
+        "--strict-mcp-config",
         "--permission-mode",
         "dontAsk",
         "--permission-prompts",
         "none",
-        "--allowedTools",
-        "Read,Glob,Grep",
+        "--no-session-persistence",
+        "--output-format",
+        "stream-json",
+        "--verbose",
     ]
 
     prompt = append_manifest_instruction(
@@ -40,4 +48,5 @@ def run(job):
         cwd=workdir,
         timeout=ACTOR_TIMEOUT["claude"],
         input_text=prompt,
+        actor="claude",
     )

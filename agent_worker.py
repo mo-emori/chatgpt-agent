@@ -5,8 +5,15 @@ import subprocess
 import threading
 
 from actors import run_agent
+from actors import claude
+from actors.claude_stream import parse_stream_json
+from actors.process_runner import ProcessResult
+from actors.review_workspace import (
+    ReviewPreparationError, cleanup_review, create_review_workspace, diff_head_stat, finish_review,
+)
 from config import HOSTNAME
 from job_protocol import (
+    Job,
     JobValidationError,
     job_from_row,
     parse_job,
@@ -442,10 +449,10 @@ def recover_queued_jobs(say):
         dispatch_next_queued(workspace, say)
 
 
-def prepare_execution(job):
+def prepare_execution(job, *, log_dir=None):
     workspace = WORKSPACES[job.workspace]
     workdir = workspace["path"]
-    log_dir = create_job_log(job.job_id)
+    log_dir = log_dir or create_job_log(job.job_id)
 
     request_data = {
         "protocol_version": job.protocol_version,
@@ -685,6 +692,8 @@ def handle_execution_failure(
 
 
 def execute_job(job, say):
+    if isinstance(job, Job) and job.actor == "claude" and job.mode == "review":
+        return execute_claude_review(job, say)
     status = "RUNNING"
     exit_code = None
     workspace, workdir, log_dir, before = prepare_execution(job)
@@ -831,6 +840,197 @@ def execute_job(job, say):
             job.workspace,
             say,
         )
+
+
+def execute_claude_review(job, say):
+    """Worker-owned preparation, execution, boundary proof and adoption."""
+    status = "FAILED"
+    exit_code = None
+    workspace = WORKSPACES[job.workspace]
+    canonical = workspace["path"]
+    log_dir = None
+    review = None
+    actor_status = "NOT_STARTED"
+    failure_class = "BRIDGE_ERROR"
+    result = None
+    boundary = None
+    head_after = None
+    outputs = []
+    final_text = None
+    normalized = []
+    cleanup_status = "PENDING"
+    artifact_result = None
+    artifact_status = "NOT_RUN"
+    error_summary = None
+    response = None
+
+    try:
+        log_dir = create_job_log(job.job_id)
+        workspace, canonical, log_dir, _ = prepare_execution(job, log_dir=log_dir)
+        review = create_review_workspace(canonical, job.job_id)
+
+        save_json(log_dir, "review-input.json", review.input_manifest)
+        save_text(log_dir, "canonical-diff-head-before.stat", review.canonical_diff_stat)
+        save_text(log_dir, "review-diff-head-before.stat", review.review_diff_stat)
+        try:
+            result = claude.run(job, workdir=review.root, settings_path=review.settings_path)
+            exit_code = result.returncode
+            actor_status = "DONE" if result.returncode == 0 else "AGENT_ERROR"
+            if actor_status != "DONE":
+                failure_class = "ACTOR_FAILED"
+        except subprocess.TimeoutExpired as exc:
+            actor_status = "TIMEOUT"
+            failure_class = "TIMEOUT"
+            result = getattr(exc, "result", None)
+        except Exception as exc:
+            actor_status = "AGENT_ERROR"
+            failure_class = "ACTOR_FAILED"
+            result = ProcessResult(1, "", str(exc))
+
+        # run_process settles its owned process tree before returning/raising.
+        boundary, _, head_after, outputs = finish_review(review)
+        save_text(log_dir, "canonical-diff-head-after.stat", diff_head_stat(canonical))
+        save_text(log_dir, "review-diff-head-after.stat", diff_head_stat(review.root))
+        if result is not None:
+            save_text(log_dir, "claude-stream.jsonl", result.stdout)
+            save_text(log_dir, "stderr.txt", result.stderr)
+            final_text, normalized = parse_stream_json(result.stdout)
+            save_json(log_dir, "review-execution.json", {
+                "events": normalized, "final_result_text": final_text,
+                "exit_code": result.returncode,
+            })
+        transcript_persisted = result is not None
+        evidence_persisted = transcript_persisted and final_text is not None
+        adoptable = actor_status == "DONE" and boundary == "CLEAN" and evidence_persisted
+        status = "DONE" if actor_status == "DONE" else "FAILED"
+        if boundary != "CLEAN" and actor_status == "DONE":
+            failure_class = boundary
+        elif actor_status == "DONE" and not evidence_persisted:
+            failure_class = "EXECUTION_EVIDENCE_MISSING"
+        elif actor_status == "DONE":
+            failure_class = None
+
+        # A non-CLEAN clone is evidence, never an authoritative artifact source.
+        if adoptable:
+            bridge_result = ProcessResult(result.returncode, final_text, result.stderr)
+            artifact_result = process_artifacts(job, bridge_result, workspace, review.root)
+            artifact_status = artifact_result[1]
+
+    except ReviewPreparationError as exc:
+        failure_class = exc.failure_class
+        error_summary = str(exc)[:4000]
+    except Exception as exc:
+        # All post-acceptance bridge faults converge through the same terminal
+        # closure below, including evidence parsing and boundary verification.
+        failure_class = "BRIDGE_ERROR"
+        error_summary = str(exc)[:4000]
+        logger.exception("CLAUDE REVIEW BRIDGE ERROR: job_id=%s", job.job_id)
+
+    try:
+        transcript_persisted = result is not None
+        evidence_persisted = transcript_persisted and final_text is not None
+        adoptable = actor_status == "DONE" and boundary == "CLEAN" and evidence_persisted
+        response = build_result(
+            job, status=status, failure_class=failure_class, exit_code=exit_code,
+            error_summary=error_summary, artifact_result=artifact_result,
+        )
+        response.update({
+            "review_input": None,
+            "review_boundary": {"status": boundary} if boundary is not None else None,
+            "review_execution": {
+                "actor_status": actor_status,
+                "raw_transcript": "claude-stream.jsonl" if result is not None else None,
+                "normalized_evidence": "review-execution.json" if result is not None else None,
+                "partial_evidence_available": transcript_persisted and actor_status == "TIMEOUT",
+                "evidence_persisted": evidence_persisted,
+                "adoptable": adoptable,
+            },
+            "review_workspace": None,
+            "cleanup_status": "PENDING",
+        })
+        if review is not None:
+            response.update({
+                "canonical_head": review.canonical_before["head"],
+                "input_manifest_sha256": review.input_manifest["input_manifest_sha256"],
+                "file_count": review.input_manifest["file_count"],
+                "review_input": {
+                    "version": 1,
+                    "canonical_head": review.canonical_before["head"],
+                    "input_manifest_sha256": review.input_manifest["input_manifest_sha256"],
+                    "file_count": review.input_manifest["file_count"],
+                    "canonical_diff_head_stat": "canonical-diff-head-before.stat",
+                    "review_diff_head_stat": "review-diff-head-before.stat",
+                },
+                "review_workspace": {
+                    "type": "independent_clone", "head_before": review.head_before,
+                    "head_after": head_after, "outputs": outputs,
+                },
+            })
+        if actor_status == "DONE" and boundary != "CLEAN":
+            response["artifact_status"] = "NOT_RUN"
+            response["artifact_skip_reason"] = (
+                f"Review artifacts are non-authoritative because boundary is {boundary}."
+            )
+    except Exception as exc:
+        status = "FAILED"
+        failure_class = "RESULT_ASSEMBLY_FAILED"
+        artifact_status = "NOT_RUN"
+        response = build_result(job, status=status, failure_class=failure_class,
+                                error_summary=str(exc)[:4000])
+        response.update({"review_input": None, "review_boundary": None,
+                         "review_execution": None, "review_workspace": None,
+                         "cleanup_status": "PENDING"})
+
+    # Terminal publication is exactly once.  Each sink is isolated so a failed
+    # DB/local/Slack write cannot suppress the callback attempt or cleanup.
+    db_persisted = False
+    try:
+        state_store.mark_completed(job.job_id, status=status, exit_code=exit_code,
+                                   failure_class=failure_class)
+        db_persisted = True
+    except Exception:
+        logger.exception("Unable to persist terminal DB state: job_id=%s", job.job_id)
+    try:
+        if log_dir is not None:
+            publish_slack_result(log_dir, say, response)
+        else:
+            send_json(say, response)
+    except Exception:
+        logger.exception("Unable to publish terminal Slack Result: job_id=%s", job.job_id)
+    try:
+        if log_dir is not None:
+            finalize_browser_callback(job, log_dir, response, status=status,
+                                      artifact_status=artifact_status,
+                                      failure_class=failure_class)
+        else:
+            response["callback"] = send_browser_callback(
+                job, status=status, artifact_status=artifact_status,
+                failure_class=failure_class,
+            )
+    except Exception:
+        logger.exception("Unable to attempt terminal callback: job_id=%s", job.job_id)
+
+    if review is not None:
+        cleanup_status = cleanup_review(
+            review, outcome_path=(log_dir / "cleanup.json") if log_dir is not None else None,
+        )
+    response["cleanup_status"] = cleanup_status
+    if not db_persisted:
+        try:
+            state_store.mark_completed(job.job_id, status=status, exit_code=exit_code,
+                                       failure_class=failure_class)
+            db_persisted = True
+        except Exception:
+            logger.exception("Terminal DB state retry failed: job_id=%s", job.job_id)
+    try:
+        if log_dir is not None:
+            save_json(log_dir, "result.json", response)
+    except Exception:
+        logger.exception("Unable to persist final Result: job_id=%s", job.job_id)
+
+    logger.info("Claude review end: job_id=%s status=%s actor=%s boundary=%s cleanup=%s",
+                job.job_id, status, actor_status, boundary, cleanup_status)
+    dispatch_next_queued(job.workspace, say)
 
 
 def process_exists(pid):

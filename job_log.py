@@ -1,4 +1,5 @@
 import json
+import hashlib
 import subprocess
 from pathlib import Path
 
@@ -21,6 +22,7 @@ def _run_git(workdir, *args):
 
 def get_git_snapshot(workdir):
     workdir = Path(workdir)
+    status = _run_git(workdir, "status", "--porcelain")
 
     return {
         "head": _run_git(
@@ -28,11 +30,7 @@ def get_git_snapshot(workdir):
             "rev-parse",
             "HEAD",
         ).strip(),
-        "status": _run_git(
-            workdir,
-            "status",
-            "--porcelain",
-        ),
+        "status": status,
         "diff": _run_git(
             workdir,
             "diff",
@@ -44,7 +42,38 @@ def get_git_snapshot(workdir):
             "--cached",
             "--no-ext-diff",
         ),
+        "path_states": _get_path_states(workdir, status),
     }
+
+
+def _get_path_states(workdir, status):
+    states = {}
+    for line in status.splitlines():
+        if len(line) < 4:
+            continue
+        status_code = line[:2]
+        path = line[3:].strip()
+        if " -> " in path:
+            path = path.split(" -> ", 1)[1]
+        candidate = workdir / path
+        digest = None
+        if candidate.is_file() and not candidate.is_symlink():
+            digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        elif candidate.is_symlink():
+            digest = f"symlink:{candidate.readlink()}"
+        states[path] = {"status": status_code, "sha256": digest}
+    return states
+
+
+def get_attributable_changed_paths(before, after):
+    """Paths whose Worker-observed state changed during this job."""
+    before_states = before.get("path_states", {})
+    after_states = after.get("path_states", {})
+    return sorted(
+        path
+        for path in before_states.keys() | after_states.keys()
+        if before_states.get(path) != after_states.get(path)
+    )
 
 
 def get_changed_paths(before, after):

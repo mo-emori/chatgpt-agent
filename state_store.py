@@ -31,6 +31,14 @@ CREATE TABLE IF NOT EXISTS jobs (
 );
 """
 
+WORKSPACE_CLAIM_SCHEMA = """
+CREATE TABLE IF NOT EXISTS workspace_claims (
+    workspace TEXT PRIMARY KEY,
+    owner TEXT NOT NULL,
+    acquired_at TEXT NOT NULL
+);
+"""
+
 
 def now_iso():
     return datetime.now(timezone.utc).isoformat()
@@ -45,6 +53,7 @@ def connect():
 def initialize():
     with connect() as db:
         db.execute(SCHEMA)
+        db.execute(WORKSPACE_CLAIM_SCHEMA)
 
         columns = {
             row["name"]
@@ -187,8 +196,6 @@ def mark_running(job_id, pid, host):
                 job_id,
             ),
         )
-
-
 def heartbeat(job_id):
     with connect() as db:
         db.execute(
@@ -230,6 +237,7 @@ def mark_completed(
                 job_id,
             ),
         )
+        db.execute("DELETE FROM workspace_claims WHERE owner = ?", (f"job:{job_id}",))
 
 
 def list_running():
@@ -297,6 +305,34 @@ def restore_dispatching_jobs():
             WHERE status = 'DISPATCHING'
             """
         )
+        db.execute("DELETE FROM workspace_claims WHERE owner LIKE 'job:%'")
+
+
+def acquire_manual_workspace_claim(workspace, owner):
+    """Acquire the cross-process workspace lease used by normal dispatch."""
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        busy = db.execute(
+            "SELECT 1 FROM jobs WHERE workspace=? AND status IN ('DISPATCHING','RUNNING')",
+            (workspace,),
+        ).fetchone()
+        leased = db.execute(
+            "SELECT 1 FROM workspace_claims WHERE workspace=?", (workspace,)
+        ).fetchone()
+        if busy is not None or leased is not None:
+            return False
+        db.execute("INSERT INTO workspace_claims VALUES (?, ?, ?)",
+                   (workspace, owner, now_iso()))
+        return True
+
+
+def release_manual_workspace_claim(workspace, owner):
+    with connect() as db:
+        result = db.execute(
+            "DELETE FROM workspace_claims WHERE workspace=? AND owner=?",
+            (workspace, owner),
+        )
+    return result.rowcount == 1
 
 
 def is_workspace_busy(workspace):
@@ -347,7 +383,10 @@ def claim_next_queued(workspace):
             """,
             (workspace,),
         ).fetchone()
-        if busy is not None:
+        leased = db.execute(
+            "SELECT 1 FROM workspace_claims WHERE workspace = ?", (workspace,)
+        ).fetchone()
+        if busy is not None or leased is not None:
             return None
 
         row = db.execute(
@@ -376,6 +415,9 @@ def claim_next_queued(workspace):
         if updated.rowcount != 1:
             return None
 
+        db.execute("INSERT INTO workspace_claims VALUES (?, ?, ?)",
+                   (workspace, f"job:{row['job_id']}", now_iso()))
+
         claimed = dict(row)
         claimed["status"] = "DISPATCHING"
         return claimed
@@ -393,6 +435,8 @@ def restore_claim(job_id):
             """,
             (job_id,),
         )
+        if result.rowcount == 1:
+            db.execute("DELETE FROM workspace_claims WHERE owner=?", (f"job:{job_id}",))
     return result.rowcount == 1
 
 

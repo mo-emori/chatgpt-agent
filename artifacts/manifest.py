@@ -20,7 +20,17 @@ MANIFEST_INSTRUCTION = """
 
 成果物がない場合は artifacts を空配列にしてください。
 このblockは必ず最後に1回だけ出力してください。
-""".strip()
+""".strip() + """
+
+
+Contract: artifacts is only for files intended for external delivery. Do not
+list repo-canonical docs, evidence, context, baselines, or .agent declarations;
+those changes are reported through normal git/change/evidence fields.
+""".rstrip("\n")
+
+# Contract: ``artifacts`` contains only files intended for external delivery.
+# Repo-canonical docs, evidence, context, baselines, and declarations are
+# reported through Worker-observed git/change evidence, not this field.
 
 class ManifestError(ValueError):
     pass

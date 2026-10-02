@@ -7,6 +7,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import agent_worker
+from job_log import get_attributable_changed_paths
 
 
 def make_job():
@@ -412,6 +413,7 @@ class ExecuteJobRefactorTests(unittest.TestCase):
                 "path": "notes.txt",
                 "reason": "outside allowed roots",
             }],
+            "canonical_references": [],
         }
         self.assertEqual(events, ["slack", "callback"])
         self.assertEqual(parse_slack_payload(slack_messages[0]), expected_slack)
@@ -502,6 +504,19 @@ class ProcessArtifactsTests(unittest.TestCase):
             + "\n</AGENT_RESULT>"
         )
 
+    def test_attribution_excludes_unchanged_preexisting_dirty_path(self):
+        unchanged = {"status": " M", "sha256": "same"}
+        before = {"path_states": {"docs/dirty.md": unchanged}}
+        after = {"path_states": {
+            "docs/dirty.md": unchanged,
+            "docs/created.md": {"status": "??", "sha256": "new"},
+        }}
+
+        self.assertEqual(
+            get_attributable_changed_paths(before, after),
+            ["docs/created.md"],
+        )
+
     @patch.object(agent_worker, "upload_artifacts")
     def test_valid_artifact_is_uploaded_and_preserved(self, upload):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -529,6 +544,7 @@ class ProcessArtifactsTests(unittest.TestCase):
                 "source_path": "artifacts/report.txt",
                 "drive_file_id": "drive-1",
             }],
+            [],
             [],
         ))
         upload.assert_called_once_with("JOB-001", [artifact.resolve()])
@@ -585,6 +601,7 @@ class ProcessArtifactsTests(unittest.TestCase):
                 },
             ],
             [],
+            [],
         ))
 
     @patch.object(agent_worker, "upload_artifacts")
@@ -610,7 +627,137 @@ class ProcessArtifactsTests(unittest.TestCase):
                 "path": None,
                 "reason": "Artifact processing error: Drive unavailable",
             }],
+            [],
         ))
+
+    @patch.object(agent_worker, "upload_artifacts")
+    def test_canonical_references_are_separate_and_do_not_fail(self, upload):
+        cases = [
+            ".agent/context.json",
+            "validation/context/job.json",
+            "docs/design.md",
+            "validation/evidence/job/result.json",
+        ]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            for relative_path in cases:
+                path = root / relative_path
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("canonical", encoding="utf-8")
+            result = SimpleNamespace(
+                stdout=self.make_manifest("complete", cases)
+            )
+            actual = agent_worker.process_artifacts(
+                make_job(), result, {"artifact_roots": ["artifacts"]}, root,
+                cases,
+            )
+
+        self.assertEqual(actual[0:4], ("complete", "DONE", [], []))
+        self.assertEqual(
+            [item["path"] for item in actual[4]], cases
+        )
+        self.assertTrue(all(
+            item["disposition"] == "REPO_CANONICAL_REFERENCE"
+            for item in actual[4]
+        ))
+        upload.assert_not_called()
+
+    @patch.object(agent_worker, "upload_artifacts")
+    def test_unchanged_repo_file_outside_roots_is_rejected(self, upload):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            path = root / "docs" / "unchanged.md"
+            path.parent.mkdir()
+            path.write_text("existing", encoding="utf-8")
+            result = SimpleNamespace(stdout=self.make_manifest(
+                "invalid", ["docs/unchanged.md"]
+            ))
+            actual = agent_worker.process_artifacts(
+                make_job(), result, {"artifact_roots": ["artifacts"]}, root,
+                [],
+            )
+
+        self.assertEqual(actual[1], "FAILED")
+        self.assertEqual(actual[4], [])
+        upload.assert_not_called()
+
+    @patch.object(agent_worker, "upload_artifacts")
+    def test_missing_traversal_and_absolute_paths_remain_rejected(self, upload):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            candidates = ["missing.txt", "../escape.txt", "C:/escape.txt"]
+            result = SimpleNamespace(stdout=self.make_manifest(
+                "invalid", candidates
+            ))
+            actual = agent_worker.process_artifacts(
+                make_job(), result, {"artifact_roots": ["artifacts"]}, root,
+                candidates,
+            )
+
+        self.assertEqual(actual[1], "FAILED")
+        self.assertEqual(
+            [item["path"] for item in actual[3]], candidates
+        )
+        self.assertEqual(actual[4], [])
+        upload.assert_not_called()
+
+    @patch.object(agent_worker, "upload_artifacts")
+    def test_mixed_canonical_and_external_artifact_succeeds(self, upload):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            canonical = root / "docs" / "changed.md"
+            external = root / "artifacts" / "report.txt"
+            canonical.parent.mkdir()
+            external.parent.mkdir()
+            canonical.write_text("canonical", encoding="utf-8")
+            external.write_text("report", encoding="utf-8")
+            upload.return_value = [{
+                "name": "report.txt", "drive_file_id": "drive-1",
+            }]
+            result = SimpleNamespace(stdout=self.make_manifest(
+                "complete", ["docs/changed.md", "artifacts/report.txt"]
+            ))
+            actual = agent_worker.process_artifacts(
+                make_job(), result, {"artifact_roots": ["artifacts"]}, root,
+                ["docs/changed.md"],
+            )
+
+        self.assertEqual(actual[1], "DONE")
+        self.assertEqual(len(actual[2]), 1)
+        self.assertEqual(actual[3], [])
+        self.assertEqual(actual[4][0]["path"], "docs/changed.md")
+
+    @patch.object(agent_worker, "upload_artifacts")
+    def test_mixed_canonical_and_invalid_artifact_fails(self, upload):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            canonical = root / "docs" / "changed.md"
+            canonical.parent.mkdir()
+            canonical.write_text("canonical", encoding="utf-8")
+            result = SimpleNamespace(stdout=self.make_manifest(
+                "invalid", ["docs/changed.md", "missing.txt"]
+            ))
+            actual = agent_worker.process_artifacts(
+                make_job(), result, {"artifact_roots": ["artifacts"]}, root,
+                ["docs/changed.md"],
+            )
+
+        self.assertEqual(actual[1], "FAILED")
+        self.assertEqual(actual[4][0]["path"], "docs/changed.md")
+        self.assertEqual(actual[3][0]["path"], "missing.txt")
+        upload.assert_not_called()
+
+    def test_result_manifest_records_canonical_references(self):
+        references = [{
+            "path": "docs/changed.md",
+            "disposition": "REPO_CANONICAL_REFERENCE",
+            "reason": "Worker-observed change",
+        }]
+        result = agent_worker.build_result(
+            make_job(), status="DONE",
+            artifact_result=("complete", "DONE", [], [], references),
+        )
+        self.assertEqual(result["canonical_references"], references)
 
 
 if __name__ == "__main__":

@@ -45,6 +45,7 @@ from review_evidence import (
 from historical_job_evidence import adopt_historical_job_evidence
 from job_log import (
     create_job_log,
+    get_attributable_changed_paths,
     get_changed_paths,
     get_git_snapshot,
     save_git_snapshot,
@@ -61,6 +62,7 @@ from notion_client import (
     fetch_instruction,
 )
 from operational_logging import configure_logging
+from context_harness import begin_shadow, finish_shadow
 
 logger = logging.getLogger(__name__)
 
@@ -522,11 +524,22 @@ def collect_execution_evidence(
     return after, get_changed_paths(before, after)
 
 
-def process_artifacts(job, result, workspace, workdir):
+def process_artifacts(
+    job,
+    result,
+    workspace,
+    workdir,
+    canonical_changed_paths=(),
+):
     artifact_status = "DONE"
     artifacts = []
     rejected_artifacts = []
+    canonical_references = []
     agent_summary = result.stdout.strip()
+    changed_paths = {
+        Path(path).as_posix()
+        for path in canonical_changed_paths
+    }
 
     try:
         agent_result = parse_agent_result(result.stdout)
@@ -542,6 +555,29 @@ def process_artifacts(job, result, workspace, workdir):
                 )
                 validated.append((raw_path, path))
             except ArtifactPathError as e:
+                if str(e) == "Artifact outside allowed roots":
+                    try:
+                        canonical_path = validate_artifact_path(
+                            raw_path,
+                            workspace_root=workdir,
+                            artifact_roots=[],
+                        )
+                        relative_path = canonical_path.relative_to(
+                            Path(workdir).resolve()
+                        ).as_posix()
+                        if relative_path in changed_paths:
+                            canonical_references.append({
+                                "path": relative_path,
+                                "disposition": "REPO_CANONICAL_REFERENCE",
+                                "reason": (
+                                    "Outside external artifact roots and "
+                                    "attributed to the Worker-observed "
+                                    "before/after canonical change set"
+                                ),
+                            })
+                            continue
+                    except (ArtifactPathError, ValueError):
+                        pass
                 logger.warning(
                     "Rejected artifact: job_id=%s path=%s reason=%s",
                     job.job_id, raw_path, e,
@@ -593,7 +629,15 @@ def process_artifacts(job, result, workspace, workdir):
         artifact_status,
         artifacts,
         rejected_artifacts,
+        canonical_references,
     )
+
+
+def unpack_artifact_result(artifact_result):
+    """Accept legacy four-field internal results while adding diagnostics."""
+    if len(artifact_result) == 4:
+        return (*artifact_result, [])
+    return artifact_result
 
 
 def build_result(
@@ -607,6 +651,7 @@ def build_result(
     artifact_result=None,
     runtime=None,
     runtime_diagnostics=None,
+    context=None,
 ):
     response = {
         "protocol_version": job.protocol_version,
@@ -626,8 +671,16 @@ def build_result(
         response["error_summary"] = error_summary
     if runtime_diagnostics is not None:
         response["runtime_diagnostics"] = runtime_diagnostics
+    if context is not None:
+        response["context"] = context
     if artifact_result is not None:
-        summary, artifact_status, artifacts, rejected = artifact_result
+        (
+            summary,
+            artifact_status,
+            artifacts,
+            rejected,
+            canonical_references,
+        ) = unpack_artifact_result(artifact_result)
         response["summary"] = summary
     if execution_evidence is not None:
         before, after, changed_paths = execution_evidence
@@ -641,6 +694,7 @@ def build_result(
             "artifact_status": artifact_status,
             "artifacts": artifacts,
             "rejected_artifacts": rejected,
+            "canonical_references": canonical_references,
         })
     if job.protocol_version == "3":
         response[
@@ -686,6 +740,7 @@ def handle_execution_failure(
     artifact_status,
     error_summary=None,
     exception=None,
+    context=None,
 ):
     runtime_diagnostic = None
     if isinstance(exception, FileNotFoundError):
@@ -702,6 +757,7 @@ def handle_execution_failure(
         failure_class=failure_class,
         error_summary=error_summary,
         runtime_diagnostics=runtime_diagnostic,
+        context=context,
     )
     publish_slack_result(log_dir, say, response)
     finalize_browser_callback(
@@ -730,6 +786,10 @@ def execute_job(job, say):
     status = "RUNNING"
     exit_code = None
     workspace, workdir, log_dir, before = prepare_execution(job)
+    context_session = begin_shadow(
+        workdir, workspace=job.workspace, actor=job.actor, mode=job.mode,
+        cache_root=Path(__file__).parent / "logs",
+    )
 
     try:
         result = run_agent(job)
@@ -759,6 +819,7 @@ def execute_job(job, say):
             runtime_diagnostic = classify_runtime_failure(error_summary)
             failure_class = runtime_diagnostic["classification"]
 
+            context = finish_shadow(workdir, context_session, job_id=job.job_id)
             state_store.mark_completed(
                 job.job_id,
                 status="FAILED",
@@ -775,6 +836,7 @@ def execute_job(job, say):
                 execution_evidence=(before, after, changed_paths),
                 runtime=collect_runtime_evidence(job.actor, result),
                 runtime_diagnostics=runtime_diagnostic,
+                context=context,
             )
             publish_slack_result(log_dir, say, response)
             finalize_browser_callback(
@@ -794,17 +856,22 @@ def execute_job(job, say):
 
         status = "DONE"
 
+        artifact_result = process_artifacts(
+            job,
+            result,
+            workspace,
+            workdir,
+            get_attributable_changed_paths(before, after),
+        )
         (
             agent_summary,
             artifact_status,
             artifacts,
             rejected_artifacts,
-        ) = process_artifacts(
-            job,
-            result,
-            workspace,
-            workdir,
-        )
+            canonical_references,
+        ) = unpack_artifact_result(artifact_result)
+
+        context = finish_shadow(workdir, context_session, job_id=job.job_id)
 
         state_store.mark_completed(
             job.job_id,
@@ -827,8 +894,10 @@ def execute_job(job, say):
                 artifact_status,
                 artifacts,
                 rejected_artifacts,
+                canonical_references,
             ),
             runtime=collect_runtime_evidence(job.actor, result),
+            context=context,
         )
         publish_slack_result(log_dir, say, response)
         finalize_browser_callback(
@@ -842,28 +911,24 @@ def execute_job(job, say):
     except subprocess.TimeoutExpired:
         status = "FAILED"
 
-        handle_execution_failure(
-            job,
-            say,
-            log_dir,
-            failure_class="TIMEOUT",
-            response_status="FAILED",
-            artifact_status="NOT_RUN",
-        )
+        context = finish_shadow(workdir, context_session, job_id=job.job_id)
+        failure_args = dict(failure_class="TIMEOUT", response_status="FAILED",
+                            artifact_status="NOT_RUN")
+        if context is not None:
+            failure_args["context"] = context
+        handle_execution_failure(job, say, log_dir, **failure_args)
 
     except Exception as e:
         status = "FAILED"
 
-        handle_execution_failure(
-            job,
-            say,
-            log_dir,
-            failure_class="BRIDGE_ERROR",
-            response_status="BRIDGE_ERROR",
-            artifact_status="UNKNOWN",
-            error_summary=str(e)[:4000],
-            exception=e,
-        )
+        context = finish_shadow(workdir, context_session, job_id=job.job_id)
+
+        failure_args = dict(
+            failure_class="BRIDGE_ERROR", response_status="BRIDGE_ERROR",
+            artifact_status="UNKNOWN", error_summary=str(e)[:4000], exception=e)
+        if context is not None:
+            failure_args["context"] = context
+        handle_execution_failure(job, say, log_dir, **failure_args)
 
         logger.exception("BRIDGE ERROR: job_id=%s", job.job_id)
 
@@ -899,10 +964,16 @@ def execute_claude_review(job, say):
     runtime_diagnostic = None
     response = None
     review_evidence = not_run_review_evidence(bool(workspace.get("review_evidence_root")))
+    context_session = None
+    context = None
 
     try:
         log_dir = create_job_log(job.job_id)
         workspace, canonical, log_dir, _ = prepare_execution(job, log_dir=log_dir)
+        context_session = begin_shadow(
+            canonical, workspace=job.workspace, actor=job.actor, mode=job.mode,
+            cache_root=Path(__file__).parent / "logs",
+        )
         review = create_review_workspace(canonical, job.job_id)
 
         save_json(log_dir, "review-input.json", review.input_manifest)
@@ -973,11 +1044,15 @@ def execute_claude_review(job, say):
         transcript_persisted = result is not None
         evidence_persisted = transcript_persisted and final_text is not None
         adoptable = actor_status == "DONE" and boundary == "CLEAN" and evidence_persisted
+        # Canonical evidence adoption and the mandatory scan both occur while the
+        # DISPATCHING/RUNNING workspace claim is still held.
+        context = finish_shadow(canonical, context_session, job_id=job.job_id)
         response = build_result(
             job, status=status, failure_class=failure_class, exit_code=exit_code,
             error_summary=error_summary, artifact_result=artifact_result,
             runtime=collect_runtime_evidence(job.actor, result),
             runtime_diagnostics=runtime_diagnostic,
+            context=context,
         )
         response.update({
             "review_input": None,
@@ -1045,8 +1120,9 @@ def execute_claude_review(job, say):
         status = "FAILED"
         failure_class = "RESULT_ASSEMBLY_FAILED"
         artifact_status = "NOT_RUN"
+        context = finish_shadow(canonical, context_session, job_id=job.job_id)
         response = build_result(job, status=status, failure_class=failure_class,
-                                error_summary=str(exc)[:4000])
+                                error_summary=str(exc)[:4000], context=context)
         response.update({"review_input": None, "review_boundary": None,
                          "review_execution": None, "review_workspace": None,
                          "review_evidence": review_evidence,
@@ -1240,16 +1316,33 @@ def main(argv=()):
             }
         else:
             workspace_config = WORKSPACES[args.workspace]
-            result = adopt_historical_job_evidence(
-                canonical=workspace_config["path"],
-                evidence_root=workspace_config.get("job_evidence_root"),
-                job_id=args.adopt_job_evidence,
-                workspace=args.workspace,
-                log_dir=Path(__file__).parent / "logs" / args.adopt_job_evidence,
-                state_row=state_store.get_job(args.adopt_job_evidence),
-                slack_manifest_path=args.slack_result_manifest,
-                human_approved=args.human_approved,
-            )
+            state_store.initialize()
+            owner = f"historical:{args.adopt_job_evidence}"
+            if not state_store.acquire_manual_workspace_claim(args.workspace, owner):
+                result = {
+                    "status": "FAILED", "mode": "HISTORICAL_MANUAL",
+                    "job_id": args.adopt_job_evidence, "workspace": args.workspace,
+                    "destination": None, "manifest_sha256": None,
+                    "corroboration": None,
+                    "trust_limitation": (
+                        "Historical evidence lacks an original terminal-time cryptographic anchor."
+                    ),
+                    "error": "WORKSPACE_BUSY",
+                }
+            else:
+                try:
+                    result = adopt_historical_job_evidence(
+                        canonical=workspace_config["path"],
+                        evidence_root=workspace_config.get("job_evidence_root"),
+                        job_id=args.adopt_job_evidence,
+                        workspace=args.workspace,
+                        log_dir=Path(__file__).parent / "logs" / args.adopt_job_evidence,
+                        state_row=state_store.get_job(args.adopt_job_evidence),
+                        slack_manifest_path=args.slack_result_manifest,
+                        human_approved=args.human_approved,
+                    )
+                finally:
+                    state_store.release_manual_workspace_claim(args.workspace, owner)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0 if result["status"] in ("ADOPTED", "NOOP") else 1
 

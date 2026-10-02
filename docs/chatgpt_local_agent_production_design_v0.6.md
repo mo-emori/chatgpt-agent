@@ -7,6 +7,78 @@ Status: IMPLEMENTED_BASELINE
 Supersedes: ChatGPT Local Agent 本番設計 v0.5
 ```
 
+## Actor Result Artifact Contract (IMPLEMENTED_BASELINE)
+
+`AGENT_RESULT.artifacts` is exclusively the list of files intended for
+external delivery. Repo-canonical outputs such as `.agent` declarations,
+documentation, validation evidence, context, and baselines must not be listed
+there. Canonical changes are represented by Worker-observed
+`git.changed_paths` and the applicable canonical evidence mechanism.
+
+The Worker classifies each actor-reported candidate as
+`EXTERNAL_DELIVERABLE`, `REPO_CANONICAL_REFERENCE`, or `INVALID`. Normal
+artifact-root validation remains authoritative for external delivery. Only a
+candidate rejected specifically because it is outside configured external
+artifact roots is eligible for canonical-reference normalization. It must then
+pass the same workspace-relative safety and file-existence validation and its
+normalized path must occur in the current Worker-observed `git.changed_paths`
+and its status/content fingerprint must differ between the job's before and
+after snapshots.
+Such a reference is not uploaded, does not make `artifact_status` fail, and is
+recorded additively in Result Manifest `canonical_references` with its path,
+disposition, and reason.
+
+An arbitrary unchanged repository file, including an unchanged file that was
+already dirty before the job, is not sufficient proof. Missing,
+absolute, drive-qualified, UNC, traversal/out-of-workspace, unsafe, or otherwise
+disallowed candidates remain in `rejected_artifacts`; genuine external
+deliverables continue to require a configured `artifact_roots` match and any
+delivery failure remains fail-closed. This runtime normalization supplements,
+rather than relies only upon, actor prompt guidance.
+
+## Phase 1 Capability Context Harness (SHADOW / IMPLEMENTED_BASELINE)
+
+Phase 1 adds observation and provenance only. A workspace may opt in with
+`.agent/context.json` (`schema_version: 1`, `mode: SHADOW`). The declaration
+maps a capability to repo-relative sources, source kinds, authority class,
+explicit context-item dependency edges, actor/mode selectors, and a generated
+evidence root. JSON was selected to avoid a YAML dependency and is hashed as
+raw bytes. `approved_semantics` is forbidden in this actor-editable declaration.
+
+The deterministic builder records HEAD, declaration raw SHA-256, declared file
+raw SHA-256, type/existence, relevant per-path tracked/untracked status,
+configured dependency edges, and optional normalized-text hashes. Raw bytes are
+authoritative. A matching normalized-text hash only labels a raw-byte change as
+`EOL_ONLY`; it never changes the result to `NO_IMPACT`. Unrelated dirty files are
+outside the observation only when no configured edge selects them.
+
+The canonical manifest is UTF-8 JSON with sorted keys, compact separators, and
+an LF suffix. Its content hash covers `observed` and the Phase-1 empty
+`approved_semantics`; timestamps and `previous_context_hash` are excluded so an
+identical input has an identical hash. Lifecycle metadata carries context ID,
+schema/hash, prior hash, HEAD, authoritative hashes, and builder provenance.
+
+The mandatory terminal scan runs after actor execution and evidence adoption,
+while the SQLite workspace claim remains held, and before `mark_completed`.
+It deterministically reports `NO_IMPACT`, `CONTEXT_UPDATE`,
+`POTENTIAL_AUTHORITY_CHANGE`, or fail-closed-for-future-enforcement
+`UNVERIFIABLE`. Phase 1 never changes job status or actor prompt. Result
+Manifests add an optional `context` object containing mode, capability, current
+and previous hashes, delta status, `would_block`, evidence paths, changed
+sources, and unverifiable reasons.
+
+Normal dispatch and `HISTORICAL_MANUAL` adoption now share a cross-process
+SQLite workspace lease. Manual adoption fails with `WORKSPACE_BUSY` instead of
+racing a scan. The ARGUS PoC declaration was not installed cross-workspace; the
+reviewed exact candidate is
+`docs/argus_runtime_bootstrap_context_phase1.json` and should be copied to
+ARGUS `.agent/context.json` by an authorized ARGUS job.
+
+NOT IMPLEMENTED: Job Context Slicer, prompt reduction/injection, Evidence
+Indexer beyond declared file references, Review Delta Package, DELTA/BOUNDARY/
+FULL routing, LLM reconciliation, automatic approved-semantic mutation, or a
+ban on actor supplemental repository reads.
+
 ## 1. 目的
 
 通常のChatGPTをControl Planeとして利用し、ローカルPC上のCodex / Claude

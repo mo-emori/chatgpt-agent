@@ -142,6 +142,19 @@ class QueueRecoveryTests(unittest.TestCase):
             "QUEUED",
         )
 
+    def test_manual_adoption_and_normal_dispatch_share_workspace_lease(self):
+        self.queue_job("Q-LEASE")
+        self.assertTrue(state_store.acquire_manual_workspace_claim("sandbox", "manual:1"))
+        self.assertIsNone(state_store.claim_next_queued("sandbox"))
+        self.assertFalse(state_store.acquire_manual_workspace_claim("sandbox", "manual:2"))
+        self.assertTrue(state_store.release_manual_workspace_claim("sandbox", "manual:1"))
+        claimed = state_store.claim_next_queued("sandbox")
+        self.assertEqual(claimed["job_id"], "Q-LEASE")
+        self.assertFalse(state_store.acquire_manual_workspace_claim("sandbox", "manual:3"))
+        state_store.mark_completed("Q-LEASE", status="DONE")
+        self.assertTrue(state_store.acquire_manual_workspace_claim("sandbox", "manual:3"))
+        self.assertTrue(state_store.release_manual_workspace_claim("sandbox", "manual:3"))
+
     @patch.object(agent_worker.threading, "Thread", ImmediateThread)
     def test_concurrent_process_messages_atomically_dispatch_one_job(self):
         dispatch_barrier = threading.Barrier(2)

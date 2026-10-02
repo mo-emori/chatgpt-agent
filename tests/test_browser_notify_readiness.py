@@ -9,6 +9,14 @@ COMPOSER = "composer"
 STOP = "stop"
 SEND = "send"
 USER_MESSAGE = "user-message"
+CALLBACK = (
+    "LOCAL_AGENT_JOB_COMPLETED\n\n"
+    "job_id: JOB-ACK-001\n"
+    "actor: codex\n"
+    "workspace: sandbox\n"
+    "status: DONE\n"
+    "artifact_status: DONE"
+)
 
 
 class Element:
@@ -55,7 +63,7 @@ class Page:
         self.composer = composer
         self.stops = list(stops or [[]])
         self.sends = list(sends or [[]])
-        self.messages = list(messages or [[], [Element(text="callback")]])
+        self.messages = list(messages or [[], [Element(text=CALLBACK)]])
         self.waits = []
         for send_state in self.sends:
             for send in send_state:
@@ -88,7 +96,7 @@ class Page:
 
 
 class BrowserNotifyReadinessTests(unittest.TestCase):
-    def run_notify(self, page, *, monotonic=None):
+    def run_notify(self, page, *, monotonic=None, message=CALLBACK):
         browser = Mock()
         browser.contexts = [Mock(pages=[page])]
         playwright = Mock()
@@ -113,9 +121,9 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
             if len(patches) == 4:
                 with patches[3]:
                     return notify.notify_chatgpt(
-                        target_url=page.url, message="callback"
+                        target_url=page.url, message=message
                     )
-            return notify.notify_chatgpt(target_url=page.url, message="callback")
+            return notify.notify_chatgpt(target_url=page.url, message=message)
 
     def test_idle_empty_fills_and_clicks_send(self):
         composer = Element()
@@ -124,7 +132,7 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
 
         self.run_notify(page)
 
-        self.assertEqual(composer.fills, ["callback"])
+        self.assertEqual(composer.fills, [CALLBACK])
         self.assertEqual(send.clicks, 1)
 
     def test_click_without_new_matching_message_is_delivery_unknown(self):
@@ -137,13 +145,13 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
             self.run_notify(page, monotonic=[0, 0, 0, 11])
 
         self.assertEqual(send.clicks, 1)
-        self.assertEqual(composer.fills, ["callback"])
+        self.assertEqual(composer.fills, [CALLBACK])
         self.assertEqual(composer.text, "user replacement")
 
     def test_old_identical_message_does_not_acknowledge_delivery(self):
         composer = Element()
         send = Element()
-        old = Element(text="callback")
+        old = Element(text=CALLBACK)
         page = Page(composer, sends=[[send]], messages=[[old]])
 
         with self.assertRaisesRegex(notify.BrowserNotifyError, "DELIVERY_UNKNOWN"):
@@ -161,13 +169,13 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
             self.run_notify(page)
 
         self.assertEqual(send.clicks, 1)
-        self.assertEqual(composer.fills, ["callback"])
+        self.assertEqual(composer.fills, [CALLBACK])
 
     def test_new_identical_message_after_old_one_confirms_delivery(self):
         composer = Element()
         send = Element()
-        old = Element(text="callback")
-        new = Element(text="callback")
+        old = Element(text=CALLBACK)
+        new = Element(text=CALLBACK)
         page = Page(
             composer, sends=[[send]], messages=[[old], [old, new]]
         )
@@ -175,6 +183,52 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
         self.run_notify(page)
 
         self.assertEqual(send.clicks, 1)
+
+    def test_new_identity_with_rendered_whitespace_differences_confirms(self):
+        composer = Element()
+        send = Element()
+        rendered = (
+            "LOCAL_AGENT_JOB_COMPLETED   job_id:   JOB-ACK-001\r\n"
+            "actor: codex workspace: sandbox status: DONE artifact_status: DONE"
+        )
+        page = Page(composer, sends=[[send]], messages=[[], [Element(text=rendered)]])
+
+        self.run_notify(page)
+
+        self.assertEqual(send.clicks, 1)
+
+    def test_new_job_id_only_does_not_confirm(self):
+        page = Page(Element(), sends=[[Element()]], messages=[[], [
+            Element(text="job_id: JOB-ACK-001 actor: codex")
+        ]])
+
+        with self.assertRaisesRegex(notify.BrowserNotifyError, "DELIVERY_UNKNOWN"):
+            self.run_notify(page, monotonic=[0, 0, 0, 11])
+
+    def test_new_marker_only_does_not_confirm(self):
+        page = Page(Element(), sends=[[Element()]], messages=[[], [
+            Element(text="LOCAL_AGENT_JOB_COMPLETED")
+        ]])
+
+        with self.assertRaisesRegex(notify.BrowserNotifyError, "DELIVERY_UNKNOWN"):
+            self.run_notify(page, monotonic=[0, 0, 0, 11])
+
+    def test_marker_and_job_id_in_different_new_nodes_do_not_confirm(self):
+        page = Page(Element(), sends=[[Element()]], messages=[[], [
+            Element(text="LOCAL_AGENT_JOB_COMPLETED"),
+            Element(text="job_id: JOB-ACK-001 actor: codex"),
+        ]])
+
+        with self.assertRaisesRegex(notify.BrowserNotifyError, "DELIVERY_UNKNOWN"):
+            self.run_notify(page, monotonic=[0, 0, 0, 11])
+
+    def test_wrong_job_id_does_not_confirm(self):
+        page = Page(Element(), sends=[[Element()]], messages=[[], [Element(text=(
+            "LOCAL_AGENT_JOB_COMPLETED job_id: JOB-ACK-002 actor: codex"
+        ))]])
+
+        with self.assertRaisesRegex(notify.BrowserNotifyError, "DELIVERY_UNKNOWN"):
+            self.run_notify(page, monotonic=[0, 0, 0, 11])
 
     def test_composer_empty_without_matching_message_is_not_confirmed(self):
         composer = Element()
@@ -197,6 +251,24 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
 
         self.assertEqual(stop.clicks, 0)
 
+    def test_composer_empty_and_stop_without_combined_identity_do_not_confirm(self):
+        composer = Element()
+        send = Element()
+        stop = Element()
+        page = Page(composer, sends=[[send]], messages=[[], [
+            Element(text="LOCAL_AGENT_JOB_COMPLETED")
+        ]])
+        def after_click():
+            composer.text = ""
+            page.stops[0] = [stop]
+            page.messages.pop(0)
+        send.on_click = after_click
+
+        with self.assertRaisesRegex(notify.BrowserNotifyError, "DELIVERY_UNKNOWN"):
+            self.run_notify(page, monotonic=[0, 0, 0, 11])
+
+        self.assertEqual(send.clicks, 1)
+
     def test_generating_waits_for_stop_to_disappear_then_sends(self):
         composer = Element()
         stop = Element()
@@ -206,7 +278,7 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
         self.run_notify(page)
 
         self.assertEqual(page.waits, [500])
-        self.assertEqual(composer.fills, ["callback"])
+        self.assertEqual(composer.fills, [CALLBACK])
         self.assertEqual(send.clicks, 1)
         self.assertEqual(stop.clicks, 0)
 
@@ -238,7 +310,7 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
 
         self.run_notify(page)
 
-        self.assertEqual(composer.fills, ["callback"])
+        self.assertEqual(composer.fills, [CALLBACK])
         self.assertEqual(send.clicks, 1)
 
     def test_send_timeout_attempts_callback_cleanup(self):
@@ -248,7 +320,7 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
         with self.assertRaisesRegex(notify.BrowserNotifyError, "SEND_BUTTON_TIMEOUT"):
             self.run_notify(page, monotonic=[0, 0, 6])
 
-        self.assertEqual(composer.fills, ["callback", ""])
+        self.assertEqual(composer.fills, [CALLBACK, ""])
 
     def test_multiple_stop_buttons_fails_closed(self):
         composer = Element()
@@ -269,7 +341,7 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
         with self.assertRaisesRegex(notify.BrowserNotifyError, "send_button: multiple"):
             self.run_notify(page)
 
-        self.assertEqual(composer.fills, ["callback", ""])
+        self.assertEqual(composer.fills, [CALLBACK, ""])
         self.assertTrue(all(send.clicks == 0 for send in sends))
 
     def test_cleanup_does_not_clear_user_replacement(self):

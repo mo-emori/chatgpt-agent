@@ -59,6 +59,27 @@ Human ↔ ChatGPT
 
 Inbound HTTPは公開しない。Slack Socket Modeを利用する。
 
+## 2.1 Local Agent Runtime Diagnostics / Recovery（IMPLEMENTED_BASELINE）
+
+運用原則は `Fail -> Diagnose -> Scope -> Fix -> Restart -> Smoke -> Retry` とする。Actor の loud failure は terminal Result の raw `error_summary` を authority として反応的に扱い、強く識別できるものだけを best-effort 分類する。曖昧な失敗は `UNKNOWN_RUNTIME_FAILURE` のまま残す。
+
+自動 model fallback、自動 config 変更、Actor disable/brake、persistent availability、READY/DEGRADED state machine、runtime identity/cache/TTL、startup inference probe は導入しない。修復は scope と hint を確認した人が行い、Worker restart、smoke、元 JOB retry の順に進める。
+
+Codex は shared `~/.codex` とその default model を意図的に利用し、専用 `CODEX_HOME` や model pin を持たない。一方、Windows sandbox backend は silent-corruption invariant である。Codex CLI 0.157.1 が `-c windows.sandbox="mxc"` を per-run override として受理し、`mxc` を同 build の正式な variant として検証することを確認したため、Local Agent launcher は `codex exec -c windows.sandbox="mxc" --sandbox workspace-write -` を使用する。これは shared config を変更せず、自動 fallback も行わない。
+
+Terminal Result Manifest の `runtime` は evidence であり JOB 成否の追加 gate ではない。`configured_default_model` は shared config の観測値、`requested_model` は launcher の明示要求（現在は `null`）、`effective_model` は Codex execution header の `model:` または Claude stream-json `message.model` が存在する場合だけの実行証拠であり、推測しない。Codex CLI 0.157.1 の通常実行でauthoritativeなmodel出力が得られない場合、`effective_model=null` は正常である。`cli_version` と `sandbox_config` も best-effort evidence とする。`sandbox_config` は shared config の観測値であり、per-run MXC invariant 自体は launcher引数とmanual checkの `sandbox_invariant=windows.sandbox="mxc"` で確認する。Terminal `runtime` に別の `sandbox_invariant` keyは追加しない。
+
+Manual diagnostic は Worker event loop、State Store write、Workspace Lock、canonical workspace を使用せず disposable temp directory で実行する。
+
+```text
+python agent_worker.py --check
+python agent_worker.py --check all
+python agent_worker.py --check codex
+python agent_worker.py --check claude
+```
+
+無引数の `--check` と `--check all` は Codex、Claude の順に両方を診断し、`--check codex` / `--check claude` は指定Actorだけを診断する。出力は CLI path/version、configured default model、sandbox config/invariant、minimal inference PASS/FAIL、effective model（authoritativeに観測できる場合だけ）、impact scope を含む。check は manual/reactive、read-only/nonpersistentであり、disposable temp directoryで最小推論を行い、自動 compatibility gate、自動 startup probe、自動 repairには使用しない。ACL before/after、workspace-write mutation probe、Claude review-isolation canary、browser send E2E は将来の optional `--extended` の対象であり、本 baseline には含めない。
+
 ## 3. Slack Authorization
 
 WorkerはChannel IDとSender IDの両方をallowlistで検証する。
@@ -242,8 +263,8 @@ claude -p <prompt>
 CodexはWorkspace Registryに応じて実行する。
 
 ```text
-sandbox:       codex exec --skip-git-repo-check --sandbox workspace-write -
-git workspace: codex exec --sandbox workspace-write -
+sandbox:       codex exec --skip-git-repo-check -c windows.sandbox="mxc" --sandbox workspace-write -
+git workspace: codex exec -c windows.sandbox="mxc" --sandbox workspace-write -
 ```
 
 Codex implementationとClaude independent reviewの境界を維持し、CodexからClaude Codeを直接起動させない。
@@ -257,7 +278,7 @@ Windows上の本Local Agent環境では、Codex設定のsandbox backendを次の
 sandbox = "mxc"
 ```
 
-Local Agentの実行contractは変更しない。Codexは引き続き `codex exec --sandbox workspace-write -` で起動し、subprocessの`cwd`はWorkspace Registryに登録されたworkspace pathとする。`--sandbox workspace-write`はCodex sandboxの境界を指定し、Windows上でその境界を実装するbackendはCodex configのMXCである。approval behaviorも変更しない。sandboxを削除する判断ではなく、`workspace-write`をMXCで実装する判断である。
+Local Agentの実行contractは `codex exec -c windows.sandbox="mxc" --sandbox workspace-write -` とし、subprocessの`cwd`はWorkspace Registryに登録されたworkspace pathとする。`--sandbox workspace-write`はCodex sandboxの境界を指定し、`-c windows.sandbox="mxc"` はWindows上でその境界を実装するbackendを一回の実行に限定して固定する。approval behaviorは変更しない。shared configやdefault modelは引き続き利用する。
 
 本環境では`elevated` backendを承認しない。また、MXCを利用できない場合に`elevated`へsilent fallbackしてはならない。ARGUS（`C:\dev\argus`）で`elevated`を使用した際、workspace rootへの持続的なsandbox ALLOW ACE（`ares\CodexSandboxUsers`および未解決sandbox SID）、`.git`へのsandbox SID明示DENY ACE、tree内の不整合なACL、書込み可能fileだけに付加されたsandbox SID ACE、およびcanonical docsへの実際のwrite failureを観測した。既存の影響pathはARGUS作業で別途修復済みである。
 
@@ -544,6 +565,18 @@ closureを実行する。partial evidenceが存在してもactorをDONEへ昇格
 
 Claude reviewはcanonical workspace単位のqueue lockをactor timeoutまで保持する。このためreviewは同一workspaceの他jobを最大actor timeoutまで直列化し得る。actorのcwdはWorker所有のjob固有disposable directoryに作る独立local cloneであり、worktreeではない。作成は `git clone --no-hardlinks --no-checkout <canonical> <review_dir>`、続いてcanonical HEADのdetached checkoutを行う。
 
+### 20.2 Review Isolation → Worker Evidence Adoption（IMPLEMENTED_BASELINE）
+
+Claudeは引き続き独立cloneだけを読み、canonical workspaceへ一切writeしない。既存のcanonical/review boundary verificationが完了し、`review_boundary=CLEAN`、`actor_status=DONE`、`evidence_persisted=true`により`review_execution.adoptable=true`となった後だけ、同じworkspace queue lockを保持したWorkerがnormalized review evidenceをcanonicalへ採用する。設定はworkspace単位のoptional `review_evidence_root`であり、ARGUSでは `validation/evidence/external-review` とする。このrootはactor申告の通常の`artifact_roots`には含めない。
+
+採用先は `<canonical>/<review_evidence_root>/<job_id>/` で、Worker固定allowlistの `review-input.json`、`review-execution.json`、canonical/reviewのbefore/after `diff HEAD --stat` 4ファイル、およびWorker生成のdeterministic `review-manifest.json`だけを置く。Claudeの`AGENT_RESULT`は採用対象を選択できない。Operating Rules v0.3 §19の制約により、raw Local Execution Logsである`claude-stream.jsonl`と`stderr.txt`は常に`LOCAL_ONLY`でありARGUS Gitへ入れてはならない。manifestとResultにはraw内容ではなくSHA-256と`storage=LOCAL_ONLY`だけを記録する。
+
+Workerはconfigured rootとcanonicalへのstrict containment、absolute/drive/UNC/traversal/ADS/Windows reserved-name拒否、既存parent/destinationのsymlink/reparse拒否を行う。完全なpackageはconfigured root直下のWorker作成temporary directoryへstageし、同一filesystemのatomic renameでjob destinationへ設置する。同じjob_idにbyte-equivalent packageが既にあれば`NOOP`、異なるpackageまたは余分なentryがあれば`FAILED`として既存packageを上書き・mergeしない。採用前後のcanonical snapshotを比較し、configured evidence root外の変化があれば採用を`FAILED`にして新規packageをbest-effort rollbackする。既存のdirty source変更はbefore/afterが同一なら許容し、変更しない。
+
+Terminal Resultの`review_evidence`は`status: ADOPTED | NOOP | FAILED | NOT_RUN | NOT_CONFIGURED`、`mode: LIVE`、canonical-relative destination、manifest SHA-256、normalized file hash、raw local-only hash/storage、optional errorを持つ。review qualificationとevidence transportは別failure domainであり、adoption failureは`status=DONE`、`review_boundary=CLEAN`、`review_execution.adoptable=true`を変更しない。Slack Resultは採用attempt後に公開されるためfinal adoption status/hashを含む。Workerはevidenceをcommitせず、commit authorityはHumanに残る。
+
+provenance chainは `Worker-owned local job log → normalized allowlist → Worker manifest → Result.manifest_sha256 → downstream Codex` である。downstream Codexはcanonicalの`review-manifest.json`をSHA-256で再計算し、Resultの`manifest_sha256`と一致した場合だけ採用evidenceをtrustする。`HISTORICAL_MANUAL` adoptionは明示的にdeferredであり、このbaselineでは実装しない。
+
 Review Input Manifest v1は `git ls-files --cached --others --exclude-standard` が列挙し、現在のfilesystemに通常fileとして存在するpathを対象とする。pathはworkspace-relative slash-normalized、byte順で決定的に整列し、各fileのraw bytesのSHA-256とsize、決定的JSON serialization全体の `input_manifest_sha256` を記録する。staged/unstaged区別はreview cloneへ再現しない。staged deletionを含むcanonicalで現存しないfileは入力集合に含めず、clone側から削除する。Git LFS、submoduleの完全なsnapshot semanticsはv0.1の保証外である。
 
 Workerはclone内を入力集合と完全一致させ、Claude開始前にmanifestを再計算する。不一致はpreparation domainの `REVIEW_SNAPSHOT_MISMATCH` としactorを起動しない。作成・snapshot取得失敗はそれぞれ `REVIEW_WORKSPACE_CREATE_FAILED` / `REVIEW_SNAPSHOT_FAILED` とする。
@@ -657,10 +690,12 @@ Humanが変更した、またはそれ以外のcomposer textは決してclearし
 Fail Closedとし、Agent専用Browser profile、CDP endpoint、selectorのuniqueness / visibility safetyを維持する。
 
 click正常終了は `CLICK_SUCCEEDED` であり、callback成功ではない。Workerはclick前に
-`[data-message-author-role="user"]` のうちcallback textと完全一致するmessage数を取得し、click後は約10秒を上限として
-約500 ms間隔で同じselectorを再検査する。事前値より完全一致message数が増えた場合だけ
+`[data-message-author-role="user"]` の総node数を取得し、click後は約10秒を上限として約500 ms間隔で同じselectorを再検査する。
+事前node数より後に追加された単一の新規user-message node内に、送信callbackの
+`LOCAL_AGENT_JOB_COMPLETED` または `LOCAL_AGENT_JOB_FAILED` markerと、exactなunique `job_id` の両方が存在する場合だけ
 `DELIVERY_CONFIRMED` とし、`notify_chatgpt` の成功returnおよびWorkerの `Browser callback succeeded` を許可する。
-これにより、同一callbackが過去に存在しても新規deliveryのACKにはならない。composerが空になったこと、およびSTOPが
+DOM renderingによる改行・通常whitespaceの正規化は許容し、full rendered textの完全一致は要求しない。markerのみ、`job_id` のみ、
+または別々の新規nodeに分かれた一致はACKにならない。これにより、同一callbackが過去に存在しても新規deliveryのACKにはならない。composerが空になったこと、およびSTOPが
 visibleになったことはsecondary diagnostic evidenceに限り、delivery authorityにはしない。
 
 click後にACK timeout、DOM変化の不確定、またはその他のambiguous stateが生じた場合は

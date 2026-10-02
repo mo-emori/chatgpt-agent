@@ -1,5 +1,6 @@
 import json
 import logging
+import re
 import time
 from pathlib import Path
 
@@ -146,19 +147,51 @@ def element_text(element):
     return (value or "").replace("\r\n", "\n")
 
 
-def matching_user_message_count(page, selectors, message):
-    expected = message.replace("\r\n", "\n")
-
+def user_message_locator(page, selectors):
     for selector in selectors:
         locator = page.locator(selector)
-        count = locator.count()
-        if count:
-            return sum(
-                element_text(locator.nth(i)) == expected
-                for i in range(count)
-            )
+        if locator.count():
+            return locator
 
-    return 0
+    return None
+
+
+def user_message_count(page, selectors):
+    locator = user_message_locator(page, selectors)
+    return locator.count() if locator is not None else 0
+
+
+def callback_identity(message):
+    marker = None
+    job_id = None
+    for line in message.splitlines():
+        stripped = line.strip()
+        if stripped in {"LOCAL_AGENT_JOB_COMPLETED", "LOCAL_AGENT_JOB_FAILED"}:
+            marker = stripped
+        elif stripped.startswith("job_id: "):
+            job_id = stripped.removeprefix("job_id: ").strip()
+
+    if marker is None or not job_id:
+        raise BrowserNotifyError("INVALID_CALLBACK_IDENTITY")
+
+    return marker, job_id
+
+
+def normalized_rendered_text(value):
+    return " ".join(value.split())
+
+
+def callback_identity_matches(text, marker, job_id):
+    rendered = normalized_rendered_text(text)
+    marker_match = re.search(
+        rf"(?:^|\s){re.escape(marker)}(?=\s|$)", rendered
+    ) is not None
+    job_id_match = re.search(
+        rf"(?:^|\s)job_id:\s*{re.escape(normalized_rendered_text(job_id))}"
+        rf"(?=\s+actor:|$)",
+        rendered,
+    ) is not None
+    return marker_match, job_id_match
 
 
 def callback_log_identity(message):
@@ -175,20 +208,45 @@ def callback_log_identity(message):
 
 def wait_for_delivery_ack(
     page, *, composer_selectors, stop_selectors, user_message_selectors,
-    message, pre_send_match_count,
+    message, user_message_count_before,
 ):
     deadline = time.monotonic() + DELIVERY_ACK_TIMEOUT_SECONDS
     saw_composer_empty = False
     saw_stop_visible = False
+    marker, job_id = callback_identity(message)
+    marker_match_seen = False
+    job_id_match_seen = False
+    combined_identity_match_seen = False
+    user_message_count_after = user_message_count_before
 
     while True:
-        match_count = matching_user_message_count(
-            page, user_message_selectors, message
+        locator = user_message_locator(page, user_message_selectors)
+        user_message_count_after = locator.count() if locator is not None else 0
+        for index in range(user_message_count_before, user_message_count_after):
+            marker_match, job_id_match = callback_identity_matches(
+                element_text(locator.nth(index)), marker, job_id
+            )
+            marker_match_seen = marker_match_seen or marker_match
+            job_id_match_seen = job_id_match_seen or job_id_match
+            combined_identity_match_seen = (
+                combined_identity_match_seen or (marker_match and job_id_match)
+            )
+
+        new_user_message_count = max(
+            0, user_message_count_after - user_message_count_before
         )
-        if match_count > pre_send_match_count:
+        if combined_identity_match_seen:
             logger.info(
-                "Browser callback DELIVERY_CONFIRMED: %s",
-                callback_log_identity(message),
+                "Browser callback DELIVERY_CONFIRMED: %s "
+                "user_message_count_before=%s user_message_count_after=%s "
+                "new_user_message_count=%s marker_match_seen=%s "
+                "job_id_match_seen=%s combined_identity_match_seen=%s "
+                "composer_empty_seen=%s stop_seen=%s timeout_seconds=%s",
+                callback_log_identity(message), user_message_count_before,
+                user_message_count_after, new_user_message_count,
+                marker_match_seen, job_id_match_seen,
+                combined_identity_match_seen, saw_composer_empty,
+                saw_stop_visible, DELIVERY_ACK_TIMEOUT_SECONDS,
             )
             return
 
@@ -209,8 +267,15 @@ def wait_for_delivery_ack(
         if time.monotonic() >= deadline:
             logger.warning(
                 "Browser callback DELIVERY_ACK_TIMEOUT/DELIVERY_UNKNOWN: %s "
-                "composer_empty=%s stop_visible=%s",
-                callback_log_identity(message), saw_composer_empty, saw_stop_visible,
+                "user_message_count_before=%s user_message_count_after=%s "
+                "new_user_message_count=%s marker_match_seen=%s "
+                "job_id_match_seen=%s combined_identity_match_seen=%s "
+                "composer_empty_seen=%s stop_seen=%s timeout_seconds=%s",
+                callback_log_identity(message), user_message_count_before,
+                user_message_count_after, new_user_message_count,
+                marker_match_seen, job_id_match_seen,
+                combined_identity_match_seen, saw_composer_empty,
+                saw_stop_visible, DELIVERY_ACK_TIMEOUT_SECONDS,
             )
             raise BrowserNotifyError("DELIVERY_UNKNOWN: DELIVERY_ACK_TIMEOUT")
 
@@ -316,8 +381,8 @@ def notify_chatgpt(
             if not composer_is_empty(composer):
                 raise BrowserNotifyError("COMPOSER_NOT_EMPTY")
 
-            pre_send_match_count = matching_user_message_count(
-                page, dom["user_message"]["selectors"], message
+            user_message_count_before = user_message_count(
+                page, dom["user_message"]["selectors"]
             )
 
             filled = False
@@ -359,7 +424,7 @@ def notify_chatgpt(
                 stop_selectors=dom["stop_button"]["selectors"],
                 user_message_selectors=dom["user_message"]["selectors"],
                 message=message,
-                pre_send_match_count=pre_send_match_count,
+                user_message_count_before=user_message_count_before,
             )
 
     except BrowserNotifyError:

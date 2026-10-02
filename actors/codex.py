@@ -3,6 +3,7 @@ import subprocess
 from config import (
     ACTOR_TIMEOUT,
     CODEX_CMD,
+    CODEX_SANDBOX_OVERRIDE,
     WORKSPACES,
 )
 from actors.process_runner import run_process
@@ -27,6 +28,8 @@ def run(job):
     args = [
         CODEX_CMD,
         "exec",
+        "-c",
+        CODEX_SANDBOX_OVERRIDE,
     ]
 
     if config["allow_skip_git_repo_check"]:

@@ -3,6 +3,8 @@ import hashlib
 import logging
 import subprocess
 import threading
+import argparse
+import sys
 
 from actors import run_agent
 from actors import claude
@@ -31,6 +33,14 @@ from artifacts.validator import (
 from config import WORKSPACES
 from drive_store import upload_artifacts
 from cli_check import check_cli_versions
+from runtime_diagnostics import (
+    classify_runtime_failure,
+    collect_runtime_evidence,
+    run_checks,
+)
+from review_evidence import (
+    adopt_review_evidence, failed_review_evidence, not_run_review_evidence,
+)
 from job_log import (
     create_job_log,
     get_changed_paths,
@@ -593,6 +603,8 @@ def build_result(
     error_summary=None,
     execution_evidence=None,
     artifact_result=None,
+    runtime=None,
+    runtime_diagnostics=None,
 ):
     response = {
         "protocol_version": job.protocol_version,
@@ -602,6 +614,7 @@ def build_result(
         "workspace": job.workspace,
         "prompt_sha256": job.prompt_sha256,
         "status": status,
+        "runtime": runtime or collect_runtime_evidence(job.actor),
     }
     if exit_code is not None:
         response["exit_code"] = exit_code
@@ -609,6 +622,8 @@ def build_result(
         response["failure_class"] = failure_class
     if error_summary is not None:
         response["error_summary"] = error_summary
+    if runtime_diagnostics is not None:
+        response["runtime_diagnostics"] = runtime_diagnostics
     if artifact_result is not None:
         summary, artifact_status, artifacts, rejected = artifact_result
         response["summary"] = summary
@@ -668,7 +683,12 @@ def handle_execution_failure(
     response_status,
     artifact_status,
     error_summary=None,
+    exception=None,
 ):
+    runtime_diagnostic = None
+    if isinstance(exception, FileNotFoundError):
+        runtime_diagnostic = classify_runtime_failure(error_summary, exception=exception)
+        failure_class = runtime_diagnostic["classification"]
     state_store.mark_completed(
         job.job_id,
         status="FAILED",
@@ -679,6 +699,7 @@ def handle_execution_failure(
         status=response_status,
         failure_class=failure_class,
         error_summary=error_summary,
+        runtime_diagnostics=runtime_diagnostic,
     )
     publish_slack_result(log_dir, say, response)
     finalize_browser_callback(
@@ -718,25 +739,30 @@ def execute_job(job, say):
             status = "FAILED"
             logger.error("Actor failure: job_id=%s exit_code=%s", job.job_id, result.returncode)
 
-            state_store.mark_completed(
-                job.job_id,
-                status="FAILED",
-                exit_code=result.returncode,
-                failure_class="ACTOR_FAILED",
-            )
-
             error_summary = (
                 result.stderr.strip()
                 or result.stdout.strip()
                 or "Actor failed"
             )[-4000:]
+            runtime_diagnostic = classify_runtime_failure(error_summary)
+            failure_class = runtime_diagnostic["classification"]
+
+            state_store.mark_completed(
+                job.job_id,
+                status="FAILED",
+                exit_code=result.returncode,
+                failure_class=failure_class,
+            )
+
             response = build_result(
                 job,
                 status="FAILED",
-                failure_class="ACTOR_FAILED",
+                failure_class=failure_class,
                 exit_code=result.returncode,
                 error_summary=error_summary,
                 execution_evidence=(before, after, changed_paths),
+                runtime=collect_runtime_evidence(job.actor, result),
+                runtime_diagnostics=runtime_diagnostic,
             )
             publish_slack_result(log_dir, say, response)
             finalize_browser_callback(
@@ -745,7 +771,7 @@ def execute_job(job, say):
                 response,
                 status="FAILED",
                 artifact_status="NOT_RUN",
-                failure_class="ACTOR_FAILED",
+                failure_class=failure_class,
             )
 
             return
@@ -790,6 +816,7 @@ def execute_job(job, say):
                 artifacts,
                 rejected_artifacts,
             ),
+            runtime=collect_runtime_evidence(job.actor, result),
         )
         publish_slack_result(log_dir, say, response)
         finalize_browser_callback(
@@ -823,6 +850,7 @@ def execute_job(job, say):
             response_status="BRIDGE_ERROR",
             artifact_status="UNKNOWN",
             error_summary=str(e)[:4000],
+            exception=e,
         )
 
         logger.exception("BRIDGE ERROR: job_id=%s", job.job_id)
@@ -862,7 +890,9 @@ def execute_claude_review(job, say):
     artifact_result = None
     artifact_status = "NOT_RUN"
     error_summary = None
+    runtime_diagnostic = None
     response = None
+    review_evidence = not_run_review_evidence(bool(workspace.get("review_evidence_root")))
 
     try:
         log_dir = create_job_log(job.job_id)
@@ -909,6 +939,13 @@ def execute_claude_review(job, say):
             failure_class = "EXECUTION_EVIDENCE_MISSING"
         elif actor_status == "DONE":
             failure_class = None
+        elif actor_status == "AGENT_ERROR":
+            error_summary = (
+                (result.stderr.strip() or result.stdout.strip())
+                if result is not None else "Actor failed"
+            )[-4000:]
+            runtime_diagnostic = classify_runtime_failure(error_summary)
+            failure_class = runtime_diagnostic["classification"]
 
         # A non-CLEAN clone is evidence, never an authoritative artifact source.
         if adoptable:
@@ -933,6 +970,8 @@ def execute_claude_review(job, say):
         response = build_result(
             job, status=status, failure_class=failure_class, exit_code=exit_code,
             error_summary=error_summary, artifact_result=artifact_result,
+            runtime=collect_runtime_evidence(job.actor, result),
+            runtime_diagnostics=runtime_diagnostic,
         )
         response.update({
             "review_input": None,
@@ -971,6 +1010,31 @@ def execute_claude_review(job, say):
             response["artifact_skip_reason"] = (
                 f"Review artifacts are non-authoritative because boundary is {boundary}."
             )
+        if adoptable and review is not None:
+            try:
+                review_evidence = adopt_review_evidence(
+                    canonical=canonical,
+                    review_evidence_root=workspace.get("review_evidence_root"),
+                    job_id=job.job_id,
+                    log_dir=log_dir,
+                    actor=job.actor,
+                    mode=job.mode,
+                    canonical_head=review.canonical_before["head"],
+                    review_head_before=review.head_before,
+                    review_head_after=head_after,
+                    input_manifest_sha256=review.input_manifest["input_manifest_sha256"],
+                    file_count=review.input_manifest["file_count"],
+                    review_boundary=boundary,
+                    actor_status=actor_status,
+                    evidence_persisted=evidence_persisted,
+                    adoptable=adoptable,
+                )
+            except Exception as exc:
+                # Evidence delivery is deliberately not a review qualification
+                # domain.  Preserve DONE/CLEAN/adoptable on any transport fault.
+                logger.exception("REVIEW EVIDENCE ADOPTION FAILED: job_id=%s", job.job_id)
+                review_evidence = failed_review_evidence(exc)
+        response["review_evidence"] = review_evidence
     except Exception as exc:
         status = "FAILED"
         failure_class = "RESULT_ASSEMBLY_FAILED"
@@ -979,6 +1043,7 @@ def execute_claude_review(job, say):
                                 error_summary=str(exc)[:4000])
         response.update({"review_input": None, "review_boundary": None,
                          "review_execution": None, "review_workspace": None,
+                         "review_evidence": review_evidence,
                          "cleanup_status": "PENDING"})
 
     # Terminal publication is exactly once.  Each sink is isolated so a failed
@@ -1121,7 +1186,17 @@ def recover_running_jobs():
             logger.warning("RECOVERY_REQUIRED: job_id=%s pid=%s", job_id, pid)
 
 
-def main():
+def main(argv=()):
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--check", nargs="?", const="all",
+        choices=("all", "codex", "claude"),
+    )
+    args = parser.parse_args(argv)
+    if args.check:
+        actors = ("codex", "claude") if args.check == "all" else (args.check,)
+        return run_checks(actors)
+
     configure_logging()
     state_store.initialize()
 
@@ -1140,7 +1215,8 @@ def main():
     logger.info("Press Ctrl+C to stop.")
 
     bridge.start()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main(sys.argv[1:]))

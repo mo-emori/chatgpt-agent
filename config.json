@@ -10,6 +10,7 @@
       "path": "C:\\dev\\argus",
       "git_required": true,
       "allow_skip_git_repo_check": false,
+      "review_evidence_root": "validation/evidence/external-review",
       "artifact_roots": [
         "validation/reports",
         "validation/metrics",

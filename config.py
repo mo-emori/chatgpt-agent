@@ -27,6 +27,8 @@ CODEX_CMD = os.environ.get(
     "codex.cmd",
 )
 
+CODEX_SANDBOX_OVERRIDE = 'windows.sandbox="mxc"'
+
 CLAUDE_CMD = os.environ["CLAUDE_CMD"]
 
 EXPECTED_CLI = {

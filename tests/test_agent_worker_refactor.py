@@ -71,12 +71,14 @@ class ExecuteJobRefactorTests(unittest.TestCase):
     @patch.object(agent_worker.state_store, "mark_completed")
     @patch.object(agent_worker, "process_artifacts")
     @patch.object(agent_worker, "collect_execution_evidence")
+    @patch.object(agent_worker, "collect_runtime_evidence")
     @patch.object(agent_worker, "run_agent")
     @patch.object(agent_worker, "prepare_execution")
     def test_success_keeps_execution_and_artifact_status_separate(
         self,
         prepare,
         run_agent,
+        collect_runtime,
         collect_evidence,
         process_artifacts,
         mark_completed,
@@ -173,6 +175,7 @@ class ExecuteJobRefactorTests(unittest.TestCase):
             "status": "BRIDGE_ERROR",
             "failure_class": "BRIDGE_ERROR",
             "error_summary": "bridge exploded",
+            "runtime": parse_slack_payload(slack_messages[0])["runtime"],
         }
         self.assertEqual(events, ["slack", "callback"])
         self.assertEqual(parse_slack_payload(slack_messages[0]), expected_slack)
@@ -199,12 +202,14 @@ class ExecuteJobRefactorTests(unittest.TestCase):
     @patch.object(agent_worker, "notify_chatgpt")
     @patch.object(agent_worker.state_store, "mark_completed")
     @patch.object(agent_worker, "collect_execution_evidence")
+    @patch.object(agent_worker, "collect_runtime_evidence")
     @patch.object(agent_worker, "run_agent")
     @patch.object(agent_worker, "prepare_execution")
     def test_actor_failure_keeps_git_evidence_and_isolates_callback_failure(
         self,
         prepare,
         run_agent,
+        collect_runtime,
         collect_evidence,
         mark_completed,
         notify,
@@ -218,6 +223,12 @@ class ExecuteJobRefactorTests(unittest.TestCase):
             stdout="actor output",
             stderr="actor error",
         )
+        runtime = {
+            "actor": "claude", "cli_version": "2.1.280 (Claude Code)",
+            "configured_default_model": None, "requested_model": None,
+            "effective_model": None, "sandbox_config": None,
+        }
+        collect_runtime.return_value = runtime
         events = []
         slack_messages = []
 
@@ -259,8 +270,14 @@ class ExecuteJobRefactorTests(unittest.TestCase):
             "prompt_sha256": "a" * 64,
             "status": "FAILED",
             "exit_code": 17,
-            "failure_class": "ACTOR_FAILED",
+            "failure_class": "UNKNOWN_RUNTIME_FAILURE",
             "error_summary": "actor error",
+            "runtime": runtime,
+            "runtime_diagnostics": {
+                "classification": "UNKNOWN_RUNTIME_FAILURE",
+                "scope": "unknown; inspect raw error",
+                "repair_hint": "Diagnose the raw actor error before changing configuration, then smoke-test and retry.",
+            },
             "git": {
                 "baseline_commit": "abc123",
                 "head_after": "def456",
@@ -295,7 +312,7 @@ class ExecuteJobRefactorTests(unittest.TestCase):
             job.job_id,
             status="FAILED",
             exit_code=17,
-            failure_class="ACTOR_FAILED",
+            failure_class="UNKNOWN_RUNTIME_FAILURE",
         )
         dispatch.assert_called_once_with(job.workspace, say)
 
@@ -304,12 +321,14 @@ class ExecuteJobRefactorTests(unittest.TestCase):
     @patch.object(agent_worker.state_store, "mark_completed")
     @patch.object(agent_worker, "process_artifacts")
     @patch.object(agent_worker, "collect_execution_evidence")
+    @patch.object(agent_worker, "collect_runtime_evidence")
     @patch.object(agent_worker, "run_agent")
     @patch.object(agent_worker, "prepare_execution")
     def test_success_slack_and_local_result_snapshots_keep_all_status_domains(
         self,
         prepare,
         run_agent,
+        collect_runtime,
         collect_evidence,
         process_artifacts,
         mark_completed,
@@ -320,6 +339,12 @@ class ExecuteJobRefactorTests(unittest.TestCase):
         before = {"head": "base"}
         after = {"head": "head"}
         actor_result = SimpleNamespace(returncode=0, stdout="output", stderr="")
+        runtime = {
+            "actor": "claude", "cli_version": "2.1.280 (Claude Code)",
+            "configured_default_model": None, "requested_model": None,
+            "effective_model": None, "sandbox_config": None,
+        }
+        collect_runtime.return_value = runtime
         events = []
         slack_messages = []
 
@@ -366,6 +391,7 @@ class ExecuteJobRefactorTests(unittest.TestCase):
             "workspace": "argus",
             "prompt_sha256": "a" * 64,
             "status": "DONE",
+            "runtime": runtime,
             "exit_code": 0,
             "summary": "completed with one rejection",
             "git": {

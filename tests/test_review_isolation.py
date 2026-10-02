@@ -135,11 +135,14 @@ class LauncherContractTests(unittest.TestCase):
 
     @patch.object(codex, "run_process")
     @patch.object(codex, "validate_workspace")
-    def test_codex_workspace_write_contract_unchanged(self, validate, run_process):
+    def test_codex_workspace_write_contract_has_mxc_invariant(self, validate, run_process):
         job = SimpleNamespace(workspace="local-agent", prompt="implement", actor="codex")
         codex.run(job)
         args = run_process.call_args.kwargs["args"]
-        self.assertEqual(args, [codex.CODEX_CMD, "exec", "--sandbox", "workspace-write", "-"])
+        self.assertEqual(args, [
+            codex.CODEX_CMD, "exec", "-c", codex.CODEX_SANDBOX_OVERRIDE,
+            "--sandbox", "workspace-write", "-",
+        ])
 
 
 class CleanupAndProcessTreeTests(unittest.TestCase):
@@ -290,7 +293,35 @@ class ReviewTerminalConvergenceTests(unittest.TestCase):
         response, say, mocks = self.run_case("CLEAN")
         self.assertEqual(response["status"], "DONE")
         self.assertTrue(response["review_execution"]["adoptable"])
+        self.assertEqual(response["review_evidence"]["status"], "NOT_CONFIGURED")
         self.assertEqual(say.call_count, 1)
+
+    def test_terminal_slack_has_final_adoption_status_and_manifest_sha(self):
+        adopted = {"status": "ADOPTED", "mode": "LIVE", "destination": "evidence/J",
+                   "manifest_sha256": "f" * 64, "normalized_files": [],
+                   "raw_local_only": []}
+        with patch.object(agent_worker, "adopt_review_evidence", return_value=adopted) as adoption, \
+             patch.dict(agent_worker.WORKSPACES["local-agent"],
+                        {"review_evidence_root": "evidence"}):
+            response, say, mocks = self.run_case("CLEAN")
+        self.assertEqual(response["status"], "DONE")
+        self.assertEqual(response["review_boundary"]["status"], "CLEAN")
+        self.assertTrue(response["review_execution"]["adoptable"])
+        self.assertEqual(response["review_evidence"]["status"], "ADOPTED")
+        published = json.loads(say.call_args.args[0].removeprefix("```json\n").removesuffix("\n```"))
+        self.assertEqual(published["review_evidence"], adopted)
+        adoption.assert_called_once()
+
+    def test_adoption_exception_does_not_rewrite_successful_review(self):
+        with patch.object(agent_worker, "adopt_review_evidence",
+                          side_effect=OSError("adoption denied")), \
+             patch.dict(agent_worker.WORKSPACES["local-agent"],
+                        {"review_evidence_root": "evidence"}):
+            response, say, mocks = self.run_case("CLEAN")
+        self.assertEqual(response["status"], "DONE")
+        self.assertEqual(response["review_boundary"]["status"], "CLEAN")
+        self.assertTrue(response["review_execution"]["adoptable"])
+        self.assertEqual(response["review_evidence"]["status"], "FAILED")
 
     def test_nonclean_boundaries_are_done_nonadoptable_and_skip_artifacts(self):
         for boundary in ("INPUT_MODIFIED", "CANONICAL_STATE_CHANGED"):

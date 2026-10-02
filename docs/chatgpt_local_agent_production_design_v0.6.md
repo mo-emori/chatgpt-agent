@@ -690,7 +690,9 @@ Humanが変更した、またはそれ以外のcomposer textは決してclearし
 Fail Closedとし、Agent専用Browser profile、CDP endpoint、selectorのuniqueness / visibility safetyを維持する。
 
 click正常終了は `CLICK_SUCCEEDED` であり、callback成功ではない。Workerはclick前に
-`[data-message-author-role="user"]` の総node数を取得し、click後は約10秒を上限として約500 ms間隔で同じselectorを再検査する。
+現行DOMの `article[data-testid^="conversation-turn-"][data-turn="user"]` を優先し、旧DOMの
+`[data-message-author-role="user"]` をfallbackとして、可視user-turnのtext snapshotを取得する。click後は約10秒を上限として
+約500 ms間隔で同じ優先順を再検査し、使用selectorと前後件数をdiagnostic logへ残す。
 事前node数より後に追加された単一の新規user-message node内に、送信callbackの
 `LOCAL_AGENT_JOB_COMPLETED` または `LOCAL_AGENT_JOB_FAILED` markerと、exactなunique `job_id` の両方が存在する場合だけ
 `DELIVERY_CONFIRMED` とし、`notify_chatgpt` の成功returnおよびWorkerの `Browser callback succeeded` を許可する。

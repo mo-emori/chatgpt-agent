@@ -259,8 +259,9 @@ class ReviewTerminalConvergenceTests(unittest.TestCase):
         )
 
     def run_case(self, boundary="CLEAN", parse_error=None, boundary_error=None,
-                 state_error=None):
+                 state_error=None, callback_effect=None, callback_type="chatgpt_browser"):
         job = self.job(); say = Mock()
+        job.callback_type = callback_type
         temp = tempfile.TemporaryDirectory(); root = Path(temp.name)
         review = self.review(root); review.root.mkdir(); review.settings_path.write_text("{}")
         final = '<AGENT_RESULT>\n{"summary":"CHANGES REQUESTED","artifacts":[]}\n</AGENT_RESULT>'
@@ -274,8 +275,10 @@ class ReviewTerminalConvergenceTests(unittest.TestCase):
             patch.object(agent_worker, "diff_head_stat", return_value=""),
             patch.object(agent_worker, "cleanup_review", return_value="DONE"),
             patch.object(agent_worker.state_store, "mark_completed", side_effect=state_error),
-            patch.object(agent_worker, "finalize_browser_callback"),
+            patch.object(agent_worker, "finalize_browser_callback",
+                         side_effect=callback_effect),
             patch.object(agent_worker, "dispatch_next_queued"),
+            patch.object(agent_worker, "log_job_end"),
             patch.object(agent_worker, "process_artifacts", return_value=("CHANGES REQUESTED", "DONE", [], [])),
         ]
         if parse_error:
@@ -295,6 +298,36 @@ class ReviewTerminalConvergenceTests(unittest.TestCase):
         self.assertTrue(response["review_execution"]["adoptable"])
         self.assertEqual(response["review_evidence"]["status"], "NOT_CONFIGURED")
         self.assertEqual(say.call_count, 1)
+        mocks[-2].assert_called_once()
+
+    def test_job_end_once_for_each_callback_outcome_and_no_callback(self):
+        def callback_outcome(callback_status, error=None):
+            def apply(_job, _log_dir, response, **_kwargs):
+                response["callback"] = {"status": callback_status}
+                if error is not None:
+                    response["callback"]["error"] = error
+            return apply
+
+        cases = (
+            ("confirmed", callback_outcome("DONE"), "chatgpt_browser", "DONE"),
+            ("unknown", callback_outcome(
+                "FAILED", "DELIVERY_UNKNOWN: DELIVERY_ACK_TIMEOUT"
+            ), "chatgpt_browser", "FAILED"),
+            ("exception", RuntimeError("callback exploded"),
+             "chatgpt_browser", None),
+            ("no callback", callback_outcome("SKIPPED"), None, "SKIPPED"),
+        )
+        for name, effect, callback_type, callback_status in cases:
+            with self.subTest(name=name):
+                response, _, mocks = self.run_case(
+                    callback_effect=effect, callback_type=callback_type
+                )
+                self.assertEqual(response["status"], "DONE")
+                self.assertEqual(response["review_boundary"]["status"], "CLEAN")
+                self.assertEqual(response["cleanup_status"], "DONE")
+                if callback_status is not None:
+                    self.assertEqual(response["callback"]["status"], callback_status)
+                mocks[-2].assert_called_once()
 
     def test_terminal_slack_has_final_adoption_status_and_manifest_sha(self):
         adopted = {"status": "ADOPTED", "mode": "LIVE", "destination": "evidence/J",

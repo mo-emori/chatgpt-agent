@@ -19,6 +19,7 @@
   },
   "user_message": {
     "selectors": [
+      "article[data-testid^='conversation-turn-'][data-turn='user']",
       "[data-message-author-role='user']"
     ]
   }

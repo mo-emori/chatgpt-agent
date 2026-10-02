@@ -714,6 +714,16 @@ def handle_execution_failure(
     )
 
 
+def log_job_end(job, status, exit_code):
+    logger.info(
+        "\n==============================\n"
+        "JOB END\njob_id   : %s\nactor    : %s\nmode     : %s\n"
+        "workspace: %s\nstatus   : %s\nexit_code: %s\n"
+        "==============================",
+        job.job_id, job.actor, job.mode, job.workspace, status, exit_code,
+    )
+
+
 def execute_job(job, say):
     if isinstance(job, Job) and job.actor == "claude" and job.mode == "review":
         return execute_claude_review(job, say)
@@ -858,13 +868,7 @@ def execute_job(job, say):
         logger.exception("BRIDGE ERROR: job_id=%s", job.job_id)
 
     finally:
-        logger.info(
-            "\n==============================\n"
-            "JOB END\njob_id   : %s\nactor    : %s\nmode     : %s\n"
-            "workspace: %s\nstatus   : %s\nexit_code: %s\n"
-            "==============================",
-            job.job_id, job.actor, job.mode, job.workspace, status, exit_code,
-        )
+        log_job_end(job, status, exit_code)
 
         dispatch_next_queued(
             job.workspace,
@@ -1078,9 +1082,14 @@ def execute_claude_review(job, say):
         logger.exception("Unable to attempt terminal callback: job_id=%s", job.job_id)
 
     if review is not None:
-        cleanup_status = cleanup_review(
-            review, outcome_path=(log_dir / "cleanup.json") if log_dir is not None else None,
-        )
+        try:
+            cleanup_status = cleanup_review(
+                review,
+                outcome_path=(log_dir / "cleanup.json") if log_dir is not None else None,
+            )
+        except Exception:
+            cleanup_status = "FAILED"
+            logger.exception("Review workspace cleanup failed: job_id=%s", job.job_id)
     response["cleanup_status"] = cleanup_status
     if not db_persisted:
         try:
@@ -1097,6 +1106,7 @@ def execute_claude_review(job, say):
 
     logger.info("Claude review end: job_id=%s status=%s actor=%s boundary=%s cleanup=%s",
                 job.job_id, status, actor_status, boundary, cleanup_status)
+    log_job_end(job, status, exit_code)
     dispatch_next_queued(job.workspace, say)
 
 

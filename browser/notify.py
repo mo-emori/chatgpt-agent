@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import time
+from collections import Counter
 from pathlib import Path
 
 from playwright.sync_api import (
@@ -147,18 +148,23 @@ def element_text(element):
     return (value or "").replace("\r\n", "\n")
 
 
-def user_message_locator(page, selectors):
+def visible_user_messages(page, selectors):
     for selector in selectors:
         locator = page.locator(selector)
-        if locator.count():
-            return locator
+        elements = [
+            locator.nth(index)
+            for index in range(locator.count())
+            if locator.nth(index).is_visible()
+        ]
+        if elements:
+            return selector, elements
 
-    return None
+    return None, []
 
 
-def user_message_count(page, selectors):
-    locator = user_message_locator(page, selectors)
-    return locator.count() if locator is not None else 0
+def user_message_snapshot(page, selectors):
+    strategy, elements = visible_user_messages(page, selectors)
+    return strategy, [element_text(element) for element in elements]
 
 
 def callback_identity(message):
@@ -208,7 +214,7 @@ def callback_log_identity(message):
 
 def wait_for_delivery_ack(
     page, *, composer_selectors, stop_selectors, user_message_selectors,
-    message, user_message_count_before,
+    message, user_messages_before,
 ):
     deadline = time.monotonic() + DELIVERY_ACK_TIMEOUT_SECONDS
     saw_composer_empty = False
@@ -217,14 +223,26 @@ def wait_for_delivery_ack(
     marker_match_seen = False
     job_id_match_seen = False
     combined_identity_match_seen = False
+    selector_before, texts_before = user_messages_before
+    user_message_count_before = len(texts_before)
+    selector_after = selector_before
     user_message_count_after = user_message_count_before
 
     while True:
-        locator = user_message_locator(page, user_message_selectors)
-        user_message_count_after = locator.count() if locator is not None else 0
-        for index in range(user_message_count_before, user_message_count_after):
+        selector_after, texts_after = user_message_snapshot(
+            page, user_message_selectors
+        )
+        user_message_count_after = len(texts_after)
+        remaining_before = Counter(texts_before)
+        new_texts = []
+        for text in texts_after:
+            if remaining_before[text]:
+                remaining_before[text] -= 1
+            else:
+                new_texts.append(text)
+        for text in new_texts:
             marker_match, job_id_match = callback_identity_matches(
-                element_text(locator.nth(index)), marker, job_id
+                text, marker, job_id
             )
             marker_match_seen = marker_match_seen or marker_match
             job_id_match_seen = job_id_match_seen or job_id_match
@@ -232,17 +250,17 @@ def wait_for_delivery_ack(
                 combined_identity_match_seen or (marker_match and job_id_match)
             )
 
-        new_user_message_count = max(
-            0, user_message_count_after - user_message_count_before
-        )
+        new_user_message_count = len(new_texts)
         if combined_identity_match_seen:
             logger.info(
                 "Browser callback DELIVERY_CONFIRMED: %s "
+                "user_message_selector_before=%r user_message_selector_after=%r "
                 "user_message_count_before=%s user_message_count_after=%s "
                 "new_user_message_count=%s marker_match_seen=%s "
                 "job_id_match_seen=%s combined_identity_match_seen=%s "
                 "composer_empty_seen=%s stop_seen=%s timeout_seconds=%s",
-                callback_log_identity(message), user_message_count_before,
+                callback_log_identity(message), selector_before, selector_after,
+                user_message_count_before,
                 user_message_count_after, new_user_message_count,
                 marker_match_seen, job_id_match_seen,
                 combined_identity_match_seen, saw_composer_empty,
@@ -267,11 +285,13 @@ def wait_for_delivery_ack(
         if time.monotonic() >= deadline:
             logger.warning(
                 "Browser callback DELIVERY_ACK_TIMEOUT/DELIVERY_UNKNOWN: %s "
+                "user_message_selector_before=%r user_message_selector_after=%r "
                 "user_message_count_before=%s user_message_count_after=%s "
                 "new_user_message_count=%s marker_match_seen=%s "
                 "job_id_match_seen=%s combined_identity_match_seen=%s "
                 "composer_empty_seen=%s stop_seen=%s timeout_seconds=%s",
-                callback_log_identity(message), user_message_count_before,
+                callback_log_identity(message), selector_before, selector_after,
+                user_message_count_before,
                 user_message_count_after, new_user_message_count,
                 marker_match_seen, job_id_match_seen,
                 combined_identity_match_seen, saw_composer_empty,
@@ -381,7 +401,7 @@ def notify_chatgpt(
             if not composer_is_empty(composer):
                 raise BrowserNotifyError("COMPOSER_NOT_EMPTY")
 
-            user_message_count_before = user_message_count(
+            user_messages_before = user_message_snapshot(
                 page, dom["user_message"]["selectors"]
             )
 
@@ -424,7 +444,7 @@ def notify_chatgpt(
                 stop_selectors=dom["stop_button"]["selectors"],
                 user_message_selectors=dom["user_message"]["selectors"],
                 message=message,
-                user_message_count_before=user_message_count_before,
+                user_messages_before=user_messages_before,
             )
 
     except BrowserNotifyError:

@@ -8,7 +8,9 @@ from browser import notify
 COMPOSER = "composer"
 STOP = "stop"
 SEND = "send"
-USER_MESSAGE = "user-message"
+CURRENT_USER_MESSAGE = "article[data-testid^='conversation-turn-'][data-turn='user']"
+LEGACY_USER_MESSAGE = "[data-message-author-role='user']"
+USER_MESSAGE = CURRENT_USER_MESSAGE
 CALLBACK = (
     "LOCAL_AGENT_JOB_COMPLETED\n\n"
     "job_id: JOB-ACK-001\n"
@@ -20,15 +22,16 @@ CALLBACK = (
 
 
 class Element:
-    def __init__(self, *, text="", enabled=True, on_click=None):
+    def __init__(self, *, text="", enabled=True, on_click=None, visible=True):
         self.text = text
         self.enabled = enabled
         self.fills = []
         self.clicks = 0
         self.on_click = on_click
+        self.visible = visible
 
     def is_visible(self):
-        return True
+        return self.visible
 
     def is_enabled(self):
         return self.enabled
@@ -58,12 +61,15 @@ class Locator:
 
 
 class Page:
-    def __init__(self, composer, *, stops=None, sends=None, messages=None):
+    def __init__(self, composer, *, stops=None, sends=None, messages=None,
+                 legacy_messages=None, other_elements=None):
         self.url = "https://chatgpt.com/c/test"
         self.composer = composer
         self.stops = list(stops or [[]])
         self.sends = list(sends or [[]])
         self.messages = list(messages or [[], [Element(text=CALLBACK)]])
+        self.legacy_messages = list(legacy_messages or [[]])
+        self.other_elements = dict(other_elements or {})
         self.waits = []
         for send_state in self.sends:
             for send in send_state:
@@ -72,6 +78,8 @@ class Page:
     def _after_click(self):
         if len(self.messages) > 1:
             self.messages.pop(0)
+        if len(self.legacy_messages) > 1:
+            self.legacy_messages.pop(0)
 
     def bring_to_front(self):
         pass
@@ -85,6 +93,10 @@ class Page:
             return Locator(self.sends[0])
         if selector == USER_MESSAGE:
             return Locator(self.messages[0])
+        if selector == LEGACY_USER_MESSAGE:
+            return Locator(self.legacy_messages[0])
+        if selector in self.other_elements:
+            return Locator(self.other_elements[selector])
         return Locator([])
 
     def wait_for_timeout(self, milliseconds):
@@ -105,7 +117,7 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
             "composer": {"selectors": [COMPOSER]},
             "stop_button": {"selectors": [STOP]},
             "send_button": {"selectors": [SEND]},
-            "user_message": {"selectors": [USER_MESSAGE]},
+            "user_message": {"selectors": [CURRENT_USER_MESSAGE, LEGACY_USER_MESSAGE]},
         }
         patches = [
             patch.object(notify, "BROWSER_CONFIG", {
@@ -183,6 +195,39 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
         self.run_notify(page)
 
         self.assertEqual(send.clicks, 1)
+
+    def test_legacy_user_message_selector_remains_compatible(self):
+        composer = Element()
+        send = Element()
+        page = Page(
+            composer, sends=[[send]], messages=[[]],
+            legacy_messages=[[], [Element(text=CALLBACK)]],
+        )
+
+        self.run_notify(page)
+
+        self.assertEqual(send.clicks, 1)
+
+    def test_hidden_current_user_message_cannot_confirm(self):
+        page = Page(
+            Element(), sends=[[Element()]],
+            messages=[[], [Element(text=CALLBACK, visible=False)]],
+        )
+
+        with self.assertRaisesRegex(notify.BrowserNotifyError, "DELIVERY_UNKNOWN"):
+            self.run_notify(page, monotonic=[0, 0, 0, 11])
+
+    def test_assistant_history_composer_and_unrelated_text_cannot_confirm(self):
+        composer = Element()
+        historical = Element(text=CALLBACK)
+        page = Page(
+            composer, sends=[[Element()]],
+            messages=[[historical], [historical, Element(text="unrelated user text")]],
+            other_elements={"assistant-message": [Element(text=CALLBACK)]},
+        )
+
+        with self.assertRaisesRegex(notify.BrowserNotifyError, "DELIVERY_UNKNOWN"):
+            self.run_notify(page, monotonic=[0, 0, 0, 11])
 
     def test_new_identity_with_rendered_whitespace_differences_confirms(self):
         composer = Element()

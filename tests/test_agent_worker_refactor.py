@@ -65,6 +65,7 @@ class ExecuteJobRefactorTests(unittest.TestCase):
         ))
         notify.assert_called_once()
 
+    @patch.object(agent_worker, "log_job_end")
     @patch.object(agent_worker, "dispatch_next_queued")
     @patch.object(agent_worker, "finalize_browser_callback")
     @patch.object(agent_worker, "publish_slack_result")
@@ -85,6 +86,7 @@ class ExecuteJobRefactorTests(unittest.TestCase):
         publish,
         finalize_callback,
         dispatch,
+        job_end,
     ):
         job = make_job()
         say = Mock()
@@ -126,6 +128,7 @@ class ExecuteJobRefactorTests(unittest.TestCase):
             artifact_status="FAILED",
         )
         dispatch.assert_called_once_with(job.workspace, say)
+        job_end.assert_called_once_with(job, "DONE", 0)
 
     @patch.object(agent_worker, "dispatch_next_queued")
     @patch.object(agent_worker, "notify_chatgpt")

@@ -5,6 +5,7 @@ import subprocess
 import threading
 import argparse
 import sys
+from pathlib import Path
 
 from actors import run_agent
 from actors import claude
@@ -41,6 +42,7 @@ from runtime_diagnostics import (
 from review_evidence import (
     adopt_review_evidence, failed_review_evidence, not_run_review_evidence,
 )
+from historical_job_evidence import adopt_historical_job_evidence
 from job_log import (
     create_job_log,
     get_changed_paths,
@@ -1192,10 +1194,54 @@ def main(argv=()):
         "--check", nargs="?", const="all",
         choices=("all", "codex", "claude"),
     )
+    parser.add_argument("--adopt-job-evidence", metavar="JOB_ID")
+    parser.add_argument("--workspace")
+    parser.add_argument("--historical-manual", action="store_true")
+    parser.add_argument("--human-approved", action="store_true")
+    parser.add_argument("--slack-result-manifest", metavar="JSON_FILE")
     args = parser.parse_args(argv)
     if args.check:
         actors = ("codex", "claude") if args.check == "all" else (args.check,)
         return run_checks(actors)
+
+    if args.adopt_job_evidence:
+        if not args.workspace or not args.historical_manual or not args.slack_result_manifest:
+            result = {
+                "status": "FAILED", "mode": "HISTORICAL_MANUAL",
+                "job_id": args.adopt_job_evidence, "workspace": args.workspace,
+                "destination": None, "manifest_sha256": None,
+                "corroboration": None,
+                "trust_limitation": (
+                    "Historical evidence lacks an original terminal-time cryptographic anchor."
+                ),
+                "error": ("--workspace, --historical-manual, and "
+                          "--slack-result-manifest are required"),
+            }
+        elif args.workspace not in WORKSPACES:
+            result = {
+                "status": "FAILED", "mode": "HISTORICAL_MANUAL",
+                "job_id": args.adopt_job_evidence, "workspace": args.workspace,
+                "destination": None, "manifest_sha256": None,
+                "corroboration": None,
+                "trust_limitation": (
+                    "Historical evidence lacks an original terminal-time cryptographic anchor."
+                ),
+                "error": "unknown workspace",
+            }
+        else:
+            workspace_config = WORKSPACES[args.workspace]
+            result = adopt_historical_job_evidence(
+                canonical=workspace_config["path"],
+                evidence_root=workspace_config.get("job_evidence_root"),
+                job_id=args.adopt_job_evidence,
+                workspace=args.workspace,
+                log_dir=Path(__file__).parent / "logs" / args.adopt_job_evidence,
+                state_row=state_store.get_job(args.adopt_job_evidence),
+                slack_manifest_path=args.slack_result_manifest,
+                human_approved=args.human_approved,
+            )
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+        return 0 if result["status"] in ("ADOPTED", "NOOP") else 1
 
     configure_logging()
     state_store.initialize()

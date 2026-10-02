@@ -837,6 +837,62 @@ callback後のhost-side ACL inspectionでは、workspace root、`.git`、`baseli
 > 境界を分けたExecution Actor、Google Driveは条件付きArtifact Transport / Store、Local Repo / Gitは
 > Source of Truth、Browser Callbackはwake-up notificationとする。
 
+## 27. Cross-JOB Historical Job Evidence Adoption（IMPLEMENTED_BASELINE）
+
+Terminal `result.json` is intentionally compact and can be lossy for later
+cross-JOB reconciliation. A historical Codex BLOCKED decision can exist only in
+local `stdout.txt`. `HISTORICAL_MANUAL` is the narrow recovery path for that case;
+it is not automatic normal-JOB adoption, replay/event sourcing, or a safety gate.
+
+The authority model is explicit:
+
+- `WORKER_OBSERVED`: Worker-persisted identity, instruction hash/reference,
+  terminal state/exit code/failure class, runtime/artifact facts, Git snapshots,
+  changed paths, and available state-store timestamps.
+- `ACTOR_REPORTED`: Codex summary, judgment, original BLOCKED decision/details,
+  and the exact bounded final actor message. This proves what Codex reported, not
+  that its report was correct.
+- `RAW_LOCAL_ONLY`: `stdout.txt`, `stderr.txt`, and other execution logs. Their
+  adoption-time SHA-256 values may be recorded, but raw files are never copied.
+- `CORROBORATIVE_ONLY`: read-only state store and a Human/ChatGPT-supplied Slack
+  Result Manifest. Matches strengthen provenance without upgrading actor judgment.
+
+For the inspected historical and current plain `codex exec` format, stdout is the
+dedicated terminal actor-message channel and progress/tool trace is on stderr.
+Extraction method `codex-exec-plain-stdout-terminal-message-v1` accepts complete
+stdout only when it is non-empty strict UTF-8 plain text; CRLF and bare CR are
+normalized to LF. Invalid UTF-8, NUL, ANSI control sequences, or a missing message
+fail closed. The method/version, raw stdout SHA-256, and extracted-message SHA-256
+are recorded; the message is not summarized or rewritten.
+
+ARGUS uses `validation/evidence/job-results/<job_id>/`. The only package files are
+`job-evidence-manifest.json`, `normalized-result.json`, and `actor-reported.json`.
+The manifest records deterministic canonical JSON hashes, authority labels, local
+source provenance, raw-local-only hashes, corroboration, Human approval, and the
+trust limitation. Installation rejects unsafe Windows paths and symlink/reparse
+escapes, stages atomically, returns `NOOP` for identical bytes, and fails rather
+than overwriting a different package. Dirty canonical changes outside the exact
+destination remain untouched. The Worker does not commit.
+
+Manual adoption requires `--historical-manual`, `--human-approved`, and a supplied
+Slack Result Manifest. The Worker does not call Slack. Supplied JSON must contain
+`job_id`, `actor`, `mode`, `workspace`, `instruction_sha256`, `status`, `exit_code`,
+plus `git.baseline_commit` and `git.head_after`. All stable overlapping
+request/result/state-store/Slack values are compared mechanically; mismatch fails
+closed.
+
+```text
+python agent_worker.py --adopt-job-evidence <job_id> --workspace argus \
+  --historical-manual --human-approved \
+  --slack-result-manifest C:\\path\\to\\slack-result-manifest.json
+```
+
+The JSON result is `ADOPTED`, `NOOP`, or `FAILED` and includes mode, job/workspace,
+destination, manifest SHA-256, corroboration, trust limitation, and any error.
+Adoption never mutates the historical state-store row. Hashes were created at
+adoption time; original terminal-time hash continuity is unavailable. A future
+all-JOB terminal Slack hash anchor is explicitly DEFERRED.
+
 > v3の実行identityはpage_idではなく、受理時に解決・snapshotしたInstruction bytesとWorker-generated SHAである。
 
 > 同一WorkspaceはSQLiteのatomic `DISPATCHING` claimで直列化し、新規JOBと復旧JOBを同じdispatch pathへ通す。

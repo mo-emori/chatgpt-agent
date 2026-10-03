@@ -130,13 +130,18 @@ def _attributed_patch(root: Path, before: dict | None, after: dict | None,
 
 
 def _expansion(item: dict) -> dict:
+    requirement = item.get("requirement") or (
+        "REQUIRED_BEFORE_REVIEW" if item.get(
+            "required_before_review", item.get("required_before_package_first_execution", False))
+        else "OPTIONAL_BOUNDED")
     return {
         "missing_ref": item.get("source_ref") or item.get("evidence_ref"),
         "reason": item.get("reason", "UNSPECIFIED_EXPANSION"),
         "authority": item.get("authority_class", "evidence"),
         "quality": item.get("quality", "PARTIAL"),
-        "required_before_review": bool(item.get(
-            "required_before_review", item.get("required_before_package_first_execution", False))),
+        "requirement": requirement,
+        "required_before_review": requirement == "REQUIRED_BEFORE_REVIEW",
+        "origin": item.get("origin", "JOB_CONTEXT"),
         "suggested_scope": sorted(set(item.get("suggested_scope", []))),
     }
 
@@ -192,19 +197,24 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
         boundary = sorted(job_context.get("dependency_states", []),
                           key=lambda x: (x.get("context_item", ""), x.get("source_ref", "")))
     expansions = [_expansion(x) for x in job_context.get("expansion_requirements", [])]
-    expansions.extend(attribution_expansion)
+    inherited_count = len(expansions)
+    for item in attribution_expansion:
+        item.update({"requirement": "REQUIRED_BEFORE_REVIEW", "origin": "PACKAGE_NATIVE"})
+        expansions.append(item)
     if mode == "FULL_REVIEW":
         expansions.append({"missing_ref": "full_repository", "reason": "FULL_REVIEW_REQUIRES_BROAD_REPO_VISIBILITY",
                            "authority": "review_mode", "quality": "DECLARED",
-                           "required_before_review": True, "suggested_scope": []})
-    for ref in refs:
-        if ref.get("quality") in ("PARTIAL", "UNSTRUCTURED"):
-            expansions.append({"missing_ref": ref.get("evidence_id"),
-                               "reason": "PRIOR_FINDINGS_NOT_STRUCTURALLY_AVAILABLE",
-                               "authority": "evidence", "quality": ref.get("quality"),
-                               "required_before_review": True,
-                               "suggested_scope": [ref.get("evidence_path")] if ref.get("evidence_path") else []})
+                           "requirement": "REQUIRED_BEFORE_REVIEW",
+                           "required_before_review": True, "origin": "PACKAGE_NATIVE",
+                           "suggested_scope": []})
     expansions = sorted({canonical(x): x for x in expansions}.values(), key=canonical)
+    required_expansions = [x for x in expansions if x["requirement"] == "REQUIRED_BEFORE_REVIEW"]
+    optional_expansions = [x for x in expansions if x["requirement"] == "OPTIONAL_BOUNDED"]
+    inherited_count = sum(x.get("origin") == "JOB_CONTEXT" for x in expansions)
+    package_native_count = sum(x.get("origin") == "PACKAGE_NATIVE" for x in expansions)
+    reason_counts = {}
+    for item in expansions:
+        reason_counts[item["reason"]] = reason_counts.get(item["reason"], 0) + 1
 
     validation = []
     for ref in refs:
@@ -221,7 +231,7 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
                                "execution_authority": "WORKER_OBSERVED",
                                "verdict_authority": "ACTOR_REPORTED"})
     status = ("UNVERIFIABLE" if job_context.get("selection_status") == "UNVERIFIABLE"
-              else "NEEDS_RECONCILIATION" if attribution != "EXACT" or expansions or
+              else "NEEDS_RECONCILIATION" if attribution != "EXACT" or required_expansions or
               job_context.get("selection_status") == "NEEDS_RECONCILIATION"
               else "READY_PACKAGE")
     included_refs = []
@@ -268,8 +278,9 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
                 "finding_ids": [x["finding_id"] for x in findings],
                 "changed_paths": attributed,
                 "authority_ref_count": len(authority)},
-            "omitted_relevant_material": [x["missing_ref"] for x in expansions if x["required_before_review"]],
-            "over_included_material": [], "required_expansion_count": len(expansions),
+            "omitted_relevant_material": [x["missing_ref"] for x in required_expansions],
+            "over_included_material": [], "required_expansion_count": len(required_expansions),
+            "optional_candidate_count": len(optional_expansions),
             "prior_actor_usage": None,
         }),
     }
@@ -301,6 +312,12 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
         "generation_provenance": {"builder": BUILDER_VERSION, "owner": "Local Agent Worker",
                                   "actor_content_executed": False},
         "integrity_status": "VERIFIED_AT_GENERATION",
+        "expansion_diagnostics": {"required_expansion_count": len(required_expansions),
+            "optional_candidate_count": len(optional_expansions),
+            "omitted_irrelevant_count": len(job_context.get("omitted_irrelevant_evidence", [])),
+            "inherited_requirement_count": inherited_count,
+            "package_native_requirement_count": package_native_count,
+            "reason_code_counts": dict(sorted(reason_counts.items()))},
     }
     package_hash = sha256(canonical(manifest_material))
     manifest = dict(manifest_material, package_sha256=package_hash,
@@ -313,7 +330,14 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
               "evidence_index_sha256": manifest_material["evidence_index_sha256"],
               "file_count": len(file_facts), "bytes": manifest_material["package_byte_count"],
               "ref_count": len(included_refs),
-              "finding_count": len(findings), "expansion_required_count": len(expansions),
+              "finding_count": len(findings),
+              "expansion_required_count": len(required_expansions),
+              "required_expansion_count": len(required_expansions),
+              "optional_candidate_count": len(optional_expansions),
+              "omitted_irrelevant_count": len(job_context.get("omitted_irrelevant_evidence", [])),
+              "inherited_expansion_count": inherited_count,
+              "package_native_expansion_count": package_native_count,
+              "reason_code_counts": dict(sorted(reason_counts.items())),
               "attribution_status": attribution}
     return payload, report
 

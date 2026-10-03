@@ -899,6 +899,19 @@ STRUCTURED findingsだけを選択し、PARTIAL/UNSTRUCTURED proseからfinding�
 verdictではない。validationではWorker-observed execution factとactor-reported verdict/findingを別authority labelで保持する。
 
 `DELTA_REVIEW` はattributed hunks、selected authority、structured prior findings/evidence、direct declared dependency surfaceを含む。
+
+Evidence の選択と expansion は、prose の内容や job 名ではなく index に符号化された構造 edge だけで決定する。relevance は
+`REQUIRED_RELEVANT`（`review_of` / target、selected finding/evidence、declared evidence source、明示 dependency 等）、
+`BOUNDED_CANDIDATE`（relevance は不明だが current review への required edge がない）、`IRRELEVANT`（capability mismatch 等の
+決定的 exclusion）の三値とする。expansion requirement は `REQUIRED_BEFORE_REVIEW`、`OPTIONAL_BOUNDED`、`NONE` の三値とし、
+`NEEDS_RECONCILIATION` と pre-launch rejection に寄与するのは unresolved `REQUIRED_BEFORE_REVIEW` だけである。
+
+`PARTIAL` / `UNSTRUCTURED` であることは内容を構造的に判定できないという quality fact であって、current review に必須という
+relationship fact ではない。したがって unknown relevance は mandatory full read と同義ではない。required authority/dependency edge 上の
+unknown/missing evidence は従来どおり fail closed とする一方、edge のない unknown evidence は `OPTIONAL_BOUNDED` として将来の bounded
+expansion に利用可能にし、package-first launch を阻害しない。capability match 単独も、宣言が evidence class を required としていない限り
+required 化しない。Job Context 由来 requirement は Review Package で provenance を保持して継承し、同じ ref を package-native requirement
+として二重生成しない。`expansion_required_count` は後方互換 field として `REQUIRED_BEFORE_REVIEW` 件数だけを表す。
 `BOUNDARY_REVIEW` はJob Contextのdeclared dependency boundaryを追加する。`FULL_REVIEW` はbroad repo visibilityが必要というmarkerと
 bounded expansionを記録し、packageがrepo全体を代替すると主張しない。expansion planはmissing ref、reason、authority/quality、
 required-before-review、deterministic bounded scopeを保持し、automatic unrestricted fallbackを行わない。

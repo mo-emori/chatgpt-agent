@@ -16,6 +16,8 @@ SCHEMA_VERSION = 1
 BUILDER_VERSION = "context-harness-phase2b-1"
 MODE = "COMPARISON_ONLY"
 STATUSES = ("READY_BOUNDED", "NEEDS_RECONCILIATION", "UNVERIFIABLE")
+RELEVANCE = ("REQUIRED_RELEVANT", "BOUNDED_CANDIDATE", "IRRELEVANT")
+EXPANSION_REQUIREMENTS = ("REQUIRED_BEFORE_REVIEW", "OPTIONAL_BOUNDED", "NONE")
 
 
 def canonical(value) -> bytes:
@@ -100,6 +102,42 @@ def _reason(category: str, disposition: str, rule: str, count: int) -> dict:
     return {"category": category, "disposition": disposition, "rule": rule, "count": count}
 
 
+def _classify_evidence(entry: dict, *, capability: str, target_job_id: str | None,
+                       requested_findings: set[str], requested_evidence: set[str],
+                       declared_evidence: dict[str, dict]) -> tuple[str, str]:
+    """Classify from encoded edges only; prose and job names are deliberately ignored."""
+    finding_ids = {x.get("finding_id") for x in (entry.get("findings") or [])}
+    if entry.get("evidence_id") in requested_evidence:
+        return "REQUIRED_RELEVANT", "EXPLICIT_EVIDENCE_ID"
+    if requested_findings & finding_ids:
+        return "REQUIRED_RELEVANT", "SELECTED_FINDING_ID"
+    if target_job_id and target_job_id in {
+            entry.get("review_of"), entry.get("predecessor"), entry.get("successor")}:
+        return "REQUIRED_RELEVANT", "EXPLICIT_TARGET_JOB_EDGE"
+    if entry.get("evidence_path") in declared_evidence:
+        return "REQUIRED_RELEVANT", "DECLARED_EVIDENCE_SOURCE"
+    entry_capability = entry.get("capability")
+    if entry_capability is not None and entry_capability != capability:
+        return "IRRELEVANT", "EXPLICIT_CAPABILITY_MISMATCH"
+    required_types = {spec.get("evidence_type", spec.get("kind"))
+                      for spec in declared_evidence.values() if spec.get("required") is True}
+    if entry_capability == capability and entry.get("evidence_type") in required_types:
+        return "REQUIRED_RELEVANT", "DECLARED_REQUIRED_CAPABILITY_EVIDENCE_TYPE"
+    return "BOUNDED_CANDIDATE", "NO_REQUIRED_STRUCTURAL_EDGE"
+
+
+def _expansion(*, evidence_ref=None, source_ref=None, reason: str,
+               requirement: str, quality: str | None = None,
+               authority_class: str = "evidence", origin: str = "JOB_CONTEXT",
+               suggested_scope: list[str] | None = None) -> dict:
+    return {"source_ref": source_ref, "evidence_ref": evidence_ref,
+            "reason": reason, "reason_code": reason,
+            "authority_class": authority_class, "quality": quality,
+            "requirement": requirement,
+            "required_before_package_first_execution": requirement == "REQUIRED_BEFORE_REVIEW",
+            "origin": origin, "suggested_scope": sorted(set(suggested_scope or []))}
+
+
 def build(root: str | Path, *, workspace: str, capability: str, job,
           manifest: dict, manifest_path: str, delta: dict, delta_path: str,
           evidence_index: dict, evidence_index_path: str, declaration: dict) -> tuple[dict, dict]:
@@ -168,37 +206,56 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
                                               "state": "CHANGED" if fact.get("path") in changed else "CURRENT"})
             if not matches:
                 unresolved.append({"code": "DECLARED_SOURCE_NOT_OBSERVED", "source_ref": declared})
+                if spec.get("required") is True:
+                    expansion.append(_expansion(source_ref=declared,
+                        reason="REQUIRED_DECLARED_SOURCE_NOT_OBSERVED",
+                        requirement="REQUIRED_BEFORE_REVIEW", authority_class="authoritative"))
         else:
             omitted_sources.append({"source_ref": declared or spec.get("glob"),
                                     "reason": "EXPLICITLY_UNRELATED_DEPENDENCY"})
 
     requested_findings = set(request["finding_ids"] + request["previous_finding_ids"])
     requested_evidence = set(request["evidence_ids"])
-    evidence_refs, found_findings = [], set()
+    evidence_refs, optional_candidates, omitted_evidence, found_findings = [], [], [], set()
+    declared_evidence = {spec["path"]: spec for spec in config.get("sources", [])
+                         if isinstance(spec, dict) and isinstance(spec.get("path"), str)
+                         and spec.get("kind") == "evidence"}
+    target_job_id = getattr(job, "job_id", None)
     for entry in stored_index.get("entries", []):
         findings = entry.get("findings") or []
         entry_findings = {x["finding_id"] for x in findings}
-        matched = bool(requested_findings & entry_findings or entry.get("evidence_id") in requested_evidence)
-        # With no explicit filter, canonical evidence is the bounded safe set.
-        include = matched or (not requested_findings and not requested_evidence)
-        if requested_findings and entry.get("quality") != "STRUCTURED":
-            include = True
-        if include:
-            evidence_refs.append({key: entry.get(key) for key in (
+        relevance, reason_code = _classify_evidence(
+            entry, capability=capability, target_job_id=target_job_id,
+            requested_findings=requested_findings, requested_evidence=requested_evidence,
+            declared_evidence=declared_evidence)
+        ref = {key: entry.get(key) for key in (
                 "evidence_id", "evidence_path", "manifest_sha256", "evidence_type", "job_id",
                 "quality", "job_status", "failure_class", "actor_execution_status",
-                "review_verdict", "findings", "trust", "trust_limitation")})
+                "review_verdict", "findings", "trust", "trust_limitation", "capability",
+                "review_of", "predecessor", "successor")}
+        ref.update({"relevance": relevance, "relevance_reason": reason_code})
+        if relevance == "REQUIRED_RELEVANT":
+            evidence_refs.append(ref)
             found_findings.update(requested_findings & entry_findings)
             if entry.get("quality") in ("PARTIAL", "UNSTRUCTURED"):
-                expansion.append({"source_ref": None, "evidence_ref": entry.get("evidence_id"),
-                                  "reason": "EVIDENCE_RELATIONSHIPS_NOT_FULLY_STRUCTURED",
-                                  "authority_class": "evidence",
-                                  "required_before_package_first_execution": True})
+                expansion.append(_expansion(evidence_ref=entry.get("evidence_id"),
+                    reason="REQUIRED_RELEVANT_EVIDENCE_INCOMPLETE",
+                    requirement="REQUIRED_BEFORE_REVIEW", quality=entry.get("quality"),
+                    suggested_scope=[entry["evidence_path"]] if entry.get("evidence_path") else []))
+        elif relevance == "BOUNDED_CANDIDATE":
+            optional_candidates.append(ref)
+            expansion.append(_expansion(evidence_ref=entry.get("evidence_id"),
+                reason="UNKNOWN_RELEVANCE_NO_REQUIRED_STRUCTURAL_EDGE",
+                requirement="OPTIONAL_BOUNDED", quality=entry.get("quality"),
+                suggested_scope=[entry["evidence_path"]] if entry.get("evidence_path") else []))
+        else:
+            omitted_evidence.append({"evidence_id": entry.get("evidence_id"),
+                                     "evidence_path": entry.get("evidence_path"),
+                                     "reason": reason_code})
     for finding in sorted(requested_findings - found_findings):
         unresolved.append({"code": "REQUESTED_FINDING_NOT_STRUCTURALLY_INDEXED", "finding_id": finding})
-        expansion.append({"source_ref": None, "evidence_ref": None,
-                          "reason": f"REQUESTED_FINDING_MISSING:{finding}", "authority_class": "evidence",
-                          "required_before_package_first_execution": True})
+        expansion.append(_expansion(reason=f"REQUESTED_FINDING_MISSING:{finding}",
+            requirement="REQUIRED_BEFORE_REVIEW"))
 
     delta_status = stored_delta.get("delta_status")
     if delta_status == "POTENTIAL_AUTHORITY_CHANGE":
@@ -223,7 +280,8 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
 
     status = ("UNVERIFIABLE" if unresolved and any(x["code"] in
               ("INPUT_UNVERIFIABLE", "DELTA_UNVERIFIABLE") for x in unresolved)
-              else "NEEDS_RECONCILIATION" if reconciliation or unresolved or expansion
+              else "NEEDS_RECONCILIATION" if reconciliation or unresolved or any(
+                  x["requirement"] == "REQUIRED_BEFORE_REVIEW" for x in expansion)
               else "READY_BOUNDED")
     selection_reasons = [
         _reason("authoritative_sources", "INCLUDED", "ALL_CAPABILITY_DECLARED_AUTHORITY", len(sources)),
@@ -246,6 +304,10 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
         "approved_semantics": approved_refs,
         "dependency_states": sorted(dependency_states, key=lambda x: (x["context_item"], x["source_ref"])),
         "evidence_refs": sorted(evidence_refs, key=lambda x: (x["evidence_id"], x["evidence_path"])),
+        "optional_evidence_candidates": sorted(optional_candidates,
+            key=lambda x: (x["evidence_id"], x["evidence_path"])),
+        "omitted_irrelevant_evidence": sorted(omitted_evidence,
+            key=lambda x: (x["evidence_id"], x["evidence_path"])),
         "requested_finding_ids": request["finding_ids"],
         "previous_finding_ids": request["previous_finding_ids"],
         "target_files": request["target_files"],
@@ -275,15 +337,26 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
         body["unresolved_items"].append({"code": "INVALID_SIZE_BUDGET"})
         body["selection_status"] = "UNVERIFIABLE"
     elif budget is not None and payload_bytes > budget:
-        body["expansion_requirements"].append({"source_ref": None, "evidence_ref": None,
-            "reason": "SIZE_BUDGET_CANNOT_TRUNCATE_REQUIRED_AUTHORITY", "authority_class": "authoritative",
-            "required_before_package_first_execution": True})
+        body["expansion_requirements"].append(_expansion(
+            reason="SIZE_BUDGET_CANNOT_TRUNCATE_REQUIRED_AUTHORITY",
+            requirement="REQUIRED_BEFORE_REVIEW", authority_class="authoritative"))
         if body["selection_status"] == "READY_BOUNDED":
             body["selection_status"] = "NEEDS_RECONCILIATION"
     body["size"] = {"source_ref_count": len(sources), "evidence_ref_count": len(evidence_refs),
                     "file_hash_count": len(body["included_hashes"]["sources"]) + len(body["included_hashes"]["evidence_files"]),
                     "estimated_textual_payload_bytes": payload_bytes,
-                    "configured_max_text_bytes": budget}
+                     "configured_max_text_bytes": budget}
+    required_expansions = [x for x in body["expansion_requirements"]
+                           if x["requirement"] == "REQUIRED_BEFORE_REVIEW"]
+    optional_expansions = [x for x in body["expansion_requirements"]
+                           if x["requirement"] == "OPTIONAL_BOUNDED"]
+    reason_counts = {}
+    for item in body["expansion_requirements"]:
+        reason_counts[item["reason_code"]] = reason_counts.get(item["reason_code"], 0) + 1
+    body["diagnostics"] = {"required_expansion_count": len(required_expansions),
+        "optional_candidate_count": len(optional_candidates),
+        "omitted_irrelevant_count": len(omitted_evidence),
+        "expansion_reason_code_counts": dict(sorted(reason_counts.items()))}
     package_hash = sha256(canonical(body))
     result = dict(body)
     result["package_sha256"] = package_hash
@@ -295,7 +368,11 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
               "evidence_index_sha256": result["evidence_index_sha256"],
               "delta_status": delta_status, "authority_ref_count": len(sources),
               "evidence_ref_count": len(evidence_refs),
-              "expansion_required_count": len(result["expansion_requirements"]),
+              "expansion_required_count": len(required_expansions),
+              "required_expansion_count": len(required_expansions),
+              "optional_candidate_count": len(optional_candidates),
+              "omitted_irrelevant_count": len(omitted_evidence),
+              "reason_code_counts": result["diagnostics"]["expansion_reason_code_counts"],
               "bytes": len(canonical(result))}
     return result, report
 

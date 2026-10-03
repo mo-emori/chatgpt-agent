@@ -128,9 +128,23 @@ class ReviewPackageTests(unittest.TestCase):
             sources=[{"path": "evidence/review.json", "kind": "review", "required": True}])
         payload, report = self.build(index=index)
         self.assertEqual(json.loads(payload["findings.json"])["findings"], [])
-        refs = json.loads(payload["evidence-refs.json"])["evidence_refs"]
-        self.assertIsNone(refs[0]["review_verdict"])
+        candidates = json.loads(payload["job-context.json"])["optional_evidence_candidates"]
+        self.assertIsNone(candidates[0]["review_verdict"])
         self.assertEqual(report["status"], "NEEDS_RECONCILIATION")
+
+    def test_optional_candidate_is_ready_and_not_duplicated(self):
+        entry = dict(self.index["entries"][0])
+        entry.update({"quality": "UNSTRUCTURED", "findings": None})
+        index = dict(self.index); index["entries"] = [entry]
+        job = self.job()
+        job.instruction_ref["context_request"]["finding_ids"] = []
+        payload, report = self.build(job=job, index=index)
+        plan = json.loads(payload["expansion-plan.json"])["requirements"]
+        self.assertEqual(len(plan), 1)
+        self.assertEqual(plan[0]["requirement"], "OPTIONAL_BOUNDED")
+        self.assertEqual(report["status"], "READY_PACKAGE")
+        self.assertEqual(report["expansion_required_count"], 0)
+        self.assertEqual(report["optional_candidate_count"], 1)
 
     def test_review_modes_boundary_and_full_marker(self):
         delta, _ = self.build(job=self.job("DELTA_REVIEW"))

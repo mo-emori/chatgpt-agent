@@ -116,11 +116,38 @@ class JobContextTests(unittest.TestCase):
                       "review_verdict": None})
         index = dict(self.index); index["entries"] = [entry]
         result, _ = self.build(job=self.job({"finding_ids": ["F-6"]}), index=index)
-        self.assertEqual(result["evidence_refs"][0]["review_verdict"], None)
-        self.assertEqual(result["evidence_refs"][0]["findings"], None)
+        self.assertEqual(result["optional_evidence_candidates"][0]["review_verdict"], None)
+        self.assertEqual(result["optional_evidence_candidates"][0]["findings"], None)
         self.assertEqual(result["selection_status"], "NEEDS_RECONCILIATION")
         self.assertIn("F-6", [x.get("finding_id") for x in result["unresolved_items"]])
         self.assertTrue(result["expansion_requirements"])
+
+    def test_unstructured_without_edge_is_optional_not_blocking(self):
+        entry = dict(self.index["entries"][0])
+        entry.update({"quality": "UNSTRUCTURED", "findings": None, "capability": "CAP"})
+        index = dict(self.index); index["entries"] = [entry]
+        result, report = self.build(index=index)
+        self.assertEqual(result["selection_status"], "READY_BOUNDED")
+        self.assertEqual(result["optional_evidence_candidates"][0]["relevance"], "BOUNDED_CANDIDATE")
+        self.assertEqual(report["required_expansion_count"], 0)
+        self.assertEqual(report["optional_candidate_count"], 1)
+
+    def test_unstructured_explicit_review_of_target_is_required(self):
+        entry = dict(self.index["entries"][0])
+        entry.update({"quality": "UNSTRUCTURED", "findings": None, "review_of": "JOB"})
+        index = dict(self.index); index["entries"] = [entry]
+        result, report = self.build(index=index)
+        self.assertEqual(result["evidence_refs"][0]["relevance"], "REQUIRED_RELEVANT")
+        self.assertEqual(result["selection_status"], "NEEDS_RECONCILIATION")
+        self.assertEqual(report["required_expansion_count"], 1)
+
+    def test_explicit_capability_mismatch_is_irrelevant(self):
+        entry = dict(self.index["entries"][0]); entry["capability"] = "OTHER"
+        index = dict(self.index); index["entries"] = [entry]
+        result, report = self.build(index=index)
+        self.assertEqual(result["omitted_irrelevant_evidence"][0]["reason"],
+                         "EXPLICIT_CAPABILITY_MISMATCH")
+        self.assertEqual(report["omitted_irrelevant_count"], 1)
 
     def test_boundaries_and_budget_never_truncate_authority(self):
         result, _ = self.build(job=self.job({"max_text_bytes": 0}))

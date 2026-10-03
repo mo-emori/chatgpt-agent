@@ -326,7 +326,8 @@ def _index_result(rel: str, raw: bytes, value: dict, kind: str) -> dict:
         "review_boundary": _nullable(boundary, "status"),
         "actor_execution_status": actor_status, "review_verdict": verdict,
         "findings": findings, "predecessor": value.get("predecessor"),
-        "successor": value.get("successor"), "review_of": value.get("review_of"),
+        "successor": value.get("successor"),
+        "review_of": value.get("review_of") or value.get("target_job_id"),
         "trust": ["WORKER_OBSERVED"],
         "source_files": [{"path": rel, "sha256": _sha(raw)}],
     })

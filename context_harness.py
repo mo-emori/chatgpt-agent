@@ -12,6 +12,7 @@ import subprocess
 from pathlib import Path, PurePosixPath
 
 from evidence_index import generate as generate_evidence_index
+from job_context import generate as generate_job_context
 
 
 SCHEMA_VERSION = 1
@@ -295,7 +296,8 @@ def load_trusted_baseline(cache_root: str | Path, workspace: str,
 
 
 def begin_shadow(root: str | Path, *, workspace: str, actor: str, mode: str,
-                 cache_root: str | Path, evidence_roots: list[dict] | None = None) -> dict | None:
+                 cache_root: str | Path, evidence_roots: list[dict] | None = None,
+                 job=None) -> dict | None:
     declaration, _, declaration_errors = load_declaration(root)
     if declaration is None:
         # Absence means not enabled.  A present but invalid declaration is visible.
@@ -313,9 +315,11 @@ def begin_shadow(root: str | Path, *, workspace: str, actor: str, mode: str,
     except Exception as exc:
         pre = None
         errors.append(f"PRE_OBSERVATION_FAILED: {exc}")
-    return {"capability": capability, "pre": pre, "baseline": baseline,
-            "errors": errors, "cache_root": str(cache_root), "workspace": workspace,
-            "evidence_roots": evidence_roots or [], "declaration": declaration}
+    session = {"capability": capability, "pre": pre, "baseline": baseline,
+               "errors": errors, "cache_root": str(cache_root), "workspace": workspace,
+               "evidence_roots": evidence_roots or [], "declaration": declaration}
+    session["job"] = job
+    return session
 
 
 def refresh_evidence_index(root: str | Path, session: dict | None) -> dict | None:
@@ -374,6 +378,35 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str) -> dic
         temp.write_bytes(_canonical(current))
         os.replace(temp, cache)
         evidence_index = refresh_evidence_index(root, session)
+        job_context = None
+        if evidence_index and evidence_index.get("status") == "READY":
+            index_rel = _safe_relative(
+                f"{session['declaration'].get('generated_root', 'validation/context')}/"
+                f"{capability}/evidence-index.json")
+            index_value = json.loads((root / index_rel).read_text("utf-8"))
+            job = session.get("job")
+            if job is not None:
+                try:
+                    job_context = generate_job_context(
+                        root, workspace=session["workspace"], capability=capability, job=job,
+                        manifest=current, manifest_path=manifest_path, delta=report,
+                        delta_path=report_path, evidence_index=index_value,
+                        evidence_index_path=index_rel, declaration=session["declaration"],
+                    )
+                except Exception as exc:
+                    # Comparison diagnostics are deliberately outside the job
+                    # qualification domain during Phase 2B.
+                    job_context = {
+                        "mode": "COMPARISON_ONLY", "status": "UNVERIFIABLE",
+                        "schema_version": 1, "sha256": None,
+                        "source_context_sha256": current["lifecycle"]["manifest_sha256"],
+                        "evidence_index_sha256": evidence_index.get("index_sha256"),
+                        "delta_status": report["delta_status"], "authority_ref_count": 0,
+                        "evidence_ref_count": 0, "expansion_required_count": 0,
+                        "bytes": 0, "report_path": None,
+                        "diagnostics": [{"code": "JOB_CONTEXT_BUILD_FAILED",
+                                         "detail": str(exc)[:1000]}],
+                    }
         return {"mode": "SHADOW", "capability": capability,
                 "manifest_sha256": current["lifecycle"]["manifest_sha256"],
                 "previous_manifest_sha256": current["lifecycle"]["previous_context_hash"],
@@ -381,7 +414,7 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str) -> dic
                 "would_block": report["would_block"], "manifest_path": manifest_path,
                 "report_path": report_path, "changed_sources": report["changed_sources"],
                 "unverifiable_reasons": report["unverifiable_reasons"],
-                "evidence_index": evidence_index}
+                "evidence_index": evidence_index, "job_context": job_context}
     except Exception as exc:
         return {"mode": "SHADOW", "capability": capability,
                 "manifest_sha256": None, "previous_manifest_sha256": None,

@@ -675,6 +675,8 @@ def build_result(
         response["context"] = context
         if context.get("evidence_index") is not None:
             response["evidence_index"] = context["evidence_index"]
+        if context.get("job_context") is not None:
+            response["job_context"] = context["job_context"]
     if artifact_result is not None:
         (
             summary,
@@ -803,6 +805,7 @@ def execute_job(job, say):
         workdir, workspace=job.workspace, actor=job.actor, mode=job.mode,
         cache_root=Path(__file__).parent / "logs",
         evidence_roots=_evidence_roots(workspace),
+        job=job,
     )
 
     try:
@@ -988,6 +991,7 @@ def execute_claude_review(job, say):
             canonical, workspace=job.workspace, actor=job.actor, mode=job.mode,
             cache_root=Path(__file__).parent / "logs",
             evidence_roots=_evidence_roots(workspace),
+            job=job,
         )
         review = create_review_workspace(canonical, job.job_id)
 

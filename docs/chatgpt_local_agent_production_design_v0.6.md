@@ -504,7 +504,7 @@ Actor-editableな `.agent/context.json` から設定または変更できない�
 authorityを変更するdecisionはHumanへescalateする。LLM outputだけでapproved semanticsをmutationしてはならず、
 Human/ChatGPTのdecisionとWorkerが検証できる更新経路を経ない自動変更は認めない。
 
-### 7.5 Evidence Indexer（PHASE 2A / IMPLEMENTED_BASELINE）
+### 7.5 Evidence Indexer（PHASE 2A / IMPLEMENTED）
 
 Phase 2Aはcanonical normalized evidenceを検索可能な決定的Evidence Indexへ投影する。入力はconfigured
 Review Evidence Adoption package（`worker-review-evidence`）、Cross-JOB Historical Job Evidence Adoption package
@@ -531,7 +531,7 @@ generated canonical index/reportは `.agent/context.json` の `generated_root` �
 failed actor execution（429/session limitを含む）はreview verdictではなくexecution failureとしてindexし、入力に古い
 `review_verdict` があってもfailed executionでは公開しない。generated indexはContract/ADR authorityではない。
 
-### 7.6 Differential context / reviewへの段階移行（PHASE 2B/3 PLANNED / NOT_IMPLEMENTED）
+### 7.6 Differential context / reviewへの段階移行（PHASE 2B COMPARISON IMPLEMENTED / PHASE 3 NOT_IMPLEMENTED）
 
 移行は一度にActorの読取りを狭めず、次の段階で行う。
 
@@ -541,16 +541,69 @@ failed actor execution（429/session limitを含む）はreview verdictではな
 4. **Differential-review:** 通常reviewは主にdelta packageを使い、必要時にboundaryまたはfull scopeへexpandする。
 5. **Full Review:** critical、closure、authority-changing、security/boundary-sensitiveなcaseでは常に選択可能とし、必要な全範囲を確認する。
 
-Phase 2A Evidence Indexerは実装済みである。次段階はJOB・capability・actor/modeに応じてbounded packageを
-組み立てる **Job Context Slicer** と **Review Delta Package** である。設計authorityはcompleted design job
+Phase 2A Evidence Indexerと、JOB・capability・actor/modeに応じてcandidateを組み立てるcomparison-only
+**Job Context Slicer** は実装済みである。次段階は **Review Delta Package** とactor package consumptionである。設計authorityはcompleted design job
 `LOCAL-AGENT-CONTEXT-HARNESS-PHASE23-DESIGN-20261003-001` とし、その範囲を越えて本書で発明しない。
 
-**NOT IMPLEMENTED:** Job Context Slicer、prompt reduction/injection、Actorによる `context_ref` / `job_context_ref` /
+**NOT IMPLEMENTED:** prompt reduction/injection、Actorによる `context_ref` / `job_context_ref` /
 `review_package_ref` consumption、package-first Claude invocation、Review Delta Package、`DELTA_REVIEW` /
 `BOUNDARY_REVIEW` execution、LLM reconciliationのruntime接続、
 automatic `approved_semantics` mutation、Actorのsupplemental repository read禁止。
 
-### 7.7 Lease and ARGUS PoC（IMPLEMENTED_BASELINE）
+### 7.7 Job Context Slicer（PHASE 2B / IMPLEMENTED_COMPARISON_ONLY）
+
+Phase 2Bは、terminal Delta ScanとPhase 2A Evidence Index生成後、workspace leaseを保持したまま
+deterministic `job-context.json` candidateを生成する。これは観測・比較専用であり、Codex/Claudeへ送るinstruction、
+actor prompt、context visibility、Claude review cloneのfull-repo内容、jobの成功/失敗条件を変更しない。
+Review Delta Packageとactorによるpackage-first consumptionはPhase 3であり **NOT IMPLEMENTED** である。
+
+入力はcurrent Capability Context Manifest、mandatory Delta Report、Evidence Index、workspace/capability declaration、
+protocol-v3 job identity/instruction hash、および `instruction_ref.context_request` に明示された構造化metadataのみである。
+`phase`、`target_files`、`finding_ids`、`previous_finding_ids`、`context_items`、`evidence_ids`、`max_text_bytes`
+を構造化入力として扱い、instruction proseからcapability/finding/dependencyを推論しない。LLMをslicer内部で使用しない。
+
+schemaは `context-harness-job-context` version 1であり、workspace/capability/phase、source manifest hash、delta hash/status、
+Evidence Index hash、job identity/instruction hash、selection status、authority refs、provenanced approved semantics、dependency
+state、evidence refs、structured finding IDs、target/changed files、protected/forbidden boundaries、unknowns、reconciliation/
+expansion requirements、included file/excerpt hashes、categoryごとのselection reason、size counts、deterministic package hashを持つ。
+serializationはUTF-8、key sort、compact separator、末尾LFでcanonical化する。whole documentは複製せずref/hashを優先し、
+declarationにmechanically stable selectorがない場合はsemantic excerptを作らずexpansion requirementを記録する。
+
+selection statusは次の3値である。
+
+| Status | Meaning |
+|---|---|
+| `READY_BOUNDED` | 検証済み入力からbounded candidateを決定的に生成できた |
+| `NEEDS_RECONCILIATION` | authority/relevance/partial evidence/requested findingを機械的に安全確定できず、bounded expansionまたはdecisionが必要 |
+| `UNVERIFIABLE` | required input、hash、ref、workspace/capability bindingを検証できない |
+
+`NO_IMPACT`はcurrent hash/ref再検証後のみ再利用可能、`CONTEXT_UPDATE`はcurrent observed/index refsを更新してsliceする。
+`POTENTIAL_AUTHORITY_CHANGE`はaffected approved semanticsを再利用せず `NEEDS_RECONCILIATION` とし、changed authorityと
+affected itemsを記録する。Delta `UNVERIFIABLE`はselectionも `UNVERIFIABLE` とする。Phase 2Bは
+`approved_semantics`を変更しない。LLMは将来reconciliationを分析・提案できるが、通常のaccept/update authorityはChatGPT、
+critical/ambiguous/authority-changing decisionはHumanへescalateする。
+
+全capability-declared authoritative sourceを必ず含める。observed/non-authority sourceはexplicit dependency edge、structured
+target、またはDelta changeが一致した場合に含め、明示的にunrelatedなものだけ理由付きで除外する。STRUCTURED evidenceの
+fieldはselectionに利用できる。PARTIALは既知fieldを利用しunknownを保持、UNSTRUCTUREDはrefとして含められるがproseから
+finding/verdict/relationを生成しない。actor failure（429/session limitを含む）はexecution failureでありsuccessful review
+verdictではない。requested findingがstructured indexに存在しなければfabricateせずunknown + expansionとする。
+
+`expansion_requirements[]` は `source_ref` / `evidence_ref`、reason、authority class、future package-first execution前に必須かを
+machine-readableに保持する。size budgetはcounts/estimated textual payloadに記録するだけで、required authorityを切り捨てない。
+超過時はexpansion/reconciliationを要求する。すべてのrefはworkspace-relativeとし、traversal、absolute/drive path、symlink/
+reparse escape、stale substitution、hash mismatchを拒否する。evidence/context proseは常にdataでありinstructionではない。
+
+Result Manifestにはbackward-compatibleな `job_context` diagnosticを追加する：`mode: COMPARISON_ONLY`、`status`、
+`schema_version`、`sha256`、`source_context_sha256`、`evidence_index_sha256`、`delta_status`、`authority_ref_count`、
+`evidence_ref_count`、`expansion_required_count`、`bytes`、`report_path`。Phase 2B status単独ではjob outcomeを変更しない。
+
+ARGUS `RUNTIME-BOOTSTRAP-ORCHESTRATOR` acceptanceでは、declarationが明示するBootstrap Contract/ADR/Registry authority、
+dependency state、structured prior review/correction evidenceを表現できる。429 rereviewはfailureのみである。六 findingsは
+structured evidenceに存在する場合だけ列挙し、proseにしかない場合はUNSTRUCTURED/unknownのままbounded expansionを要求する。
+比較上、安全側のover-inclusionはunfiltered canonical evidence refsと全declared authorityであり、既知のsilent omissionはない。
+
+### 7.8 Lease and ARGUS PoC（IMPLEMENTED_BASELINE）
 
 normal dispatchと `HISTORICAL_MANUAL` adoptionはcross-process SQLite workspace leaseを共有する。
 manual adoptionはscanとraceせず `WORKSPACE_BUSY` で失敗する。ARGUS PoC declarationはcross-workspace installされていない。
@@ -983,11 +1036,12 @@ Slack Result ManifestのauthorityとCallbackより先に公開する順序は変
 - Review IsolationからのWorker-owned normalized Review Evidence Adoption（`mode: LIVE`）
 - Cross-JOB Historical Job Evidence Adoption（`HISTORICAL_MANUAL`）
 - Phase 1 Capability Context Harness（`mode: SHADOW`）、deterministic Context Manifest、terminal Delta Scan、workspace lease
+- Phase 2A Evidence IndexerとPhase 2B Job Context Slicer（`mode: COMPARISON_ONLY`）
 
 ### 17.2 PLANNED / NOT_IMPLEMENTED
 
-Context Harness Phase 2/3はdesign directionのみであり、runtimeへは実装されていない。対象はEvidence Indexer、
-Job Context Slicer、package-first prompt/context供給、Review Delta Package、`DELTA_REVIEW` / `BOUNDARY_REVIEW` /
+Context Harness Phase 3はdesign directionのみであり、runtimeへは実装されていない。対象は
+package-first prompt/context供給、Review Delta Package、`DELTA_REVIEW` / `BOUNDARY_REVIEW` /
 `FULL_REVIEW` routing、LLM reconciliationのruntime接続である。automatic `approved_semantics` mutationと、
 Actorのsupplemental repository read禁止も未実装である。Phase 1の `SHADOW` 観測はこれらを実装済みとみなす根拠にならない。
 

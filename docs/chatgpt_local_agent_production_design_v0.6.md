@@ -7,79 +7,9 @@ Status: IMPLEMENTED_BASELINE
 Supersedes: ChatGPT Local Agent 本番設計 v0.5
 ```
 
-## Actor Result Artifact Contract (IMPLEMENTED_BASELINE)
+## 1. 文書の目的・適用範囲・用語
 
-`AGENT_RESULT.artifacts` is exclusively the list of files intended for
-external delivery. Repo-canonical outputs such as `.agent` declarations,
-documentation, validation evidence, context, and baselines must not be listed
-there. Canonical changes are represented by Worker-observed
-`git.changed_paths` and the applicable canonical evidence mechanism.
-
-The Worker classifies each actor-reported candidate as
-`EXTERNAL_DELIVERABLE`, `REPO_CANONICAL_REFERENCE`, or `INVALID`. Normal
-artifact-root validation remains authoritative for external delivery. Only a
-candidate rejected specifically because it is outside configured external
-artifact roots is eligible for canonical-reference normalization. It must then
-pass the same workspace-relative safety and file-existence validation and its
-normalized path must occur in the current Worker-observed `git.changed_paths`
-and its status/content fingerprint must differ between the job's before and
-after snapshots.
-Such a reference is not uploaded, does not make `artifact_status` fail, and is
-recorded additively in Result Manifest `canonical_references` with its path,
-disposition, and reason.
-
-An arbitrary unchanged repository file, including an unchanged file that was
-already dirty before the job, is not sufficient proof. Missing,
-absolute, drive-qualified, UNC, traversal/out-of-workspace, unsafe, or otherwise
-disallowed candidates remain in `rejected_artifacts`; genuine external
-deliverables continue to require a configured `artifact_roots` match and any
-delivery failure remains fail-closed. This runtime normalization supplements,
-rather than relies only upon, actor prompt guidance.
-
-## Phase 1 Capability Context Harness (SHADOW / IMPLEMENTED_BASELINE)
-
-Phase 1 adds observation and provenance only. A workspace may opt in with
-`.agent/context.json` (`schema_version: 1`, `mode: SHADOW`). The declaration
-maps a capability to repo-relative sources, source kinds, authority class,
-explicit context-item dependency edges, actor/mode selectors, and a generated
-evidence root. JSON was selected to avoid a YAML dependency and is hashed as
-raw bytes. `approved_semantics` is forbidden in this actor-editable declaration.
-
-The deterministic builder records HEAD, declaration raw SHA-256, declared file
-raw SHA-256, type/existence, relevant per-path tracked/untracked status,
-configured dependency edges, and optional normalized-text hashes. Raw bytes are
-authoritative. A matching normalized-text hash only labels a raw-byte change as
-`EOL_ONLY`; it never changes the result to `NO_IMPACT`. Unrelated dirty files are
-outside the observation only when no configured edge selects them.
-
-The canonical manifest is UTF-8 JSON with sorted keys, compact separators, and
-an LF suffix. Its content hash covers `observed` and the Phase-1 empty
-`approved_semantics`; timestamps and `previous_context_hash` are excluded so an
-identical input has an identical hash. Lifecycle metadata carries context ID,
-schema/hash, prior hash, HEAD, authoritative hashes, and builder provenance.
-
-The mandatory terminal scan runs after actor execution and evidence adoption,
-while the SQLite workspace claim remains held, and before `mark_completed`.
-It deterministically reports `NO_IMPACT`, `CONTEXT_UPDATE`,
-`POTENTIAL_AUTHORITY_CHANGE`, or fail-closed-for-future-enforcement
-`UNVERIFIABLE`. Phase 1 never changes job status or actor prompt. Result
-Manifests add an optional `context` object containing mode, capability, current
-and previous hashes, delta status, `would_block`, evidence paths, changed
-sources, and unverifiable reasons.
-
-Normal dispatch and `HISTORICAL_MANUAL` adoption now share a cross-process
-SQLite workspace lease. Manual adoption fails with `WORKSPACE_BUSY` instead of
-racing a scan. The ARGUS PoC declaration was not installed cross-workspace; the
-reviewed exact candidate is
-`docs/argus_runtime_bootstrap_context_phase1.json` and should be copied to
-ARGUS `.agent/context.json` by an authorized ARGUS job.
-
-NOT IMPLEMENTED: Job Context Slicer, prompt reduction/injection, Evidence
-Indexer beyond declared file references, Review Delta Package, DELTA/BOUNDARY/
-FULL routing, LLM reconciliation, automatic approved-semantic mutation, or a
-ban on actor supplemental repository reads.
-
-## 1. 目的
+### 1.1 目的と適用範囲
 
 通常のChatGPTをControl Planeとして利用し、ローカルPC上のCodex / Claude
 Codeを非同期実行する。
@@ -88,6 +18,41 @@ Codeを非同期実行する。
 
 > 事前登録されたWorkspaceに対して、許可されたSender / Channel / Actor /
 > ModeのJOBだけを、状態管理されたLocal Runnerが実行する。
+
+本書は、実装済みの本番baselineを構造とlifecycleに沿って記述する。明示的に
+`PLANNED / NOT_IMPLEMENTED` と記した項目は設計方向であり、現在のruntime behavior、
+security boundary、failure semanticsを変更しない。
+
+### 1.2 用語
+
+| 用語 | 定義 |
+|---|---|
+| Control Plane | Humanとの対話、Instruction登録、JOB生成、結果解釈、後続判断を担うChatGPT側の役割。 |
+| Worker | 認可、snapshot、queue、排他、Actor起動、Evidence、Result deliveryを所有するPython Local Agent Worker。 |
+| Actor | Workerから起動されるCodexまたはClaude Code。 |
+| canonical workspace | Source of Truthである登録済みLocal Repo / Git workspace。 |
+| Job Evidence | JOB単位でWorkerが保持するlocal execution evidence。 |
+| Review Evidence | isolated reviewの実行・境界検証から正規化され、条件を満たす場合にcanonical repoへ採用されるevidence。 |
+| Context Manifest | capabilityに必要なsourceとdependencyを宣言し、観測結果を決定的に表すmanifest。 |
+| `SHADOW` | Context Harnessがcontextをbuild/index/scanして差分を観測するが、Actor prompt、読取り範囲、JOB成否を変更しない観測モード。Phase 1で実装済み。 |
+| `LIVE` | 検証済みevidence packageをcanonical repoへ実際に採用する動作モード。現在はReview Evidence Adoptionで使用する名称であり、Context Harnessのpackage-first実行を意味しない。 |
+| Full Review | critical、closure、authorityまたはboundary-sensitiveな場合に、deltaへ限定せず必要な全範囲を確認するreview。現時点の通常reviewもfull-repo inputを用いる。 |
+
+`SHADOW` と `LIVE` は相互に切り替わる全システム共通stateではない。前者はContext Harness Phase 1の
+non-enforcing observation、後者はReview Evidence Adoptionの実採用を表す各subsystem固有のmodeである。
+
+## 2. 設計原則
+
+- ChatGPTはControl Plane、Notionはv3 Instruction source / Control / Registry、SlackはCommand / Event Busとする。
+- Python Workerは状態管理されたLocal Execution Bridge / Runnerであり、Codex / Claude Codeを境界の異なるActorとして扱う。
+- Local Repo / GitをSource of Truthとし、Google Driveは条件付きArtifact Transport / Store、Browser Callbackはwake-up notificationとする。
+- 認可、workspace containment、actor isolation、evidence provenanceをWorkerが所有し、Actor自己申告だけをauthorityにしない。
+- actor、review boundary、artifact delivery、evidence adoption、callback、cleanupのfailure domainを分離する。
+- Fail Closed、idempotency、same-workspace serialization、Human control boundaryを維持し、自動Actor chainや自動修正ループを行わない。
+
+## 3. システム全体構成
+
+### 3.1 Component topology
 
 ```text
 Human ↔ ChatGPT
@@ -115,7 +80,7 @@ Human ↔ ChatGPT
                          ChatGPT
 ```
 
-## 2. 責務
+### 3.2 Component responsibilities
 
 | Component | Role |
 |---|---|
@@ -131,7 +96,7 @@ Human ↔ ChatGPT
 
 Inbound HTTPは公開しない。Slack Socket Modeを利用する。
 
-## 2.1 Local Agent Runtime Diagnostics / Recovery（IMPLEMENTED_BASELINE）
+### 3.3 Runtime contract summary（IMPLEMENTED_BASELINE）
 
 運用原則は `Fail -> Diagnose -> Scope -> Fix -> Restart -> Smoke -> Retry` とする。Actor の loud failure は terminal Result の raw `error_summary` を authority として反応的に扱い、強く識別できるものだけを best-effort 分類する。曖昧な失敗は `UNKNOWN_RUNTIME_FAILURE` のまま残す。
 
@@ -152,7 +117,7 @@ python agent_worker.py --check claude
 
 無引数の `--check` と `--check all` は Codex、Claude の順に両方を診断し、`--check codex` / `--check claude` は指定Actorだけを診断する。出力は CLI path/version、configured default model、sandbox config/invariant、minimal inference PASS/FAIL、effective model（authoritativeに観測できる場合だけ）、impact scope を含む。check は manual/reactive、read-only/nonpersistentであり、disposable temp directoryで最小推論を行い、自動 compatibility gate、自動 startup probe、自動 repairには使用しない。ACL before/after、workspace-write mutation probe、Claude review-isolation canary、browser send E2E は将来の optional `--extended` の対象であり、本 baseline には含めない。
 
-## 3. Slack Authorization
+### 3.4 Slack ingress authorization
 
 WorkerはChannel IDとSender IDの両方をallowlistで検証する。
 
@@ -189,9 +154,9 @@ Job State rowを作成せず、JOB parser / dispatchには入らない。未認�
 通常のnon-JOB textも従来どおりignoreする。目的はChatGPT → Slack → Worker → Slackの
 軽量なliveness / preflightであり、Notion / Actors / Drive / Browserのdeep health checkではない。
 
-## 4. JOB Protocol
+## 4. Job Protocol / Job Lifecycle
 
-### 4.1 Standard: Protocol v3
+### 4.1 Standard: Protocol v3（IMPLEMENTED_BASELINE）
 
 v0.6の標準JOB Protocolは `protocol_version=3` とする。
 
@@ -235,7 +200,7 @@ resolved instruction UTF-8 bytes
 authoritative identityは `page_id` 単独ではなく、受理時に解決したinstruction bytesと
 Worker-generated SHA-256である。同一bytesをSHA、永続snapshot、Actor stdinの起点とする。
 
-### 4.2 Compatibility: Protocol v1 / v2
+### 4.2 Compatibility: Protocol v1 / v2（IMPLEMENTED_BASELINE）
 
 v1 / v2は既存producerと保存済みJOBのためのcompatibility protocolとして維持する。
 新規JOBはv3を使用する。
@@ -245,7 +210,7 @@ v1 / v2は既存producerと保存済みJOBのためのcompatibility protocolと�
 - v2はrequest `prompt_sha256` を受け付けず、Workerがdecoded bytesから生成する。
 - v1 / v2のinvalid inputは従来どおりFail Closedとする。
 
-## 5. Notion Instruction Resolver / Acceptance Snapshot
+### 4.3 Notion Instruction Resolver / Acceptance Snapshot（IMPLEMENTED_BASELINE）
 
 v3のInstruction sourceはNotion page内のcode block **ちょうど1個** とする。
 WorkerのNotion integrationはread-onlyであり、Instruction pageをREADできるが、Notionを更新してはならない。
@@ -278,7 +243,32 @@ v3はJOB acceptance時にNotionをresolveし、以下をSQLiteへ永続化して
 - v3 persisted queueでsnapshot、SHA、`instruction_ref` が欠落・不正、またはSHA不一致なら
   `FAILED / INCOMPLETE_QUEUED_STATE` としてFail Closedにし、Notionから再構築しない。
 
-## 6. Workspace Registry
+### 4.4 Slack Message Parse and pre-dispatch rejection
+
+ChatGPT Slack Pluginは本文末尾にattributionを付加し得るため、先頭JSON objectだけをdecodeする。
+Markdown code fenceもtransport表現として除去する。
+
+```python
+decoder = json.JSONDecoder()
+job, end = decoder.raw_decode(text)
+```
+
+Parse前にChannel / Sender authorizationを行う。v3 parserはPrompt本文やrequest hashを許容せず、
+`instruction_ref.type == "notion_page"` と `page_id` を検証する。
+認可後、requestがjob_id / actor / workspaceとtrustworthyな `chatgpt_browser` callback destinationを安全に確立できるまで
+parseされた後のterminal validation failureは、shared rejection pathでSlack failure Resultを公開してから
+`LOCAL_AGENT_JOB_FAILED` を送る。これはvalidation成功またはJOB acceptanceを意味せず、Actorを起動しない。
+unauthorized、callback destinationを安全に確立できないmalformed / unparseable request、invalid / untrusted callback metadataは
+Fail Closedかつno-callbackとする。previous / global conversation URLを推定または再利用しない。
+
+PINGはJSON decodeより前の、認可済みplaintext control messageの完全一致として扱う。
+ChatGPT Slack transportが付加する既知のattribution付き形式、例えば
+`LOCAL-AGENT PING *使用して送信されました* <@...>` は受理する。ただし、
+`LOCAL-AGENT PING SOMETHING` のような任意のlookalikeはPINGとして受理しない。
+
+## 5. Actor Execution
+
+### 5.1 Workspace Registry and launch root
 
 Workspace / Browser等のnon-secret installation固有情報は `config.json` に外出しする。
 
@@ -309,7 +299,7 @@ Workspace / Browser等のnon-secret installation固有情報は `config.json` �
 `.env` / environment variables等の既存secret管理を維持する。Actorの `cwd` は必ずRegistryのpathへ固定する。
 `sandbox` のみ `--skip-git-repo-check` を許可し、`git_required=True` のWorkspaceはActor起動前にgit repositoryであることを確認する。
 
-## 7. Actor / Mode Policy
+### 5.2 Actor / Mode Policy
 
 ```python
 ALLOWED_ACTOR_MODES = {
@@ -327,10 +317,13 @@ trustworthyなcallback destinationを確立できるところまでparseされ�
 
 ```text
 claude -p <prompt>
---permission-mode dontAsk
---permission-prompts none
---allowedTools Read,Glob,Grep
+--restricted --tools Read,Glob,Grep,Bash
+--permission-mode dontAsk --permission-prompts none
+--safe-mode --strict-mcp-config --no-session-persistence
 ```
+
+`Bash` はWorker-managed settingsで明示許可するreview capabilityであり、security boundaryではない。
+完全なlauncher contractと制約は13.3で定義する。Edit、Write、PowerShellは公開しない。
 
 CodexはWorkspace Registryに応じて実行する。
 
@@ -341,7 +334,7 @@ git workspace: codex exec -c windows.sandbox="mxc" --sandbox workspace-write -
 
 Codex implementationとClaude independent reviewの境界を維持し、CodexからClaude Codeを直接起動させない。
 
-### 7.1 Windows Codex sandbox backend decision
+### 5.3 Codex: Windows sandbox backend decision
 
 Windows上の本Local Agent環境では、Codex設定のsandbox backendを次のとおり固定する。
 
@@ -356,11 +349,11 @@ Local Agentの実行contractは `codex exec -c windows.sandbox="mxc" --sandbox w
 
 これらのローカル観測と後述のcontrolled A/Bは、同世代Windows Codex CLIの`elevated` / `workspace-write`周辺で知られているACL mutation defectと整合し、backendが原因であることを強く支持する。ただし、観測範囲を超えてCLI全体または全Windows環境へ一般化しない。
 
-### 7.2 Workspace validation and filesystem integrity scope
+### 5.4 Codex: workspace validation and filesystem integrity scope
 
 本incidentのprimary remediationはWindows sandbox backendをMXCに固定することである。広範なFilesystem Preflight frameworkはprimary remediationとして要求せず、Planner / Operation-Preflight architectureをv0.6へ導入しない。軽量なworkspace integrity checkは、必要性を別途評価したうえで将来追加してよい。
 
-## 8. CLI Version Policy
+### 5.5 Codex / Claude Code CLI Version Policy
 
 確認済みCLI versionを設定に保持し、Worker起動時に完全一致で照合する。
 
@@ -383,30 +376,9 @@ Version不一致時は該当ActorをUnavailableとする。WindowsでCodex CLI�
 
 regressionがpassした後にのみ`EXPECTED_CLI`を更新する。現在の`codex-cli 0.157.1`を普遍的に安全とみなしてはならない。本環境で確認された安全性は、テスト済みのMXC backend configurationと`workspace-write` execution contractの組合せに依存する。
 
-## 9. Slack Message Parse
+## 6. Workspace / FIFO / Lock / State Store
 
-ChatGPT Slack Pluginは本文末尾にattributionを付加し得るため、先頭JSON objectだけをdecodeする。
-Markdown code fenceもtransport表現として除去する。
-
-```python
-decoder = json.JSONDecoder()
-job, end = decoder.raw_decode(text)
-```
-
-Parse前にChannel / Sender authorizationを行う。v3 parserはPrompt本文やrequest hashを許容せず、
-`instruction_ref.type == "notion_page"` と `page_id` を検証する。
-認可後、requestがjob_id / actor / workspaceとtrustworthyな `chatgpt_browser` callback destinationを安全に確立できるまで
-parseされた後のterminal validation failureは、shared rejection pathでSlack failure Resultを公開してから
-`LOCAL_AGENT_JOB_FAILED` を送る。これはvalidation成功またはJOB acceptanceを意味せず、Actorを起動しない。
-unauthorized、callback destinationを安全に確立できないmalformed / unparseable request、invalid / untrusted callback metadataは
-Fail Closedかつno-callbackとする。previous / global conversation URLを推定または再利用しない。
-
-PINGはJSON decodeより前の、認可済みplaintext control messageの完全一致として扱う。
-ChatGPT Slack transportが付加する既知のattribution付き形式、例えば
-`LOCAL-AGENT PING *使用して送信されました* <@...>` は受理する。ただし、
-`LOCAL-AGENT PING SOMETHING` のような任意のlookalikeはPINGとして受理しない。
-
-## 10. Job State Store / State Machine
+### 6.1 Job State Store / State Machine
 
 SQLiteをJob State Storeとして使用する。
 
@@ -445,7 +417,7 @@ RECEIVED → VALIDATED → QUEUED → DISPATCHING → RUNNING
 新規JOBとpersistent `QUEUED` JOBは、どちらも同一のatomic dispatch pathを通る。
 `job_id` をidempotency keyとし、重複JOBを再実行しない。
 
-## 11. Heartbeat / Crash Recovery
+### 6.2 Heartbeat / Crash Recovery
 
 RUNNING中はWorkerが60秒ごとに `heartbeat_at` を更新する。HeartbeatだけでActorの生死を断定せず、
 PID / host / process stateと組み合わせる。
@@ -461,7 +433,7 @@ RUNNING
 同じRUNNING JOBを無条件に自動再実行しない。判定不能はHumanへ戻す。
 RUNNING recoveryはqueued dispatchより先に完了しなければならない。
 
-## 12. Workspace FIFO / Persistent Queue Recovery
+### 6.3 Workspace FIFO / Persistent Queue Recovery
 
 同一Workspaceに複数Actorを同時実行しない。Lock単位はActorではなくWorkspaceであり、異なるWorkspaceは並行実行可能である。
 同一Workspaceは `queued_at` 昇順のFIFOとする。
@@ -484,7 +456,81 @@ RUNNING recovery完了前にqueued JOBをdispatchしない。起動時はWorkspa
 persisted v3 queued JOBは保存済みInstruction snapshotを実行し、現在のNotion contentsを参照しない。
 不完全なlegacy v3 queued stateはNotionから再構築せずFail Closedにする。
 
-## 13. Result Manifest
+## 7. Context Management
+
+### 7.1 Current / legacy behavior
+
+現在のActorは、taskに関係するrepo、docs、evidenceを広く調査できる。Context Harness Phase 1は
+この読取り範囲を制限せず、Actor promptの削減やpackage注入も行わない。このbaselineを変更せずに、
+将来のcontext omissionを測定できる観測基盤を先に導入している。
+
+### 7.2 Context Manifest and Phase 1 observation（SHADOW / IMPLEMENTED_BASELINE）
+
+workspaceは `.agent/context.json`（`schema_version: 1`, `mode: SHADOW`）でopt inできる。
+declarationはcapabilityをrepo-relative source、source kind、authority class、明示的なcontext-item dependency edge、
+actor/mode selector、generated evidence rootへ対応付ける。YAML dependencyを避けるためJSONを採用し、raw bytesをhashする。
+Actorが編集可能なdeclarationに `approved_semantics` を含めることは禁止する。
+
+deterministic builderはHEAD、declaration raw SHA-256、declared file raw SHA-256、type/existence、
+関係pathごとのtracked/untracked status、configured dependency edge、optional normalized-text hashを記録する。
+raw bytesがauthorityである。normalized-text hashが一致してもraw-byte changeは `EOL_ONLY` とlabelするだけで、
+`NO_IMPACT` へ変更しない。関連しないdirty fileを観測外にできるのは、configured edgeが選択しない場合だけである。
+
+canonical manifestはUTF-8 JSON、sorted keys、compact separators、LF suffixで生成する。content hashは
+`observed` とPhase 1では空の `approved_semantics` を対象とし、同じinputから同じhashを得るためtimestampと
+`previous_context_hash` を除外する。lifecycle metadataはcontext ID、schema/hash、prior hash、HEAD、
+authoritative hash、builder provenanceを保持する。
+
+mandatory terminal scanはactor executionとevidence adoptionの後、SQLite workspace claimを保持したまま、
+`mark_completed` の前に実行する。Result Manifestのoptional `context` objectはmode、capability、current/previous hash、
+delta status、`would_block`、evidence path、changed source、unverifiable reasonを持つ。Phase 1はJOB statusもActor promptも変更しない。
+
+### 7.3 Delta Scan state definitions（IMPLEMENTED_BASELINE）
+
+| State | 意味 |
+|---|---|
+| `NO_IMPACT` | 宣言されたcontextのauthoritative raw inputに影響する差分がない。 |
+| `CONTEXT_UPDATE` | context inputに追随可能な変更があり、再buildされたmanifestで表現できる。 |
+| `POTENTIAL_AUTHORITY_CHANGE` | 承認済みsemantic authorityに影響し得るため、機械的な追随だけでは確定できない。 |
+| `UNVERIFIABLE` | 必要なsource/hash/状態を決定的に検証できない。将来enforcementする場合はFail Closedとなる。Phase 1では `would_block` として観測する。 |
+
+### 7.4 `approved_semantics` authority reconciliation
+
+`approved_semantics` は単なるfile hashではなく、承認された意味・authorityを表す。Phase 1では空であり、
+Actor-editableな `.agent/context.json` から設定または変更できない。
+
+`POTENTIAL_AUTHORITY_CHANGE` のsemantic reconciliationはLLMが分析し、差分、影響、更新案を提案してよい。
+通常、contextの受入れ・更新を決定するauthorityはChatGPTである。ただしcritical、ambiguous、または
+authorityを変更するdecisionはHumanへescalateする。LLM outputだけでapproved semanticsをmutationしてはならず、
+Human/ChatGPTのdecisionとWorkerが検証できる更新経路を経ない自動変更は認めない。
+
+### 7.5 Differential context / reviewへの段階移行（PLANNED / NOT_IMPLEMENTED）
+
+移行は一度にActorの読取りを狭めず、次の段階で行う。
+
+1. **Current / legacy:** Actorは関係するrepo、docs、evidenceを広く調査する。
+2. **Observation / comparison:** Context Harnessがbuild、index、slice候補を作る一方、Actor behaviorは広いまま維持する。準備packageと実際に必要だったcontextを比較し、omissionを測定する。
+3. **Package-first:** ActorはWorkerが準備したbounded packageを最初に読み、不足時はbounded additional referenceをrequestできる。
+4. **Differential-review:** 通常reviewは主にdelta packageを使い、必要時にboundaryまたはfull scopeへexpandする。
+5. **Full Review:** critical、closure、authority-changing、security/boundary-sensitiveなcaseでは常に選択可能とし、必要な全範囲を確認する。
+
+Phase 2/3の設計方向は、declared referenceを越えてevidenceを検索可能にする **Evidence Indexer** と、
+JOB・capability・actor/modeに応じてbounded packageを組み立てる **Job Context Slicer** である。
+これらの具体化はcompleted design job `LOCAL-AGENT-CONTEXT-HARNESS-PHASE23-DESIGN-20261003-001`
+の範囲を越えて本書で発明しない。
+
+**NOT IMPLEMENTED:** Job Context Slicer、prompt reduction/injection、declared file referenceを越えるEvidence Indexer、
+Review Delta Package、`DELTA_REVIEW` / `BOUNDARY_REVIEW` / `FULL_REVIEW` routing、LLM reconciliationのruntime接続、
+automatic `approved_semantics` mutation、Actorのsupplemental repository read禁止。
+
+### 7.6 Lease and ARGUS PoC（IMPLEMENTED_BASELINE）
+
+normal dispatchと `HISTORICAL_MANUAL` adoptionはcross-process SQLite workspace leaseを共有する。
+manual adoptionはscanとraceせず `WORKSPACE_BUSY` で失敗する。ARGUS PoC declarationはcross-workspace installされていない。
+review済みのexact candidateは `docs/argus_runtime_bootstrap_context_phase1.json` であり、authorized ARGUS jobが
+ARGUS `.agent/context.json` へcopyする必要がある。
+
+## 8. Result Manifest and terminal status domains
 
 Actor executionとArtifact deliveryを独立状態として扱う。
 
@@ -526,7 +572,27 @@ Claude reviewのResultは共通fieldに加え、input manifest provenance、raw 
 `review_boundary_status`、`adoptable`、`partial_evidence_available`、`cleanup_status`を保持する。
 これらはactor、boundary、artifact、cleanupの各status domainを相互に上書きせず表現する。
 
-## 14. Artifact Manifest
+## 9. Artifact Delivery
+
+### 9.1 Actor Result Artifact Contract（IMPLEMENTED_BASELINE）
+
+`AGENT_RESULT.artifacts` はexternal deliveryを意図したfileだけのlistである。`.agent` declaration、documentation、
+validation evidence、context、baseline等のrepo-canonical outputを含めてはならない。canonical changeは
+Worker-observed `git.changed_paths` と該当するcanonical evidence mechanismで表す。
+
+WorkerはActor申告candidateを `EXTERNAL_DELIVERABLE`、`REPO_CANONICAL_REFERENCE`、`INVALID` に分類する。
+external deliveryには通常のartifact-root validationがauthorityを持つ。configured external artifact root外という理由だけで
+rejectされたcandidateだけがcanonical-reference normalizationの対象になり得る。その場合も同じworkspace-relative safetyと
+file-existence validationを通り、normalized pathがcurrent Worker-observed `git.changed_paths` に存在し、job before/after snapshotで
+status/content fingerprintが変化していなければならない。
+
+有効なcanonical referenceはuploadせず、`artifact_status` を失敗させず、path、disposition、reasonとともにResult Manifest
+`canonical_references` へ加算的に記録する。job前からdirtyだったfileを含む任意のunchanged repo fileは証明にならない。
+missing、absolute、drive-qualified、UNC、traversal/out-of-workspace、unsafe等のcandidateは `rejected_artifacts` に残る。
+genuine external deliverableは引き続きconfigured `artifact_roots` matchを必要とし、delivery failureはFail Closedとする。
+このruntime normalizationはActor prompt guidanceを補完し、自己申告だけには依存しない。
+
+### 9.2 Artifact Manifest
 
 Agentの自然文Markdownリンク抽出には依存せず、Workerがprompt末尾へmachine-readable出力指示を追加する。
 
@@ -541,7 +607,7 @@ Agentの自然文Markdownリンク抽出には依存せず、Workerがprompt末�
 
 成果物がない場合は `artifacts: []` を許容する。
 
-## 15. Artifact Path Validation / Upload Policy
+### 9.3 Artifact Path Validation / Upload Policy
 
 Artifact pathは信頼しない。absolute path、drive-qualified path、UNC、`\\?\`、root escape、
 Alternate Data Streams、Windows reserved device names、trailing dot / space、case-insensitive境界逸脱を拒否する。
@@ -552,7 +618,7 @@ junction/symlink escape確認 → Workspace別Artifact Root allowlist確認、�
 Password、API key、OAuth token、Worker `.env`、`credentials.json`、`token.json`、Git credential、
 外部同期禁止のCanonical State / log / secret領域、`browser-profile/` はuploadしない。
 
-## 16. Google Drive
+### 9.4 Google Drive transport
 
 Google Driveは必須実行経路ではなく、条件付きArtifact Transport / Storeである。
 source codeと変更事実のSource of TruthはLocal Repo / Gitに留まる。
@@ -570,7 +636,9 @@ chatgpt/jobs/<job_id>/
   └─ artifacts/       # validated allowlisted artifacts only
 ```
 
-## 17. Credential
+## 10. Security Boundaries
+
+### 10.1 Credential and local runtime state
 
 個人ローカル運用を前提とし、専用Vault等は初期版では導入しない。
 
@@ -581,9 +649,11 @@ chatgpt/jobs/<job_id>/
 
 `browser-profile/` はCredential相当のLocal Runtime Stateとして扱い、Git / Drive / Agent Workspaceへ含めない。
 
-## 18. Logging Policy
+## 11. Evidence / Provenance
 
-### 18.1 Operational Log
+### 11.1 Logging Policy
+
+#### 11.1.1 Operational Log
 
 Python standard loggingを用い、設定を `operational_logging.py` に集中する。
 
@@ -601,7 +671,7 @@ Python standard loggingを用い、設定を `operational_logging.py` に集中�
 status、queue / dispatch / recovery、exit code等の簡潔なmetadataを記録する。
 Credentialとdecoded Instruction bodyをINFOへ記録してはならない。
 
-### 18.2 Local Execution Evidence
+### 11.2 Job Evidence: Local Execution Evidence
 
 Operational LogとJOB単位Local Execution Evidenceは別物である。
 `logs/<job_id>/` に以下のcontractを維持する。
@@ -618,7 +688,48 @@ Worker取得Git Evidenceを変更事実のauthorityとする。Slackへstdout/st
 
 Windowsでは、WorkerによるGit before / after evidenceはCodex actor sandboxの外側から収集する。一方、`elevated` backendで`.git`へsandbox SIDの明示DENY ACEが付与されたことは、許容できないworkspace side effectである。したがってGit content evidenceとは別に、`.git` ACLのbefore / afterをWindows sandbox regressionの必須確認対象とする。
 
-## 19. Timeout
+### 11.3 Cross-JOB Historical Job Evidence Adoption（IMPLEMENTED_BASELINE）
+
+terminal `result.json` は意図的にcompactであり、後続JOBのreconciliationには情報が不足し得る。
+過去のCodex `BLOCKED` decisionがlocal `stdout.txt` にしか存在しない場合の限定的なrecovery pathが
+`HISTORICAL_MANUAL` である。automatic normal-JOB adoption、replay/event sourcing、safety gateではない。
+
+authority modelは次のとおりである。
+
+- `WORKER_OBSERVED`: Workerが永続化したidentity、instruction hash/reference、terminal state/exit code/failure class、runtime/artifact facts、Git snapshot、changed path、利用可能なstate-store timestamp。
+- `ACTOR_REPORTED`: Codex summary、judgment、元のBLOCKED decision/detail、bounded exact final actor message。Codexの報告内容を証明するが、その正しさを証明しない。
+- `RAW_LOCAL_ONLY`: `stdout.txt`、`stderr.txt`、その他execution log。adoption-time SHA-256は記録できるがraw fileはcopyしない。
+- `CORROBORATIVE_ONLY`: read-only state storeとHuman/ChatGPT提供のSlack Result Manifest。一致はprovenanceを補強するがActor judgmentのauthorityを格上げしない。
+
+確認済みのhistorical/current plain `codex exec` formatでは、stdoutがterminal actor-message専用channelで、
+progress/tool traceはstderrにある。extraction method `codex-exec-plain-stdout-terminal-message-v1` は、non-empty strict UTF-8
+plain textである完全なstdoutだけを受理し、CRLFとbare CRをLFへnormalizeする。invalid UTF-8、NUL、ANSI control sequence、
+missing messageはFail Closedとする。method/version、raw stdout SHA-256、extracted-message SHA-256を記録し、messageを要約・rewriteしない。
+
+ARGUSのadoption先は `validation/evidence/job-results/<job_id>/` である。package fileは
+`job-evidence-manifest.json`、`normalized-result.json`、`actor-reported.json` だけとする。manifestはdeterministic canonical JSON hash、
+authority label、local source provenance、raw-local-only hash、corroboration、Human approval、trust limitationを記録する。
+installationはunsafe Windows pathとsymlink/reparse escapeを拒否し、atomicにstageする。同一bytesには `NOOP`、異なる既存packageには
+上書きせずfailureを返す。exact destination外のdirty canonical changeは変更しない。Workerはcommitしない。
+
+manual adoptionには `--historical-manual`、`--human-approved`、supplied Slack Result Manifestが必要である。
+WorkerはSlackをcallしない。supplied JSONは `job_id`、`actor`、`mode`、`workspace`、`instruction_sha256`、`status`、
+`exit_code`、`git.baseline_commit`、`git.head_after` を含まなければならない。request/result/state-store/Slack間で重なる
+stable valueを機械的に比較し、不一致はFail Closedとする。
+
+```text
+python agent_worker.py --adopt-job-evidence <job_id> --workspace argus \
+  --historical-manual --human-approved \
+  --slack-result-manifest C:\\path\\to\\slack-result-manifest.json
+```
+
+JSON resultは `ADOPTED`、`NOOP`、`FAILED` のいずれかで、mode、job/workspace、destination、manifest SHA-256、
+corroboration、trust limitation、errorを含む。adoptionはhistorical state-store rowを変更しない。hashはadoption時に作成するため、
+original terminal-time hash continuityは得られない。将来のall-JOB terminal Slack hash anchorは明示的に `DEFERRED` である。
+
+## 12. Failure Domains / Recovery
+
+### 12.1 Timeout
 
 ```python
 ACTOR_TIMEOUT = {
@@ -631,13 +742,18 @@ Timeoutはactor domainの `TIMEOUT` とする。Claude reviewではtimeoutまで
 `stream-json` とnormalized eventを失わずEvidenceへ永続化し、Workerはその後もreview boundary verificationとterminal
 closureを実行する。partial evidenceが存在してもactorをDONEへ昇格せず、reviewはadoptableにならない。
 
-## 20. Codex → Claude Independent Review
+## 13. Review System
 
-### 20.1 Claude Review Isolation v0.1（IMPLEMENTED_BASELINE）
+### 13.1 Current full-repo independent review
+
+現在のnormal reviewはReview Input Manifest v1でcanonical workspaceの対象file集合を独立cloneへ再現する
+full-repo input behaviorである。Context Harness Phase 1はこのbehaviorを変更せず、delta packageへ限定しない。
+
+### 13.2 Claude Review Isolation v0.1（IMPLEMENTED_BASELINE）
 
 Claude reviewはcanonical workspace単位のqueue lockをactor timeoutまで保持する。このためreviewは同一workspaceの他jobを最大actor timeoutまで直列化し得る。actorのcwdはWorker所有のjob固有disposable directoryに作る独立local cloneであり、worktreeではない。作成は `git clone --no-hardlinks --no-checkout <canonical> <review_dir>`、続いてcanonical HEADのdetached checkoutを行う。
 
-### 20.2 Review Isolation → Worker Evidence Adoption（IMPLEMENTED_BASELINE）
+### 13.3 Review Isolation → Worker Evidence Adoption（IMPLEMENTED_BASELINE）
 
 Claudeは引き続き独立cloneだけを読み、canonical workspaceへ一切writeしない。既存のcanonical/review boundary verificationが完了し、`review_boundary=CLEAN`、`actor_status=DONE`、`evidence_persisted=true`により`review_execution.adoptable=true`となった後だけ、同じworkspace queue lockを保持したWorkerがnormalized review evidenceをcanonicalへ採用する。設定はworkspace単位のoptional `review_evidence_root`であり、ARGUSでは `validation/evidence/external-review` とする。このrootはactor申告の通常の`artifact_roots`には含めない。
 
@@ -647,7 +763,7 @@ Workerはconfigured rootとcanonicalへのstrict containment、absolute/drive/UN
 
 Terminal Resultの`review_evidence`は`status: ADOPTED | NOOP | FAILED | NOT_RUN | NOT_CONFIGURED`、`mode: LIVE`、canonical-relative destination、manifest SHA-256、normalized file hash、raw local-only hash/storage、optional errorを持つ。review qualificationとevidence transportは別failure domainであり、adoption failureは`status=DONE`、`review_boundary=CLEAN`、`review_execution.adoptable=true`を変更しない。Slack Resultは採用attempt後に公開されるためfinal adoption status/hashを含む。Workerはevidenceをcommitせず、commit authorityはHumanに残る。
 
-provenance chainは `Worker-owned local job log → normalized allowlist → Worker manifest → Result.manifest_sha256 → downstream Codex` である。downstream Codexはcanonicalの`review-manifest.json`をSHA-256で再計算し、Resultの`manifest_sha256`と一致した場合だけ採用evidenceをtrustする。`HISTORICAL_MANUAL` adoptionは明示的にdeferredであり、このbaselineでは実装しない。
+provenance chainは `Worker-owned local job log → normalized allowlist → Worker manifest → Result.manifest_sha256 → downstream Codex` である。downstream Codexはcanonicalの`review-manifest.json`をSHA-256で再計算し、Resultの`manifest_sha256`と一致した場合だけ採用evidenceをtrustする。ここでdeferredなのは、過去のisolated **review evidence package**をこの経路へ採用する `HISTORICAL_MANUAL` modeであり、このbaselineでは実装しない。一方、18節の過去JOBに対する **job evidence package** の `HISTORICAL_MANUAL` adoptionは別機能として実装済みである。両者を同一のadoption pathとして扱ってはならない。
 
 Review Input Manifest v1は `git ls-files --cached --others --exclude-standard` が列挙し、現在のfilesystemに通常fileとして存在するpathを対象とする。pathはworkspace-relative slash-normalized、byte順で決定的に整列し、各fileのraw bytesのSHA-256とsize、決定的JSON serialization全体の `input_manifest_sha256` を記録する。staged/unstaged区別はreview cloneへ再現しない。staged deletionを含むcanonicalで現存しないfileは入力集合に含めず、clone側から削除する。Git LFS、submoduleの完全なsnapshot semanticsはv0.1の保証外である。
 
@@ -677,7 +793,21 @@ Human → ChatGPT → Codex implementation → DONE / Evidence
 Codex implementation / Claude independent review境界を維持する。自動Actor chainを行わず、
 後続JOB発行前にChatGPT / Human control boundaryを置く。
 
-## 21. Notion Integration / Control & Registry Plane
+### 13.4 Review Delta Package and review modes（PLANNED / NOT_IMPLEMENTED）
+
+Review Delta Packageは、通常reviewで変更差分、関係context、必要なevidenceをbounded packageとして渡す将来設計である。
+現在のfull-repo clone behaviorを置き換える実装はまだ存在しない。planned modeは次の意味とする。
+
+| Planned mode | 定義 |
+|---|---|
+| `DELTA_REVIEW` | 通常caseでdelta packageをprimary inputとし、必要ならbounded referenceを追加要求する。 |
+| `BOUNDARY_REVIEW` | security、authority、interface、dependency等の境界へ影響が及ぶため、deltaから関係boundaryまで範囲を拡張する。 |
+| `FULL_REVIEW` | critical、closure、authority-changing、またはboundary-sensitiveなcaseで、deltaに限定せず必要な全範囲を確認する。 |
+
+packageやmode routing、automatic expansionは **NOT IMPLEMENTED** である。Phase 2/3実装前の現在は、
+通常reviewもfull-repo input behaviorを維持する。
+
+## 14. Notion Integration / Control & Registry Plane
 
 Notionはv3 Instruction sourceであり、同時にControl / Registry / Human-facing Knowledge Planeである。
 SlackはCommand / Event Busであり、Notion自体をCommand Busにはしない。
@@ -699,7 +829,7 @@ Agent Result → Slack / Drive → ChatGPT → optional Human Decision → Notio
 
 Evidence本体はLocal Repo / Local Execution Evidence / 必要に応じたDriveに保持し、Notionへ大量ログを複製しない。
 
-## 22. Browser Callback / ChatGPT Wake-up
+## 15. Browser Callback / Delivery Acknowledgement
 
 Browser CallbackはJOBごとのoptional routing metadataであり、Result authorityではなくwake-up notificationである。
 固定conversation URLをWorker設定に持たず、ChatGPTがJOB発行時に自分のconversation URLを渡す。
@@ -780,7 +910,9 @@ Slack Result ManifestのauthorityとCallbackより先に公開する順序は変
 `tests/manual/inspect_chatgpt_buttons.py` は現在のChatGPT composer / action button stateを調べる
 手動DOM diagnostic helperであり、通常のWorker executionの一部ではない。
 
-## 23. 初期本番で導入しないもの
+## 16. Failure exclusions / 未導入範囲
+
+### 16.1 初期本番で導入しないもの
 
 - Cloudflare / Web server / Inbound HTTP
 - Redis / 外部Queue service / 分散JOB scheduler
@@ -790,7 +922,9 @@ Slack Result ManifestのauthorityとCallbackより先に公開する順序は変
 - 複数PC Worker
 - 専用Secret Vault / 複雑なDLP / SIEM
 
-## 24. 実装・Acceptance状態
+## 17. Implementation Status / Roadmap
+
+### 17.1 IMPLEMENTED_BASELINE
 
 本書時点で以下を実装・Acceptance済みとする。
 
@@ -818,8 +952,19 @@ Slack Result ManifestのauthorityとCallbackより先に公開する順序は変
   Result Manifest before Callback、callback failure isolation
 - pre-dispatch invalid actor / modeのshared rejection path、Slack `BRIDGE_ERROR / INVALID_JOB`、Actor非起動
 - Browser Callbackのgeneration wait / STOP非操作 / composer draft protection / DOM Fail Closed
+- Actor Result Artifact Contractと `EXTERNAL_DELIVERABLE` / `REPO_CANONICAL_REFERENCE` / `INVALID` classification
+- Review IsolationからのWorker-owned normalized Review Evidence Adoption（`mode: LIVE`）
+- Cross-JOB Historical Job Evidence Adoption（`HISTORICAL_MANUAL`）
+- Phase 1 Capability Context Harness（`mode: SHADOW`）、deterministic Context Manifest、terminal Delta Scan、workspace lease
 
-## 25. 実装・E2E確認済み
+### 17.2 PLANNED / NOT_IMPLEMENTED
+
+Context Harness Phase 2/3はdesign directionのみであり、runtimeへは実装されていない。対象はEvidence Indexer、
+Job Context Slicer、package-first prompt/context供給、Review Delta Package、`DELTA_REVIEW` / `BOUNDARY_REVIEW` /
+`FULL_REVIEW` routing、LLM reconciliationのruntime接続である。automatic `approved_semantics` mutationと、
+Actorのsupplemental repository read禁止も未実装である。Phase 1の `SHADOW` 観測はこれらを実装済みとみなす根拠にならない。
+
+### 17.3 実装・E2E確認済み
 
 v1 / v2の既存baselineに加え、v3について以下を確認済みとする。Claude review isolationの最終correction cycleは
 `local-agent-review-isolation-final-fixes-20261002-001` と、その後のuser local `.venv` regressionで確認した。
@@ -866,7 +1011,7 @@ v1 / v2の既存baselineに加え、v3について以下を確認済みとする
 - managed settings欠落時のlauncher fail-fastと、Worker settingsによるBash明示承認
 - repository `.venv` full unittest regression: `Ran 67 tests in 4.173s`, `OK`, skip 0
 
-### 25.1 Windows sandbox controlled A/B and Local Agent E2E
+#### 17.3.1 Windows sandbox controlled A/B and Local Agent E2E
 
 fresh scratch repo `C:\dev\codex-sandbox-test`をcontrolled validation専用に使用した。初期ACLは通常の継承Windows ACLのみであり、Codex sandbox SID ALLOW ACE、`ares\CodexSandboxUsers` ACE、`.git` sandbox DENY ACEはいずれも存在しなかった。
 
@@ -904,68 +1049,12 @@ callback後のhost-side ACL inspectionでは、workspace root、`.git`、`baseli
 条件付きDrive upload、Slack Result、Browser callback成功・失敗終端系、busy state synchronization、
 およびBrowser停止時failure isolationを維持する。
 
-## 26. 設計原則
+### 17.4 Status summary
 
 > ChatGPTはControl Plane、Notionはv3 Instruction source / Control / Registry、SlackはCommand /
 > Event Bus、Python Workerは状態管理されたLocal Execution Bridge / Runner、Codex / Claude Codeは
 > 境界を分けたExecution Actor、Google Driveは条件付きArtifact Transport / Store、Local Repo / Gitは
 > Source of Truth、Browser Callbackはwake-up notificationとする。
-
-## 27. Cross-JOB Historical Job Evidence Adoption（IMPLEMENTED_BASELINE）
-
-Terminal `result.json` is intentionally compact and can be lossy for later
-cross-JOB reconciliation. A historical Codex BLOCKED decision can exist only in
-local `stdout.txt`. `HISTORICAL_MANUAL` is the narrow recovery path for that case;
-it is not automatic normal-JOB adoption, replay/event sourcing, or a safety gate.
-
-The authority model is explicit:
-
-- `WORKER_OBSERVED`: Worker-persisted identity, instruction hash/reference,
-  terminal state/exit code/failure class, runtime/artifact facts, Git snapshots,
-  changed paths, and available state-store timestamps.
-- `ACTOR_REPORTED`: Codex summary, judgment, original BLOCKED decision/details,
-  and the exact bounded final actor message. This proves what Codex reported, not
-  that its report was correct.
-- `RAW_LOCAL_ONLY`: `stdout.txt`, `stderr.txt`, and other execution logs. Their
-  adoption-time SHA-256 values may be recorded, but raw files are never copied.
-- `CORROBORATIVE_ONLY`: read-only state store and a Human/ChatGPT-supplied Slack
-  Result Manifest. Matches strengthen provenance without upgrading actor judgment.
-
-For the inspected historical and current plain `codex exec` format, stdout is the
-dedicated terminal actor-message channel and progress/tool trace is on stderr.
-Extraction method `codex-exec-plain-stdout-terminal-message-v1` accepts complete
-stdout only when it is non-empty strict UTF-8 plain text; CRLF and bare CR are
-normalized to LF. Invalid UTF-8, NUL, ANSI control sequences, or a missing message
-fail closed. The method/version, raw stdout SHA-256, and extracted-message SHA-256
-are recorded; the message is not summarized or rewritten.
-
-ARGUS uses `validation/evidence/job-results/<job_id>/`. The only package files are
-`job-evidence-manifest.json`, `normalized-result.json`, and `actor-reported.json`.
-The manifest records deterministic canonical JSON hashes, authority labels, local
-source provenance, raw-local-only hashes, corroboration, Human approval, and the
-trust limitation. Installation rejects unsafe Windows paths and symlink/reparse
-escapes, stages atomically, returns `NOOP` for identical bytes, and fails rather
-than overwriting a different package. Dirty canonical changes outside the exact
-destination remain untouched. The Worker does not commit.
-
-Manual adoption requires `--historical-manual`, `--human-approved`, and a supplied
-Slack Result Manifest. The Worker does not call Slack. Supplied JSON must contain
-`job_id`, `actor`, `mode`, `workspace`, `instruction_sha256`, `status`, `exit_code`,
-plus `git.baseline_commit` and `git.head_after`. All stable overlapping
-request/result/state-store/Slack values are compared mechanically; mismatch fails
-closed.
-
-```text
-python agent_worker.py --adopt-job-evidence <job_id> --workspace argus \
-  --historical-manual --human-approved \
-  --slack-result-manifest C:\\path\\to\\slack-result-manifest.json
-```
-
-The JSON result is `ADOPTED`, `NOOP`, or `FAILED` and includes mode, job/workspace,
-destination, manifest SHA-256, corroboration, trust limitation, and any error.
-Adoption never mutates the historical state-store row. Hashes were created at
-adoption time; original terminal-time hash continuity is unavailable. A future
-all-JOB terminal Slack hash anchor is explicitly DEFERRED.
 
 > v3の実行identityはpage_idではなく、受理時に解決・snapshotしたInstruction bytesとWorker-generated SHAである。
 

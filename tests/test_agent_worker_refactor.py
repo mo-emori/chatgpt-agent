@@ -66,6 +66,25 @@ class ExecuteJobRefactorTests(unittest.TestCase):
         ))
         notify.assert_called_once()
 
+    @patch.object(agent_worker, "notify_chatgpt")
+    def test_submitted_ack_unverified_is_not_callback_failure(self, notify):
+        job = make_job()
+        notify.return_value = "SUBMITTED_ACK_UNVERIFIED"
+
+        with self.assertLogs(agent_worker.logger, level="INFO") as captured:
+            result = agent_worker.send_browser_callback(
+                job, status="DONE", artifact_status="DONE"
+            )
+
+        self.assertEqual(result["status"], "SUBMITTED_ACK_UNVERIFIED")
+        self.assertFalse(any(
+            "BROWSER CALLBACK FAILED" in line for line in captured.output
+        ))
+        self.assertTrue(any(
+            "identity ACK unavailable" in line for line in captured.output
+        ))
+        notify.assert_called_once()
+
     @patch.object(agent_worker, "log_job_end")
     @patch.object(agent_worker, "dispatch_next_queued")
     @patch.object(agent_worker, "finalize_browser_callback")

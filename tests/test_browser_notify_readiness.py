@@ -296,23 +296,36 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
 
         self.assertEqual(stop.clicks, 0)
 
-    def test_composer_empty_and_stop_without_combined_identity_do_not_confirm(self):
+    def test_composer_empty_and_stop_without_selector_is_submitted_unverified(self):
         composer = Element()
         send = Element()
         stop = Element()
-        page = Page(composer, sends=[[send]], messages=[[], [
-            Element(text="LOCAL_AGENT_JOB_COMPLETED")
-        ]])
+        page = Page(composer, sends=[[send]], messages=[[]])
+        def after_click():
+            composer.text = ""
+            page.stops[0] = [stop]
+        send.on_click = after_click
+
+        result = self.run_notify(page, monotonic=[0, 0, 0, 11])
+
+        self.assertEqual(result, notify.SUBMITTED_ACK_UNVERIFIED)
+        self.assertEqual(send.clicks, 1)
+
+    def test_wrong_identity_with_submission_transition_is_unverified_not_confirmed(self):
+        composer = Element()
+        stop = Element()
+        page = Page(composer, sends=[[Element()]], messages=[[], [Element(text=(
+            "LOCAL_AGENT_JOB_COMPLETED job_id: JOB-ACK-002 actor: codex"
+        ))]])
         def after_click():
             composer.text = ""
             page.stops[0] = [stop]
             page.messages.pop(0)
-        send.on_click = after_click
+        page.sends[0][0].on_click = after_click
 
-        with self.assertRaisesRegex(notify.BrowserNotifyError, "DELIVERY_UNKNOWN"):
-            self.run_notify(page, monotonic=[0, 0, 0, 11])
+        result = self.run_notify(page, monotonic=[0, 0, 0, 11])
 
-        self.assertEqual(send.clicks, 1)
+        self.assertEqual(result, notify.SUBMITTED_ACK_UNVERIFIED)
 
     def test_generating_waits_for_stop_to_disappear_then_sends(self):
         composer = Element()

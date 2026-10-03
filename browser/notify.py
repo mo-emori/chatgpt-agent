@@ -19,6 +19,9 @@ SEND_BUTTON_TIMEOUT_SECONDS = 5
 DELIVERY_ACK_TIMEOUT_SECONDS = 10
 STATE_POLL_INTERVAL_MS = 500
 
+DELIVERY_CONFIRMED = "DELIVERY_CONFIRMED"
+SUBMITTED_ACK_UNVERIFIED = "SUBMITTED_ACK_UNVERIFIED"
+
 
 DOM_CONFIG_FILE = (
     Path(__file__).parent
@@ -219,6 +222,7 @@ def wait_for_delivery_ack(
     deadline = time.monotonic() + DELIVERY_ACK_TIMEOUT_SECONDS
     saw_composer_empty = False
     saw_stop_visible = False
+    submission_transition_seen = False
     marker, job_id = callback_identity(message)
     marker_match_seen = False
     job_id_match_seen = False
@@ -266,23 +270,41 @@ def wait_for_delivery_ack(
                 combined_identity_match_seen, saw_composer_empty,
                 saw_stop_visible, DELIVERY_ACK_TIMEOUT_SECONDS,
             )
-            return
+            return DELIVERY_CONFIRMED
 
         try:
             composer = find_optional_unique_visible(
                 page, composer_selectors, name="composer"
             )
-            saw_composer_empty = saw_composer_empty or (
+            composer_empty_now = (
                 composer is not None and composer_is_empty(composer)
             )
+            saw_composer_empty = saw_composer_empty or composer_empty_now
             stop_button = find_optional_unique_visible(
                 page, stop_selectors, name="stop_button"
             )
-            saw_stop_visible = saw_stop_visible or stop_button is not None
+            stop_visible_now = stop_button is not None
+            saw_stop_visible = saw_stop_visible or stop_visible_now
+            # The composer was verified empty, then populated by this invocation
+            # immediately before the click.  Empty + generation after the click
+            # is therefore an independent submission transition, even when the
+            # UI exposes no queryable user-message node.
+            submission_transition_seen = submission_transition_seen or (
+                saw_composer_empty and saw_stop_visible
+            )
         except BrowserNotifyError as e:
             logger.info("Browser callback ACK secondary observation failed: %s", e)
 
         if time.monotonic() >= deadline:
+            if submission_transition_seen:
+                logger.warning(
+                    "Browser callback SUBMITTED_ACK_UNVERIFIED: %s "
+                    "identity ACK unavailable; composer emptied and generation "
+                    "started after click user_message_selector_before=%r "
+                    "user_message_selector_after=%r",
+                    callback_log_identity(message), selector_before, selector_after,
+                )
+                return SUBMITTED_ACK_UNVERIFIED
             logger.warning(
                 "Browser callback DELIVERY_ACK_TIMEOUT/DELIVERY_UNKNOWN: %s "
                 "user_message_selector_before=%r user_message_selector_after=%r "
@@ -410,6 +432,8 @@ def notify_chatgpt(
             try:
                 composer.fill(message)
                 filled = True
+                if composer_text(composer) != message:
+                    raise BrowserNotifyError("COMPOSER_FILL_NOT_VERIFIED")
 
                 send_button = wait_for_send_button(
                     page,
@@ -438,7 +462,7 @@ def notify_chatgpt(
                     )
                 raise
 
-            wait_for_delivery_ack(
+            return wait_for_delivery_ack(
                 page,
                 composer_selectors=dom["composer"]["selectors"],
                 stop_selectors=dom["stop_button"]["selectors"],

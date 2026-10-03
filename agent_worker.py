@@ -61,6 +61,7 @@ from job_log import (
 )
 from browser.notify import (
     BrowserNotifyError,
+    SUBMITTED_ACK_UNVERIFIED,
     notify_chatgpt,
 )
 from dataclasses import replace
@@ -160,11 +161,21 @@ def send_browser_callback(
     )
 
     try:
-        notify_chatgpt(
+        delivery_status = notify_chatgpt(
             target_url=
                 job.callback_url,
             message=message,
         )
+        if delivery_status == SUBMITTED_ACK_UNVERIFIED:
+            logger.warning(
+                "Browser callback submitted; identity ACK unavailable: job_id=%s",
+                job.job_id,
+            )
+            return {
+                "type": "chatgpt_browser",
+                "status": SUBMITTED_ACK_UNVERIFIED,
+                "url": job.callback_url,
+            }
         logger.info("Browser callback succeeded: job_id=%s", job.job_id)
 
         return {

@@ -1119,11 +1119,11 @@ click正常終了は `CLICK_SUCCEEDED` であり、callback成功ではない。
 `LOCAL_AGENT_JOB_COMPLETED` または `LOCAL_AGENT_JOB_FAILED` markerと、exactなunique `job_id` の両方が存在する場合だけ
 `DELIVERY_CONFIRMED` とし、`notify_chatgpt` の成功returnおよびWorkerの `Browser callback succeeded` を許可する。
 DOM renderingによる改行・通常whitespaceの正規化は許容し、full rendered textの完全一致は要求しない。markerのみ、`job_id` のみ、
-または別々の新規nodeに分かれた一致はACKにならない。これにより、同一callbackが過去に存在しても新規deliveryのACKにはならない。composerが空になったこと、およびSTOPが
-visibleになったことはsecondary diagnostic evidenceに限り、delivery authorityにはしない。
+または別々の新規nodeに分かれた一致はconfirmed ACKにならない。これにより、同一callbackが過去に存在しても新規deliveryのACKにはならない。
 
-click後にACK timeout、DOM変化の不確定、またはその他のambiguous stateが生じた場合は
-`DELIVERY_UNKNOWN` としてcallback failureを記録する。この状態では既にsendが受理された可能性があるため、自動retry / resendを
+selectorが利用できない場合を含め、click前にこのinvocationがcomposerを空からcallback本文へ遷移させ、click後にcomposerが空へ戻り、かつgeneration開始（STOP表示）を観測した場合は、submissionは成立したがrender/server identity ACKを直接確認できない `SUBMITTED_ACK_UNVERIFIED` とする。composer-emptyまたはSTOPの片方だけではこの状態にしない。これはcallback execution failureではなく、Local `result.json` の `callback.status` に同名で記録し、`BROWSER CALLBACK FAILED` を出力しない。
+
+identity一致も上記submission transitionも得られない場合は `DELIVERY_UNKNOWN` としてcallback failureを記録する。この状態では既にsendが受理された可能性があるため、自動retry / resendを
 行わず、composer cleanupも行わない。これによりduplicate callbackと、send受理後にHumanが入力したreplacementの破壊を防ぐ。
 Slack Result ManifestのauthorityとCallbackより先に公開する順序は変えない。
 

@@ -68,6 +68,14 @@ def load_declaration(root: str | Path) -> tuple[dict | None, str | None, list[st
         for capability, config in sorted(value["capabilities"].items()):
             if not isinstance(config, dict):
                 raise ValueError(f"capability must be an object: {capability}")
+            context = config.get("context", {})
+            if not isinstance(context, dict):
+                raise ValueError(f"context must be an object: {capability}")
+            if "max_text_bytes" in context:
+                budget = context["max_text_bytes"]
+                if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
+                    raise ValueError(
+                        f"context.max_text_bytes must be a positive integer: {capability}")
             _validate_source_mappings(config, capability)
         return value, _sha(raw), []
     except Exception as exc:
@@ -234,6 +242,9 @@ def observe(root: str | Path, capability: str, *, previous_context_hash: str | N
         "schema_version": SCHEMA_VERSION,
         "capability": capability,
         "configured_label": config.get("label"),
+        "context_contract": {
+            "max_text_bytes": config.get("context", {}).get("max_text_bytes"),
+        },
         "base_git_head": head_after,
         "declaration": {"path": DECLARATION.as_posix(), "raw_sha256": declaration_hash},
         "sources": sorted(facts, key=lambda x: (x["path"], x["kind"])),

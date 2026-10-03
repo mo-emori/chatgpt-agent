@@ -68,6 +68,14 @@ def test_v3_valid():
     }
 
 
+def test_v3_preserves_structured_context_budget_exactly():
+    ref = make_v3_job()["instruction_ref"]
+    ref["context_request"] = {"max_text_bytes": 230389, "context_items": ["design"]}
+    job = parse(make_v3_job(instruction_ref=ref))
+    assert job.instruction_ref["context_request"] == {
+        "max_text_bytes": 230389, "context_items": ["design"]}
+
+
 def test_v3_missing_instruction_ref():
     data = make_v3_job()
     del data["instruction_ref"]
@@ -193,6 +201,7 @@ def test_v3_delta_review_rejects_silent_fallback_shapes():
 
 TESTS = [
     test_v3_valid,
+    test_v3_preserves_structured_context_budget_exactly,
     test_v3_missing_instruction_ref,
     test_v3_invalid_instruction_ref_type,
     test_v3_invalid_instruction_type,

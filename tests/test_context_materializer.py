@@ -4,10 +4,21 @@ import os
 
 import context_materializer
 import job_context
+import review_invocation
 from tests.test_job_context import JobContextTests, write_json
 
 
 class ContextMaterializerTests(JobContextTests):
+    def capability_budget(self, value):
+        context = self.declaration["capabilities"]["CAP"].setdefault("context", {})
+        if value is None:
+            context.pop("max_text_bytes", None)
+        else:
+            context["max_text_bytes"] = value
+        write_json(self.root / ".agent/context.json", self.declaration)
+        self.manifest = __import__("context_harness").observe(self.root, "CAP")
+        self.delta = __import__("context_harness").scan(self.manifest, self.manifest)
+
     def materialize(self, request=None, *, index=None):
         context, _ = self.build(job=self.job(request or {"max_text_bytes": 100000,
             "finding_ids": ["F-1"]}), index=index)
@@ -108,19 +119,35 @@ class ContextMaterializerTests(JobContextTests):
                 context_materializer.safe_file(self.root, "linked")
 
     def test_over_budget_is_nonready_and_nothing_is_truncated(self):
-        context, _ = self.build(job=self.job({"max_text_bytes": 100000, "finding_ids": ["F-1"]}))
-        context["size"]["configured_max_text_bytes"] = 1
-        material = dict(context); material.pop("manifest_sha256"); material.pop("package_sha256")
-        identity = job_context.sha256(job_context.canonical(material))
-        context["manifest_sha256"] = identity; context["package_sha256"] = identity
-        write_json(self.dest / "job-context.json", context)
-        value, _ = context_materializer.build(self.root, workspace="ws", capability="CAP",
-            job_context=context, job_context_path="validation/context/CAP/job-context.json",
-            evidence_index=self.index, evidence_index_path="validation/context/CAP/evidence-index.json")
+        _, value, report = self.materialize({"max_text_bytes": 1, "finding_ids": ["F-1"]})
         self.assertEqual(value["materialization_status"], "NEEDS_EXPANSION")
         self.assertEqual(value["materialized_items"], [])
-        self.assertTrue(any(x["reason_code"] == "REQUIRED_ITEMS_EXCEED_BUDGET"
+        self.assertGreater(value["measurement"]["required_payload_bytes"], 1)
+        self.assertEqual(report["over_budget_bytes"],
+                         report["required_payload_bytes"] - 1)
+        self.assertTrue(any(x["reason_code"] == "REQUIRED_CONTEXT_OVER_BUDGET"
                             for x in value["expansion_requirements"]))
+        diagnostic = next(x for x in value["diagnostics"]
+                          if x["code"] == "REQUIRED_CONTEXT_OVER_BUDGET")
+        self.assertTrue(diagnostic["oversized_required_items"])
+
+    def test_exact_and_below_budget_are_ready(self):
+        _, baseline, _ = self.materialize({"finding_ids": ["F-1"]})
+        required = baseline["measurement"]["required_payload_bytes"]
+        self.capability_budget(required)
+        _, exact, _ = self.materialize({"finding_ids": ["F-1"]})
+        self.assertEqual(exact["materialization_status"], "READY_BOUNDED")
+        self.assertEqual(exact["total_bytes"], required)
+        self.capability_budget(required + 1)
+        _, below, _ = self.materialize({"finding_ids": ["F-1"]})
+        self.assertEqual(below["materialization_status"], "READY_BOUNDED")
+
+    def test_higher_override_is_rejected_without_clamp(self):
+        _, value, report = self.materialize({"max_text_bytes": 100001})
+        self.assertEqual(value["materialization_status"], "NEEDS_EXPANSION")
+        self.assertEqual(value["budget_reason"], "BUDGET_OVERRIDE_EXCEEDS_CAPABILITY_MAX")
+        self.assertIsNone(value["effective_max_text_bytes"])
+        self.assertEqual(report["requested_max_text_bytes"], 100001)
 
     def test_binary_required_is_explicit_nonready(self):
         (self.root / "bootstrap-contract.md").write_bytes(b"\xff\x00")
@@ -155,6 +182,7 @@ class ContextMaterializerTests(JobContextTests):
         self.assertNotEqual(old, changed["materialized_context_sha256"])
 
     def test_missing_budget_fails_closed(self):
+        self.capability_budget(None)
         _, value, _ = self.materialize({"finding_ids": ["F-1"]})
         self.assertEqual(value["materialization_status"], "NEEDS_EXPANSION")
         self.assertTrue(any(x["code"] == "MISSING_EXPLICIT_BYTE_BUDGET" for x in value["diagnostics"]))
@@ -170,3 +198,12 @@ class ContextMaterializerTests(JobContextTests):
         self.assertEqual(result["materialized_context"]["status"], "READY_BOUNDED")
         self.assertEqual((job.prompt, job.prompt_sha256), prompt_identity)
         self.assertEqual(result["materialized_context"]["mode"], "COMPARISON_ONLY")
+        self.assertEqual(result["materialized_context"]["declared_max_text_bytes"], 100000)
+        self.assertEqual(result["materialized_context"]["effective_max_text_bytes"], 100000)
+
+    def test_budget_metadata_does_not_change_actor_invocation_prompt(self):
+        without = self.job({})
+        with_budget = self.job({"max_text_bytes": 1})
+        prompt1 = review_invocation.prepare_effective_prompt(without, None, capability="CAP")
+        prompt2 = review_invocation.prepare_effective_prompt(with_budget, None, capability="CAP")
+        self.assertEqual(prompt1, prompt2)

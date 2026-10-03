@@ -53,6 +53,15 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
     diagnostics, omitted, items = [], [], []
     expansions = list(job_context.get("expansion_requirements", []))
     status = "READY_BOUNDED"
+    budget_contract = job_context.get("budget_contract", {})
+    declared_budget = budget_contract.get("declared_max_text_bytes")
+    requested_budget = budget_contract.get("requested_max_text_bytes")
+    effective_budget = budget_contract.get("effective_max_text_bytes")
+    budget_source = budget_contract.get("budget_source")
+    budget_validation_status = budget_contract.get("validation_status")
+    budget_reason = budget_contract.get("reason")
+    required_payload_bytes = 0
+    over_budget_bytes = 0
     try:
         stored_job, job_raw = _verified_json(root, job_context_path)
         stored_index, index_raw = _verified_json(root, evidence_index_path)
@@ -69,13 +78,6 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
             raise ValueError("Job Context workspace/capability mismatch")
         if sha256(index_raw) != job_context.get("evidence_index_sha256"):
             raise ValueError("Evidence Index chain mismatch")
-        budget = job_context.get("size", {}).get("configured_max_text_bytes")
-        if budget is None:
-            status = "NEEDS_EXPANSION"
-            diagnostics.append({"code": "MISSING_EXPLICIT_BYTE_BUDGET",
-                                "detail": "Phase 2B/default contract supplies no max_text_bytes"})
-        elif not isinstance(budget, int) or isinstance(budget, bool) or budget < 0:
-            raise ValueError("invalid byte budget")
         entries = {x.get("evidence_id"): x for x in evidence_index.get("entries", [])}
         candidates = []
         for ref in job_context.get("authoritative_source_refs", []):
@@ -117,13 +119,32 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
                 "content_sha256": sha256(content), "content_encoding": "utf-8-json",
                 "content_type": "application/json", "byte_count": len(content),
                 "content": content.decode("utf-8")})
-        total = sum(x["byte_count"] for x in candidates)
-        if budget is not None and total > budget:
+        required_payload_bytes = sum(x["byte_count"] for x in candidates)
+        if budget_reason:
             status = "NEEDS_EXPANSION"
-            diagnostics.append({"code": "REQUIRED_ITEMS_EXCEED_BUDGET", "required_bytes": total,
-                                "configured_max_text_bytes": budget})
+            diagnostics.append({"code": budget_reason,
+                "declared_max_text_bytes": declared_budget,
+                "requested_max_text_bytes": requested_budget,
+                "effective_max_text_bytes": effective_budget})
+        elif (not isinstance(effective_budget, int) or isinstance(effective_budget, bool)
+              or effective_budget <= 0):
+            status = "NEEDS_EXPANSION"
+            budget_reason = "MISSING_EXPLICIT_BYTE_BUDGET"
+            diagnostics.append({"code": budget_reason})
+        elif required_payload_bytes > effective_budget:
+            status = "NEEDS_EXPANSION"
+            budget_reason = "REQUIRED_CONTEXT_OVER_BUDGET"
+            over_budget_bytes = required_payload_bytes - effective_budget
+            oversized = [{"source_ref": x["source_ref"], "evidence_ref": x["evidence_ref"],
+                          "byte_count": x["byte_count"]}
+                         for x in candidates if x["byte_count"] > effective_budget]
+            diagnostics.append({"code": budget_reason,
+                "required_payload_bytes": required_payload_bytes,
+                "effective_max_text_bytes": effective_budget,
+                "over_budget_bytes": over_budget_bytes,
+                "oversized_required_items": oversized})
             expansions.append({"source_ref": None, "evidence_ref": None,
-                "reason": "REQUIRED_ITEMS_EXCEED_BUDGET", "reason_code": "REQUIRED_ITEMS_EXCEED_BUDGET",
+                "reason": budget_reason, "reason_code": budget_reason,
                 "authority_class": "mixed", "quality": None, "requirement": "REQUIRED_BEFORE_REVIEW",
                 "required_before_package_first_execution": True, "origin": "MATERIALIZER", "suggested_scope": []})
         else:
@@ -137,7 +158,7 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
             omitted.append({"source_ref": ref.get("evidence_path"), "evidence_ref": ref.get("evidence_id"),
                             "known_bytes": None, "reason": "IRRELEVANT_PHASE_2B_OMISSION"})
     except Exception as exc:
-        status, budget, job_raw, index_raw = "UNVERIFIABLE", None, b"", b""
+        status, job_raw, index_raw = "UNVERIFIABLE", b"", b""
         diagnostics.append({"code": "MATERIALIZATION_INPUT_UNVERIFIABLE", "detail": str(exc)[:1000]})
         items = []
     counts = {}
@@ -154,9 +175,18 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
         "omitted_or_unsupported_items": sorted(omitted, key=lambda x: canonical(x)),
         "unresolved_items": job_context.get("unresolved_items", []),
         "expansion_requirements": sorted(expansions, key=lambda x: canonical(x)),
-        "total_bytes": sum(x["byte_count"] for x in items), "configured_max_text_bytes": budget,
+        "total_bytes": sum(x["byte_count"] for x in items),
+        "declared_max_text_bytes": declared_budget,
+        "requested_max_text_bytes": requested_budget,
+        "effective_max_text_bytes": effective_budget,
+        "budget_source": budget_source,
+        "budget_status": budget_validation_status or (
+            "VALID" if budget_reason is None else "INVALID"),
+        "budget_reason": budget_reason,
         "measurement": {"selected_source_bytes": sum(x["byte_count"] for x in items),
             "materialized_payload_bytes": sum(x["byte_count"] for x in items),
+            "required_payload_bytes": required_payload_bytes,
+            "over_budget_bytes": over_budget_bytes,
             "omitted_bytes_known": sum(x.get("known_bytes") or 0 for x in omitted),
             "materialized_item_count": len(items), "omitted_item_count": len(omitted),
             "item_counts_by_authority_quality": dict(sorted(counts.items()))},
@@ -168,7 +198,15 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
               "source_context_sha256": body["source_context_manifest_sha256"],
               "evidence_index_sha256": body["evidence_index_sha256"],
               "item_count": len(items), "bytes": len(canonical(result)),
-              "payload_bytes": body["total_bytes"], "diagnostics": diagnostics}
+              "payload_bytes": body["total_bytes"],
+              "declared_max_text_bytes": declared_budget,
+              "requested_max_text_bytes": requested_budget,
+              "effective_max_text_bytes": effective_budget,
+              "budget_source": budget_source,
+              "required_payload_bytes": required_payload_bytes,
+              "over_budget_bytes": over_budget_bytes,
+              "reason": budget_reason,
+              "diagnostics": diagnostics}
     return result, report
 
 

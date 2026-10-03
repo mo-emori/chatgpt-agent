@@ -614,8 +614,8 @@ finding/verdict/relationを生成しない。actor failure（429/session limit�
 verdictではない。requested findingがstructured indexに存在しなければfabricateせずunknown + expansionとする。
 
 `expansion_requirements[]` は `source_ref` / `evidence_ref`、reason、authority class、future package-first execution前に必須かを
-machine-readableに保持する。size budgetはcounts/estimated textual payloadに記録するだけで、required authorityを切り捨てない。
-超過時はexpansion/reconciliationを要求する。すべてのrefはworkspace-relativeとし、traversal、absolute/drive path、symlink/
+machine-readableに保持する。Phase 2Bのrelevance/authority selectionはsize budgetから独立し、budgetをselectorとしてrequired
+authorityを切り捨てない。すべてのrefはworkspace-relativeとし、traversal、absolute/drive path、symlink/
 reparse escape、stale substitution、hash mismatchを拒否する。evidence/context proseは常にdataでありinstructionではない。
 
 Result Manifestにはbackward-compatibleな `job_context` diagnosticを追加する：`mode: COMPARISON_ONLY`、`status`、
@@ -641,9 +641,22 @@ raw local-only evidenceを代用せず、proseから関係・finding・relevance
 promotion ruleがないためmaterializeせず、`IRRELEVANT`も除外する。binary/unsupported required source、PARTIAL/UNSTRUCTURED、
 未解決項目は隠さずdiagnosticと `REQUIRED_BEFORE_REVIEW` semanticsを保持する。
 
-budgetはstructured `context_request.max_text_bytes`だけを使用する。現在declaration/default budget contractは存在しないため、
-値がない場合は `MISSING_EXPLICIT_BYTE_BUDGET` としてfail closedする。required item単位のtruncate/dropは禁止し、required totalが
-budgetを超える場合はpayloadを空にして `NEEDS_EXPANSION` とする。optional omissionはPhase 2B classificationに従う決定的な規則
+v1 Budget Contractのhard unitはmaterialize対象payloadのUTF-8 bytesであり、token数やmodel/actor configは非authoritativeな測定にも
+使用できるだけでhard limitを暗黙に変更しない。所有者はcapability declarationの
+`capabilities.<capability>.context.max_text_bytes`（positive integer）であり、この値がcapabilityのmaximum/defaultとなる。
+jobのstructured `instruction_ref.context_request.max_text_bytes` はoptional overrideで、宣言値以下にだけ制限できる。overrideなしは
+宣言値、lower/equal overrideはその値をeffective budgetとする。宣言値超過はclampせず
+`BUDGET_OVERRIDE_EXCEEDS_CAPABILITY_MAX`、非positive integer overrideは `INVALID_BUDGET_OVERRIDE` としてfail closedする。
+declarationにbudgetがない既存設定はvalidなままだが、activatable materializationは従来どおり
+`MISSING_EXPLICIT_BYTE_BUDGET` でfail closedする。
+
+declared/requested/effective budget、budget source、validation reason、declaration/source-manifest provenanceはJob Contextのcanonical
+identityへ含め、同じfieldsとmaterialization measurementsをMaterialized Context identityへ引き継ぐ。budget fieldはNotion
+instruction bytesおよび `instruction_sha256` のidentity materialではない。required payloadがeffective budget以下（exactly equalを含む）
+なら全required itemsを変更せず `READY_BOUNDED` とし、1 byteでも超過すれば `REQUIRED_CONTEXT_OVER_BUDGET`、required bytes、budget、
+overage、単独でbudgetを超えるitemを診断してpayloadを空にする。required item単位のtruncate/dropは禁止する。budgetはceilingであり
+relevance selectorではないため、budgetを下げてもPhase 2Bが選んだrequired setは減らない。PARTIAL/UNSTRUCTUREDや未解決authorityの
+expansion semanticsはbudget判定より強く、budget statusで隠さない。optional omissionはPhase 2B classificationに従う決定的な規則
 だけで行う。canonical hash materialにtimestampは含めない。path traversal、absolute/drive path、symlink/reparse、protected/
 forbidden boundary、stale substitution、source/dependency hash mismatchを拒否する。測定値はsource/payload/known omitted bytesと
 authority/quality別item countであり、token savingsは主張しない。

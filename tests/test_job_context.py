@@ -34,6 +34,7 @@ class JobContextTests(unittest.TestCase):
             "schema_version": 1, "mode": "SHADOW", "generated_root": "validation/context",
             "capabilities": {"CAP": {
                 "selectors": {"actors": ["codex"], "modes": ["execute"]},
+                "context": {"max_text_bytes": 100000},
                 "protected_paths": ["security"], "forbidden_paths": ["secrets"],
                 "sources": [
                     {"path": "bootstrap-contract.md", "kind": "contract", "authority": "authoritative",
@@ -155,14 +156,29 @@ class JobContextTests(unittest.TestCase):
                          "EXPLICIT_CAPABILITY_MISMATCH")
         self.assertEqual(report["omitted_irrelevant_count"], 1)
 
-    def test_boundaries_and_budget_never_truncate_authority(self):
+    def test_budget_never_changes_authority_selection(self):
         result, _ = self.build(job=self.job({"max_text_bytes": 0}))
         self.assertEqual(result["boundaries"], {"protected_paths": ["security"],
                                                 "forbidden_paths": ["secrets"]})
         self.assertTrue(any(x["source_ref"] == "bootstrap-contract.md"
                             for x in result["authoritative_source_refs"]))
-        self.assertTrue(any(x["reason"] == "SIZE_BUDGET_CANNOT_TRUNCATE_REQUIRED_AUTHORITY"
-                            for x in result["expansion_requirements"]))
+        self.assertEqual(result["selection_status"], "READY_BOUNDED")
+        self.assertEqual(result["budget_contract"]["reason"], "INVALID_BUDGET_OVERRIDE")
+
+    def test_budget_precedence_and_identity(self):
+        inherited, _ = self.build(self.job({}))
+        lower, _ = self.build(self.job({"max_text_bytes": 50000}))
+        equal, _ = self.build(self.job({"max_text_bytes": 100000}))
+        higher, _ = self.build(self.job({"max_text_bytes": 100001}))
+        self.assertEqual(inherited["budget_contract"]["effective_max_text_bytes"], 100000)
+        self.assertEqual(inherited["budget_contract"]["budget_source"], "CAPABILITY_DECLARATION")
+        self.assertEqual(lower["budget_contract"]["effective_max_text_bytes"], 50000)
+        self.assertEqual(lower["budget_contract"]["budget_source"], "JOB_CONTEXT_REQUEST")
+        self.assertEqual(equal["budget_contract"]["validation_status"], "VALID")
+        self.assertEqual(higher["budget_contract"]["reason"],
+                         "BUDGET_OVERRIDE_EXCEEDS_CAPABILITY_MAX")
+        self.assertIsNone(higher["budget_contract"]["effective_max_text_bytes"])
+        self.assertNotEqual(inherited["package_sha256"], lower["package_sha256"])
 
     def test_hash_mismatch_traversal_stale_and_symlink_escape(self):
         (self.dest / "delta-report.json").write_text("{}", encoding="utf-8")

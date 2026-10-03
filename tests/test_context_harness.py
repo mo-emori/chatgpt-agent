@@ -104,6 +104,23 @@ class ContextHarnessTests(unittest.TestCase):
         self.assertIsNone(declaration)
         self.assertTrue(errors)
 
+    def test_capability_budget_is_optional_positive_integer_and_hash_bound(self):
+        before = self.observe()
+        self.declaration["capabilities"]["CAP"]["context"] = {"max_text_bytes": 123}
+        self.write_declaration()
+        declaration, _, errors = harness.load_declaration(self.root)
+        self.assertFalse(errors)
+        self.assertEqual(declaration["capabilities"]["CAP"]["context"]["max_text_bytes"], 123)
+        after = self.observe()
+        self.assertNotEqual(before["lifecycle"]["manifest_sha256"],
+                            after["lifecycle"]["manifest_sha256"])
+        for invalid in (0, -1, True, 1.5, "10"):
+            self.declaration["capabilities"]["CAP"]["context"]["max_text_bytes"] = invalid
+            self.write_declaration()
+            value, _, invalid_errors = harness.load_declaration(self.root)
+            self.assertIsNone(value)
+            self.assertIn("positive integer", invalid_errors[0])
+
     def test_shadow_evidence_and_result_fields_do_not_enforce(self):
         cache = self.root / "cache"
         session = harness.begin_shadow(self.root, workspace="fixture", actor="codex",

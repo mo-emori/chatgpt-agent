@@ -98,6 +98,45 @@ def structured_request(job) -> dict:
     }
 
 
+def _budget_contract(config: dict, request: dict, manifest: dict) -> dict:
+    """Resolve declaration-owned byte ceiling without changing relevance selection."""
+    context = config.get("context", {})
+    declared = context.get("max_text_bytes") if isinstance(context, dict) else None
+    requested = request.get("max_text_bytes")
+    effective = None
+    source = None
+    status = "VALID"
+    reason = None
+    if declared is None:
+        status, reason = "MISSING", "MISSING_EXPLICIT_BYTE_BUDGET"
+    elif not isinstance(declared, int) or isinstance(declared, bool) or declared <= 0:
+        status, reason = "INVALID", "INVALID_CAPABILITY_BYTE_BUDGET"
+    elif requested is not None and (
+            not isinstance(requested, int) or isinstance(requested, bool) or requested <= 0):
+        status, reason = "INVALID", "INVALID_BUDGET_OVERRIDE"
+    elif requested is not None and requested > declared:
+        status, reason = "INVALID", "BUDGET_OVERRIDE_EXCEEDS_CAPABILITY_MAX"
+    else:
+        effective = declared if requested is None else requested
+        source = "CAPABILITY_DECLARATION" if requested is None else "JOB_CONTEXT_REQUEST"
+    observed = manifest.get("observed", {})
+    declaration = observed.get("declaration", {})
+    return {
+        "unit": "UTF8_MATERIALIZED_PAYLOAD_BYTES",
+        "declared_max_text_bytes": declared,
+        "requested_max_text_bytes": requested,
+        "effective_max_text_bytes": effective,
+        "budget_source": source,
+        "validation_status": status,
+        "reason": reason,
+        "provenance": {
+            "declaration_path": declaration.get("path"),
+            "declaration_sha256": declaration.get("raw_sha256"),
+            "source_context_manifest_sha256": manifest.get("lifecycle", {}).get("manifest_sha256"),
+        },
+    }
+
+
 def _reason(category: str, disposition: str, rule: str, count: int) -> dict:
     return {"category": category, "disposition": disposition, "rule": rule, "count": count}
 
@@ -497,20 +536,15 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
     }
     payload_bytes = sum(x.get("size", 0) for x in observed_by_path.values()
                         if any(s["source_ref"] == x.get("path") for s in sources))
-    budget = request.get("max_text_bytes")
-    if budget is not None and (not isinstance(budget, int) or isinstance(budget, bool) or budget < 0):
-        body["unresolved_items"].append({"code": "INVALID_SIZE_BUDGET"})
-        body["selection_status"] = "UNVERIFIABLE"
-    elif budget is not None and payload_bytes > budget:
-        body["expansion_requirements"].append(_expansion(
-            reason="SIZE_BUDGET_CANNOT_TRUNCATE_REQUIRED_AUTHORITY",
-            requirement="REQUIRED_BEFORE_REVIEW", authority_class="authoritative"))
-        if body["selection_status"] == "READY_BOUNDED":
-            body["selection_status"] = "NEEDS_RECONCILIATION"
+    budget_contract = _budget_contract(config, request, stored_manifest)
+    body["budget_contract"] = budget_contract
     body["size"] = {"source_ref_count": len(sources), "evidence_ref_count": len(evidence_refs),
                     "file_hash_count": len(body["included_hashes"]["sources"]) + len(body["included_hashes"]["evidence_files"]),
                     "estimated_textual_payload_bytes": payload_bytes,
-                     "configured_max_text_bytes": budget}
+                    "declared_max_text_bytes": budget_contract["declared_max_text_bytes"],
+                    "requested_max_text_bytes": budget_contract["requested_max_text_bytes"],
+                    "effective_max_text_bytes": budget_contract["effective_max_text_bytes"],
+                    "configured_max_text_bytes": budget_contract["effective_max_text_bytes"]}
     required_expansions = [x for x in body["expansion_requirements"]
                            if x["requirement"] == "REQUIRED_BEFORE_REVIEW"]
     optional_expansions = [x for x in body["expansion_requirements"]
@@ -538,6 +572,12 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
               "optional_candidate_count": len(optional_candidates),
               "omitted_irrelevant_count": len(omitted_evidence),
               "reason_code_counts": result["diagnostics"]["expansion_reason_code_counts"],
+              "declared_max_text_bytes": budget_contract["declared_max_text_bytes"],
+              "requested_max_text_bytes": budget_contract["requested_max_text_bytes"],
+              "effective_max_text_bytes": budget_contract["effective_max_text_bytes"],
+              "budget_source": budget_contract["budget_source"],
+              "budget_status": budget_contract["validation_status"],
+              "budget_reason": budget_contract["reason"],
               "bytes": len(canonical(result))}
     return result, report
 

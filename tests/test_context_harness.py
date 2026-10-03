@@ -114,6 +114,9 @@ class ContextHarnessTests(unittest.TestCase):
         self.assertTrue(result["would_block"])
         self.assertTrue((self.root / result["report_path"]).is_file())
         self.assertEqual(session["pre"]["approved_semantics"], {})
+        self.assertEqual(result["evidence_index"]["status"], "READY")
+        self.assertTrue((self.root / result["evidence_index"]["report_path"]).is_file())
+        self.assertNotIn("prompt", result["evidence_index"])
 
 
 if __name__ == "__main__":

@@ -62,7 +62,7 @@ from notion_client import (
     fetch_instruction,
 )
 from operational_logging import configure_logging
-from context_harness import begin_shadow, finish_shadow
+from context_harness import begin_shadow, finish_shadow, refresh_evidence_index
 
 logger = logging.getLogger(__name__)
 
@@ -673,6 +673,8 @@ def build_result(
         response["runtime_diagnostics"] = runtime_diagnostics
     if context is not None:
         response["context"] = context
+        if context.get("evidence_index") is not None:
+            response["evidence_index"] = context["evidence_index"]
     if artifact_result is not None:
         (
             summary,
@@ -705,6 +707,17 @@ def build_result(
             "instruction_sha256"
         ] = job.prompt_sha256
     return response
+
+
+def _evidence_roots(workspace):
+    roots = []
+    if workspace.get("review_evidence_root"):
+        roots.append({"path": workspace["review_evidence_root"], "kind": "review",
+                      "manifest_name": "review-manifest.json"})
+    if workspace.get("job_evidence_root"):
+        roots.append({"path": workspace["job_evidence_root"], "kind": "historical_job",
+                      "manifest_name": "job-evidence-manifest.json"})
+    return roots
 
 
 def publish_slack_result(log_dir, say, response):
@@ -789,6 +802,7 @@ def execute_job(job, say):
     context_session = begin_shadow(
         workdir, workspace=job.workspace, actor=job.actor, mode=job.mode,
         cache_root=Path(__file__).parent / "logs",
+        evidence_roots=_evidence_roots(workspace),
     )
 
     try:
@@ -973,6 +987,7 @@ def execute_claude_review(job, say):
         context_session = begin_shadow(
             canonical, workspace=job.workspace, actor=job.actor, mode=job.mode,
             cache_root=Path(__file__).parent / "logs",
+            evidence_roots=_evidence_roots(workspace),
         )
         review = create_review_workspace(canonical, job.job_id)
 
@@ -1116,6 +1131,13 @@ def execute_claude_review(job, say):
                 logger.exception("REVIEW EVIDENCE ADOPTION FAILED: job_id=%s", job.job_id)
                 review_evidence = failed_review_evidence(exc)
         response["review_evidence"] = review_evidence
+        # Adoption precedes this refresh so the current canonical package is
+        # visible.  Index failure is diagnostic-only in Phase 2A.
+        evidence_index = refresh_evidence_index(canonical, context_session)
+        if evidence_index is not None:
+            response["evidence_index"] = evidence_index
+            if context is not None:
+                context["evidence_index"] = evidence_index
     except Exception as exc:
         status = "FAILED"
         failure_class = "RESULT_ASSEMBLY_FAILED"

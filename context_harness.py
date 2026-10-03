@@ -11,6 +11,8 @@ import os
 import subprocess
 from pathlib import Path, PurePosixPath
 
+from evidence_index import generate as generate_evidence_index
+
 
 SCHEMA_VERSION = 1
 BUILDER_VERSION = "context-harness-phase1-1"
@@ -293,7 +295,7 @@ def load_trusted_baseline(cache_root: str | Path, workspace: str,
 
 
 def begin_shadow(root: str | Path, *, workspace: str, actor: str, mode: str,
-                 cache_root: str | Path) -> dict | None:
+                 cache_root: str | Path, evidence_roots: list[dict] | None = None) -> dict | None:
     declaration, _, declaration_errors = load_declaration(root)
     if declaration is None:
         # Absence means not enabled.  A present but invalid declaration is visible.
@@ -312,7 +314,26 @@ def begin_shadow(root: str | Path, *, workspace: str, actor: str, mode: str,
         pre = None
         errors.append(f"PRE_OBSERVATION_FAILED: {exc}")
     return {"capability": capability, "pre": pre, "baseline": baseline,
-            "errors": errors, "cache_root": str(cache_root), "workspace": workspace}
+            "errors": errors, "cache_root": str(cache_root), "workspace": workspace,
+            "evidence_roots": evidence_roots or [], "declaration": declaration}
+
+
+def refresh_evidence_index(root: str | Path, session: dict | None) -> dict | None:
+    """Generate the comparison-only Phase-2A projection for an active capability."""
+    if not session or not session.get("capability"):
+        return None
+    declaration = session.get("declaration") or {}
+    capability = session["capability"]
+    config = declaration.get("capabilities", {}).get(capability, {})
+    cache_key = hashlib.sha256(
+        f"{session['workspace']}\0{capability}".encode("utf-8")).hexdigest()
+    return generate_evidence_index(
+        root, workspace=session["workspace"], capability=capability,
+        source_roots=session.get("evidence_roots", []),
+        declared_sources=config.get("sources", []),
+        generated_root=declaration.get("generated_root", "validation/context"),
+        cache_path=Path(session["cache_root"]) / "evidence-index" / f"{cache_key}.json",
+    )
 
 
 def finish_shadow(root: str | Path, session: dict | None, *, job_id: str) -> dict | None:
@@ -352,13 +373,15 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str) -> dic
         temp = cache.with_suffix(".tmp")
         temp.write_bytes(_canonical(current))
         os.replace(temp, cache)
+        evidence_index = refresh_evidence_index(root, session)
         return {"mode": "SHADOW", "capability": capability,
                 "manifest_sha256": current["lifecycle"]["manifest_sha256"],
                 "previous_manifest_sha256": current["lifecycle"]["previous_context_hash"],
                 "delta_status": report["delta_status"],
                 "would_block": report["would_block"], "manifest_path": manifest_path,
                 "report_path": report_path, "changed_sources": report["changed_sources"],
-                "unverifiable_reasons": report["unverifiable_reasons"]}
+                "unverifiable_reasons": report["unverifiable_reasons"],
+                "evidence_index": evidence_index}
     except Exception as exc:
         return {"mode": "SHADOW", "capability": capability,
                 "manifest_sha256": None, "previous_manifest_sha256": None,

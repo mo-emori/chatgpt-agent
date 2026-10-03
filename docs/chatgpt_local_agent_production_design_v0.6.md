@@ -504,7 +504,34 @@ Actor-editableな `.agent/context.json` から設定または変更できない�
 authorityを変更するdecisionはHumanへescalateする。LLM outputだけでapproved semanticsをmutationしてはならず、
 Human/ChatGPTのdecisionとWorkerが検証できる更新経路を経ない自動変更は認めない。
 
-### 7.5 Differential context / reviewへの段階移行（PLANNED / NOT_IMPLEMENTED）
+### 7.5 Evidence Indexer（PHASE 2A / IMPLEMENTED_BASELINE）
+
+Phase 2Aはcanonical normalized evidenceを検索可能な決定的Evidence Indexへ投影する。入力はconfigured
+Review Evidence Adoption package（`worker-review-evidence`）、Cross-JOB Historical Job Evidence Adoption package
+（`worker-job-evidence`）、およびworkspace declarationが `canonical_evidence: true` と明示したcanonical
+machine-readable Result Manifestだけである。raw Local Agent transcript/log、Slack単体、任意のprose fileはsource discovery
+対象にしない。Slackは既存historical package内の `CORROBORATIVE_ONLY` provenanceとしてのみ保持する。
+
+index schemaは `context-harness-evidence-index` version 1であり、entry identity/type、JOB/actor/mode/workspace/capability、
+JOB/failure/artifact status、package path/hash、git head、instruction provenance、review boundary/actor execution、
+structured finding/verdict/relationship、trust class、source file raw SHA-256をnullable fieldとして保持する。構造化されていない
+値をproseから推測しない。qualityは `STRUCTURED`（semantic fieldsを含むmachine-readable evidence）、`PARTIAL`
+（optional relationship/finding等が未提供）、`UNSTRUCTURED`（canonical packageは存在するがreview semanticsがproseのみ）である。
+
+canonical indexはUTF-8 canonical JSON（sorted keys、compact separators、LF suffix）で、timestamp、cache hit count、生成時刻を
+hash materialに含めない。同一source bytes/setは同一index SHA-256となる。workspace外のpath/traversal/ADS、symlink/reparse、
+malformed JSON、package reference hash mismatchは明示的 `FAILED` diagnosticとし、`NO_IMPACT` と呼ばない。cacheはWorkerの
+`logs/evidence-index/` にindexとは分離して置き、path/source hash/entryを保持する。unchanged manifestはreferenced bytesを
+再検証した上でparseをreuseし、addition/removal/replacementをreportする。
+
+generated canonical index/reportは `.agent/context.json` の `generated_root` 配下
+`<capability>/evidence-index.json` / `evidence-index-report.json` に置く。Result Manifestへはadditive optional
+`evidence_index` diagnostic（schema/status/quality counts/entry/source/reuse/change count/index hash/report path）を出す。
+これはcomparison-onlyであり、qualityやbuild failureだけでJOB status、review verdict、Actor prompt、context visibilityを変更しない。
+failed actor execution（429/session limitを含む）はreview verdictではなくexecution failureとしてindexし、入力に古い
+`review_verdict` があってもfailed executionでは公開しない。generated indexはContract/ADR authorityではない。
+
+### 7.6 Differential context / reviewへの段階移行（PHASE 2B/3 PLANNED / NOT_IMPLEMENTED）
 
 移行は一度にActorの読取りを狭めず、次の段階で行う。
 
@@ -514,16 +541,16 @@ Human/ChatGPTのdecisionとWorkerが検証できる更新経路を経ない自�
 4. **Differential-review:** 通常reviewは主にdelta packageを使い、必要時にboundaryまたはfull scopeへexpandする。
 5. **Full Review:** critical、closure、authority-changing、security/boundary-sensitiveなcaseでは常に選択可能とし、必要な全範囲を確認する。
 
-Phase 2/3の設計方向は、declared referenceを越えてevidenceを検索可能にする **Evidence Indexer** と、
-JOB・capability・actor/modeに応じてbounded packageを組み立てる **Job Context Slicer** である。
-これらの具体化はcompleted design job `LOCAL-AGENT-CONTEXT-HARNESS-PHASE23-DESIGN-20261003-001`
-の範囲を越えて本書で発明しない。
+Phase 2A Evidence Indexerは実装済みである。次段階はJOB・capability・actor/modeに応じてbounded packageを
+組み立てる **Job Context Slicer** と **Review Delta Package** である。設計authorityはcompleted design job
+`LOCAL-AGENT-CONTEXT-HARNESS-PHASE23-DESIGN-20261003-001` とし、その範囲を越えて本書で発明しない。
 
-**NOT IMPLEMENTED:** Job Context Slicer、prompt reduction/injection、declared file referenceを越えるEvidence Indexer、
-Review Delta Package、`DELTA_REVIEW` / `BOUNDARY_REVIEW` / `FULL_REVIEW` routing、LLM reconciliationのruntime接続、
+**NOT IMPLEMENTED:** Job Context Slicer、prompt reduction/injection、Actorによる `context_ref` / `job_context_ref` /
+`review_package_ref` consumption、package-first Claude invocation、Review Delta Package、`DELTA_REVIEW` /
+`BOUNDARY_REVIEW` execution、LLM reconciliationのruntime接続、
 automatic `approved_semantics` mutation、Actorのsupplemental repository read禁止。
 
-### 7.6 Lease and ARGUS PoC（IMPLEMENTED_BASELINE）
+### 7.7 Lease and ARGUS PoC（IMPLEMENTED_BASELINE）
 
 normal dispatchと `HISTORICAL_MANUAL` adoptionはcross-process SQLite workspace leaseを共有する。
 manual adoptionはscanとraceせず `WORKSPACE_BUSY` で失敗する。ARGUS PoC declarationはcross-workspace installされていない。

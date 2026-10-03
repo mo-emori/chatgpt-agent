@@ -15,6 +15,7 @@ from evidence_index import generate as generate_evidence_index
 from job_context import generate as generate_job_context
 from context_materializer import generate as generate_materialized_context
 from review_package import generate as generate_review_package
+from section_slicing import validate_contract as validate_section_contract
 
 
 SCHEMA_VERSION = 1
@@ -120,6 +121,7 @@ def _validate_source_mappings(config: dict, capability: str = "") -> None:
         if (authority == "authoritative" and spec.get("always_required") is False and
                 "glob" in spec):
             raise ValueError(f"conditional authority requires a stable path reference: {ref}")
+        validate_section_contract(spec, ref)
     known = set(refs)
     referenced = set()
     for spec, ref in zip(sources, refs):
@@ -161,6 +163,9 @@ def _file_fact(root: Path, rel: str, spec: dict) -> tuple[dict, str | None]:
         "target_files": sorted(set(spec.get("target_files", []))),
         "depends_on": sorted(set(spec.get("depends_on", []))),
     }
+    if spec.get("sections") is not None:
+        fact["section_coverage"] = spec.get("section_coverage")
+        fact["sections"] = spec["sections"]
     try:
         if not target.exists():
             fact.update({"exists": False, "type": "missing", "raw_sha256": None})

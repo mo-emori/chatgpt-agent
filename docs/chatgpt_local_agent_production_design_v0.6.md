@@ -670,6 +670,45 @@ authorityであり、既知のsilent omissionはない。現行ARGUS declaration
 追加し、missing/ambiguous requestを解消するenrichmentと承認が必要である。Phase 2B/2Cはいずれも引き続き
 `COMPARISON_ONLY` で、actor input activationは行わない。
 
+#### 7.7.1 Authoritative section slicing v1（IMPLEMENTED_COMPARISON_ONLY）
+
+Phase 2B.1がauthoritative source全体を選択した後に限り、v1 section slicerはそのsource内の宣言済みoriginal-byte rangeへ
+第二段階のrefinementを行える。これは独立authorityの生成ではない。親source pathと親raw SHA-256がauthority identityであり、
+sectionは親にprovenance-boundされたsubrangeである。materialized resultは引き続きactor inputへ接続しない。
+
+source schemaは `section_coverage: "COMPLETE_MAPPED"` と非空の `sections` を同時に要求する。各sectionは一意で安定した
+`section_id`、`boundary`、明示的な `context_items: []`、`target_files: []`、`depends_on: []`、および省略時falseの
+`always_required` を持つ。`boundary` は通常
+`{"kind":"heading","heading":"exact text","level":1..6,"occurrence":positive integer (optional)}` であり、
+明示的preambleだけは `{"kind":"preamble"}` とする。source glob、未知section dependency、重複section ID、未知boundary field、
+不正pathはdeclaration validationで拒否する。`section_coverage` は宣言者による完全mappingの明示契約であり、section hintsから
+completenessを推論しない。
+
+Markdown heading resolverはUTF-8 raw bytes上でATX heading lineを構造認識する。指定levelとheading textが完全一致するheadingの
+先頭byteから、次の同levelまたは上位level headingの直前byteまでをsectionとするため、下位headingは親sectionに含まれる。
+`occurrence` がなければ複数一致は `SECTION_BOUNDARY_AMBIGUOUS`、一致なしは `SECTION_BOUNDARY_MISSING` である。
+`occurrence` は1-originであり、同名headingを決定的に識別する。preambleはbyte 0から最初のheading直前まで（headingがなければEOF）
+である。CRLFを含むnewlineと全UTF-8 bytesを変換せず保持し、offsetはcharacterではなくUTF-8 byte offsetである。crossing overlapは
+`SECTION_OVERLAP_INVALID`、nested/equal selected rangeはmaterialization時にunionしてpayload重複を除く。隣接rangeは結合しない。
+
+selectionは `always_required ∪ context_item match ∪ target_file match ∪ depends_on transitive closure` であり、親source declaration順、
+次いでresolved byte range順に決定する。Jobはsection IDを供給できず、宣言外sectionを作れない。要求されたcontext item/target fileに
+未mappingがある、空requestにsafe base（少なくともalways-required section）がない、coverage契約が完全でない、boundaryが
+missing/ambiguous、またはsourceがUTF-8 Markdownとしてsupportされない場合は部分payloadを一切出さず、検証済み親whole fileへ
+fail closedする。diagnosticは `SECTION_COVERAGE_INCOMPLETE` / `SECTION_SLICING_UNSUPPORTED_SOURCE` 等を残す。
+
+各sliced authority refは `parent_source_path`、`parent_source_sha256`、`section_id`、boundary identity、resolved
+`start_byte` / `end_byte`、`slice_sha256`、exact Base64 `slice_payload`、`context_items`、`selection_reasons`、coverage statusを保持する。
+これらはJob Context/package identityへ入る。materializerは親hash、offset、slice hash、payloadを再検証し、不一致を
+`SECTION_PROVENANCE_MISMATCH` として全authority materializationをfail closedする。wrapper metadataはsource payload byte数に含めず、
+Phase 2Dの `UTF8_MATERIALIZED_PAYLOAD_BYTES` はmerge後のactual slice bytesと既存evidence payload bytesだけを数える。truncateはしない。
+
+親authoritative sourceのraw hash changeは、未選択sectionだけの変更に見えても従来どおり
+`POTENTIAL_AUTHORITY_CHANGE` / reconciliationを要求する。v1はslice-level change safetyを主張せずPhase 1を弱めない。
+Shadow measurementは `whole_file_bytes`、union後 `selected_slice_bytes`、`avoided_bytes`、selected section count/IDs、source別coverage
+statusを公開する。sectionsを持たないlegacy declarationのauthority selection、whole-file payload、budget precedence、exact-fit、
+over-budget、supplied `DELTA_REVIEW` bypassは変更しない。
+
 ### 7.8 Lease and ARGUS PoC（IMPLEMENTED_BASELINE）
 
 normal dispatchと `HISTORICAL_MANUAL` adoptionはcross-process SQLite workspace leaseを共有する。

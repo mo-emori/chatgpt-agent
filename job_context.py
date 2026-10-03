@@ -8,7 +8,11 @@ from __future__ import annotations
 import hashlib
 import json
 import stat
+import base64
 from pathlib import Path, PurePosixPath
+
+from section_slicing import (merge_selected, select as select_sections,
+                             validate_contract as validate_section_contract)
 
 
 SCHEMA = "context-harness-job-context"
@@ -214,6 +218,7 @@ def _selector_contract(config: dict) -> dict:
         conditional = authority == "authoritative" and spec.get("always_required") is False
         if conditional and "glob" in spec:
             raise ValueError(f"conditional authority requires a stable path reference: {ref}")
+        validate_section_contract(spec, ref)
         result.append({"source_ref": ref, "authority": authority,
                        "always_required": authority == "authoritative" and bool(spec.get("always_required", True)),
                        **fields})
@@ -289,7 +294,8 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
     observed_by_path = {x.get("path"): x for x in stored_manifest.get("observed", {}).get("sources", [])}
     protected = sorted(set(_strings(config.get("protected_paths"), "protected_paths") +
                            _strings(config.get("forbidden_paths"), "forbidden_paths")))
-    specs = sorted(config.get("sources", []), key=lambda x: (x.get("path", x.get("glob", "")), x.get("kind", "")))
+    declared_specs = config.get("sources", [])
+    specs = sorted(declared_specs, key=lambda x: (x.get("path", x.get("glob", "")), x.get("kind", "")))
     spec_by_ref = {}
     for spec in specs:
         try:
@@ -386,10 +392,31 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
         if relevant:
             for fact in matches:
                 reasons = sorted(selected_reasons.get(spec_ref) or {"EXPLICIT_DEPENDENCY_OR_TARGET"})
-                sources.append({"source_ref": fact.get("path"), "kind": fact.get("kind"),
+                source_ref = {"source_ref": fact.get("path"), "kind": fact.get("kind"),
                                 "authority": fact.get("authority"), "raw_sha256": fact.get("raw_sha256"),
                                 "context_items": fact.get("context_items", []),
-                                "reason": reasons[0], "reason_codes": reasons})
+                                "reason": reasons[0], "reason_codes": reasons}
+                if authoritative and spec.get("sections"):
+                    raw = safe_file(root, fact["path"]).read_bytes()
+                    section_result = select_sections(spec, raw,
+                        context_items=request["context_items"], target_files=request["target_files"])
+                    merged_ranges = (merge_selected(section_result["sections"], raw)
+                                     if section_result["coverage_status"] == "COMPLETE_MAPPED" else [])
+                    source_ref.update({
+                        "parent_source_path": fact["path"],
+                        "parent_source_sha256": fact.get("raw_sha256"),
+                        "section_coverage_status": section_result["coverage_status"],
+                        "section_diagnostics": section_result["diagnostics"],
+                        "whole_file_bytes": len(raw),
+                        "selected_sections": section_result["sections"],
+                        "selected_section_ids": [x["section_id"] for x in section_result["sections"]],
+                        "selected_slice_bytes": sum(x["end_byte"] - x["start_byte"]
+                                                    for x in merged_ranges),
+                        "source_declaration_order": declared_specs.index(spec),
+                    })
+                    source_ref["avoided_bytes"] = (len(raw) - source_ref["selected_slice_bytes"]
+                        if section_result["coverage_status"] == "COMPLETE_MAPPED" else 0)
+                sources.append(source_ref)
                 for item in fact.get("context_items", []):
                     dependency_states.append({"context_item": item, "source_ref": fact.get("path"),
                                               "state": "CHANGED" if fact.get("path") in changed else "CURRENT"})

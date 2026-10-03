@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 
 from job_context import canonical, safe_file, safe_relative, sha256
+from section_slicing import COMPLETE, merge_selected
 
 
 SCHEMA = "context-harness-materialized-context"
@@ -62,6 +63,9 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
     budget_reason = budget_contract.get("reason")
     required_payload_bytes = 0
     over_budget_bytes = 0
+    whole_file_bytes = selected_authority_bytes = 0
+    selected_section_ids = []
+    section_coverage = []
     try:
         stored_job, job_raw = _verified_json(root, job_context_path)
         stored_index, index_raw = _verified_json(root, evidence_index_path)
@@ -80,11 +84,14 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
             raise ValueError("Evidence Index chain mismatch")
         entries = {x.get("evidence_id"): x for x in evidence_index.get("entries", [])}
         candidates = []
-        for ref in job_context.get("authoritative_source_refs", []):
+        authority_refs = sorted(job_context.get("authoritative_source_refs", []),
+            key=lambda x: (x.get("source_declaration_order", 10**9), x.get("source_ref", "")))
+        for ref in authority_refs:
             rel = safe_relative(ref["source_ref"])
             if _protected(rel, job_context.get("boundaries", {})):
                 raise ValueError(f"selected source crosses protected/forbidden boundary: {rel}")
             raw = safe_file(root, rel).read_bytes()
+            whole_file_bytes += len(raw)
             if sha256(raw) != ref.get("raw_sha256"):
                 raise ValueError(f"hash mismatch: {rel}")
             try:
@@ -99,11 +106,46 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
                     "origin": "MATERIALIZER", "suggested_scope": [rel]})
                 status = "NEEDS_EXPANSION"
                 continue
-            candidates.append({"source_ref": rel, "evidence_ref": None,
-                "authority_class": ref.get("authority") or "authoritative", "trust_class": ["DECLARED_AUTHORITY"],
-                "quality": None, "source_sha256": sha256(raw), "content_sha256": sha256(raw),
-                "content_encoding": "base64", "content_type": "text/plain; charset=utf-8",
-                "byte_count": len(raw), "content": base64.b64encode(raw).decode("ascii")})
+            if ref.get("section_coverage_status") == COMPLETE:
+                verified = []
+                for section in ref.get("selected_sections", []):
+                    start, end = section.get("start_byte"), section.get("end_byte")
+                    if (not isinstance(start, int) or not isinstance(end, int) or
+                            start < 0 or end < start or end > len(raw)):
+                        raise ValueError(f"SECTION_PROVENANCE_MISMATCH: {rel}")
+                    payload = raw[start:end]
+                    if (sha256(payload) != section.get("slice_sha256") or
+                            base64.b64encode(payload).decode("ascii") != section.get("slice_payload")):
+                        raise ValueError(f"SECTION_PROVENANCE_MISMATCH: {rel}#{section.get('section_id')}")
+                    verified.append(section)
+                for merged in merge_selected(verified, raw):
+                    payload = raw[merged["start_byte"]:merged["end_byte"]]
+                    selected_authority_bytes += len(payload)
+                    selected_section_ids.extend(merged["section_ids"])
+                    candidates.append({"source_ref": rel, "parent_source_path": rel,
+                        "parent_source_sha256": sha256(raw), "evidence_ref": None,
+                        "section_ids": merged["section_ids"], "boundaries": merged["boundaries"],
+                        "resolved_start_byte": merged["start_byte"], "resolved_end_byte": merged["end_byte"],
+                        "slice_sha256": merged["slice_sha256"], "context_items": merged["context_items"],
+                        "selection_reasons": merged["selection_reasons"], "coverage_status": COMPLETE,
+                        "authority_class": ref.get("authority") or "authoritative",
+                        "trust_class": ["DECLARED_AUTHORITY"], "quality": None,
+                        "source_sha256": sha256(raw), "content_sha256": sha256(payload),
+                        "content_encoding": "base64", "content_type": "text/plain; charset=utf-8",
+                        "byte_count": len(payload), "content": base64.b64encode(payload).decode("ascii")})
+            else:
+                selected_authority_bytes += len(raw)
+                diagnostics.extend(ref.get("section_diagnostics", []))
+                candidates.append({"source_ref": rel, "evidence_ref": None,
+                    "authority_class": ref.get("authority") or "authoritative", "trust_class": ["DECLARED_AUTHORITY"],
+                    "quality": None, "source_sha256": sha256(raw), "content_sha256": sha256(raw),
+                    "content_encoding": "base64", "content_type": "text/plain; charset=utf-8",
+                    "byte_count": len(raw), "content": base64.b64encode(raw).decode("ascii"),
+                    **({"coverage_status": ref.get("section_coverage_status"),
+                        "section_diagnostics": ref.get("section_diagnostics", [])}
+                       if ref.get("section_coverage_status") else {})})
+            section_coverage.append({"source_ref": rel,
+                "status": ref.get("section_coverage_status", "WHOLE_FILE")})
         for ref in job_context.get("evidence_refs", []):
             entry = entries.get(ref.get("evidence_id"))
             if entry is None or entry.get("evidence_path") != ref.get("evidence_path"):
@@ -159,7 +201,8 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
                             "known_bytes": None, "reason": "IRRELEVANT_PHASE_2B_OMISSION"})
     except Exception as exc:
         status, job_raw, index_raw = "UNVERIFIABLE", b"", b""
-        diagnostics.append({"code": "MATERIALIZATION_INPUT_UNVERIFIABLE", "detail": str(exc)[:1000]})
+        code = "SECTION_PROVENANCE_MISMATCH" if "SECTION_PROVENANCE_MISMATCH" in str(exc) else "MATERIALIZATION_INPUT_UNVERIFIABLE"
+        diagnostics.append({"code": code, "detail": str(exc)[:1000]})
         items = []
     counts = {}
     for item in items:
@@ -189,7 +232,13 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
             "over_budget_bytes": over_budget_bytes,
             "omitted_bytes_known": sum(x.get("known_bytes") or 0 for x in omitted),
             "materialized_item_count": len(items), "omitted_item_count": len(omitted),
-            "item_counts_by_authority_quality": dict(sorted(counts.items()))},
+            "item_counts_by_authority_quality": dict(sorted(counts.items())),
+            "whole_file_bytes": whole_file_bytes,
+            "selected_slice_bytes": selected_authority_bytes,
+            "avoided_bytes": whole_file_bytes - selected_authority_bytes,
+            "selected_section_count": len(selected_section_ids),
+            "selected_section_ids": selected_section_ids,
+            "section_coverage": section_coverage},
         "diagnostics": diagnostics}
     identity = sha256(canonical(body))
     result = dict(body); result["materialized_context_sha256"] = identity
@@ -205,6 +254,12 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
               "budget_source": budget_source,
               "required_payload_bytes": required_payload_bytes,
               "over_budget_bytes": over_budget_bytes,
+              "whole_file_bytes": body["measurement"]["whole_file_bytes"],
+              "selected_slice_bytes": body["measurement"]["selected_slice_bytes"],
+              "avoided_bytes": body["measurement"]["avoided_bytes"],
+              "selected_section_count": body["measurement"]["selected_section_count"],
+              "selected_section_ids": body["measurement"]["selected_section_ids"],
+              "section_coverage": body["measurement"]["section_coverage"],
               "reason": budget_reason,
               "diagnostics": diagnostics}
     return result, report

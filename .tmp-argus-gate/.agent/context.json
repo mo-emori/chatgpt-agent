@@ -1,0 +1,51 @@
+{
+  "capabilities": {
+    "RUNTIME-BOOTSTRAP-ORCHESTRATOR": {
+      "label": "Contract design in progress",
+      "selectors": {
+        "actors": ["codex", "claude"],
+        "modes": ["implementation", "review"]
+      },
+      "sources": [
+        {
+          "authority": "authoritative",
+          "context_items": ["bootstrap-contract"],
+          "kind": "contract",
+          "path": "docs/contracts/argus_runtime_bootstrap_orchestrator_contract_v0.1.md",
+          "required": true
+        },
+        {
+          "authority": "authoritative",
+          "context_items": ["adr-009"],
+          "kind": "adr",
+          "path": "docs/adr/argus_architecture_decision_records_v0.1.md",
+          "required": true
+        },
+        {
+          "authority": "authoritative",
+          "context_items": ["capability-state", "dependency-status"],
+          "kind": "registry",
+          "path": "docs/development/argus_capability_registry.md",
+          "required": true
+        },
+        {
+          "authority": "authoritative",
+          "context_items": ["design-source-reference"],
+          "kind": "design",
+          "path": "docs/source/argus_design_source_v0.1.md",
+          "required": true
+        },
+        {
+          "authority": "non_authority",
+          "context_items": ["adopted-review-evidence"],
+          "kind": "evidence",
+          "path": "validation/evidence/external-review/ARGUS-BOOTSTRAP-CONTRACT-V01-REVIEW-RETRY-20261003-001/review-manifest.json",
+          "required": false
+        }
+      ]
+    }
+  },
+  "generated_root": "validation/context",
+  "mode": "SHADOW",
+  "schema_version": 1
+}

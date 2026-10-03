@@ -124,7 +124,10 @@ def _structured_findings(value: dict):
     for finding in findings:
         if not isinstance(finding, dict) or not isinstance(finding.get("finding_id"), str):
             raise ValueError("structured findings require finding_id")
-        result.append({"finding_id": finding["finding_id"], "status": finding.get("status")})
+        result.append({key: finding.get(key) for key in (
+            "finding_id", "status", "severity", "category", "summary", "title",
+            "affected_paths", "authority_refs", "evidence_refs", "predecessor",
+            "disposition", "recommendation", "trust_class") if finding.get(key) is not None})
     return sorted(result, key=lambda item: (item["finding_id"], str(item["status"])))
 
 
@@ -163,36 +166,103 @@ def _verified_files(root: Path, manifest_rel: str, manifest: dict,
     return sorted(facts, key=lambda item: item["path"]), content
 
 
+def _review_contract(manifest: dict, content: dict[str, bytes], rel: str) -> str:
+    """Validate the mutually exclusive LIVE and historical review package shapes."""
+    adoption = manifest.get("adoption")
+    mode = adoption.get("mode") if isinstance(adoption, dict) else None
+    if mode == "HISTORICAL_MANUAL":
+        if adoption.get("human_approved") is not True:
+            raise ValueError(f"historical review lacks human approval: {rel}")
+        if "review-execution.json" in content:
+            raise ValueError(f"historical review must not normalize local execution: {rel}")
+        if set(content) != {"review-decision.json"}:
+            raise ValueError(f"invalid historical normalized file set: {rel}")
+        if manifest.get("actor_status") != "DONE":
+            raise ValueError(f"historical source completion not validated: {rel}")
+        provenance = manifest.get("source_provenance")
+        raw = manifest.get("raw_local_only")
+        if (not isinstance(provenance, dict)
+                or provenance.get("source_job_id") != manifest.get("job_id")
+                or provenance.get("source_storage") != "LOCAL_ONLY_NOT_COPIED"
+                or not isinstance(provenance.get("source_sha256"), str)
+                or not isinstance(raw, list) or len(raw) != 1
+                or raw[0] != {"path": "review-execution.json",
+                              "sha256": provenance.get("source_sha256"),
+                              "storage": "LOCAL_ONLY"}):
+            raise ValueError(f"invalid historical source provenance: {rel}")
+        return "HISTORICAL_MANUAL"
+    if mode not in (None, "LIVE"):
+        raise ValueError(f"unsupported review adoption mode: {rel}")
+    if "review-execution.json" not in content:
+        raise ValueError(f"required normalized evidence missing: review-execution.json")
+    return "LIVE"
+
+
 def _index_review(root: Path, rel: str, raw: bytes, manifest: dict) -> dict:
     if manifest.get("schema") != "worker-review-evidence" or manifest.get("version") != 1:
         raise ValueError(f"unsupported review evidence schema: {rel}")
     entry = _base_entry(rel, _sha(raw), "review")
     files, content = _verified_files(root, rel, manifest, entry["manifest_sha256"],
                                      manifest.get("normalized_files", []))
-    execution = _load_json(content["review-execution.json"], "review-execution.json")
-    findings = _structured_findings(execution)
+    contract = _review_contract(manifest, content, rel)
+    execution = (_load_json(content["review-execution.json"], "review-execution.json")
+                 if contract == "LIVE" else None)
+    if execution is not None and not {"events", "final_result_text", "exit_code"}.issubset(execution):
+        raise ValueError("corrupt normalized evidence: review-execution.json")
+    decision = None
+    if "review-decision.json" in content:
+        from review_decision import validate
+        decision = validate(_load_json(content["review-decision.json"], "review-decision.json"),
+                            review_job_id=manifest.get("job_id"))
+        decision_ref = manifest.get("review_decision")
+        decision_sha = _sha(content["review-decision.json"])
+        if (not isinstance(decision_ref, dict)
+                or decision_ref.get("path") != "review-decision.json"
+                or decision_ref.get("sha256") != decision_sha
+                or decision_ref.get("finding_count") != len(decision["findings"])
+                or decision_ref.get("trust") != "ACTOR_REPORTED"):
+            raise ValueError(f"review decision manifest binding mismatch: {rel}")
+    if contract == "HISTORICAL_MANUAL":
+        if decision is None:
+            raise ValueError(f"historical review decision missing: {rel}")
+        provenance = decision.get("provenance")
+        source = manifest["source_provenance"]
+        if (provenance.get("normalization_mode") != "HISTORICAL_MANUAL"
+                or provenance.get("human_approved") is not True
+                or provenance.get("source_job_id") != manifest.get("job_id")
+                or provenance.get("source_file") != "review-execution.json"
+                or provenance.get("source_sha256") != source.get("source_sha256")):
+            raise ValueError(f"historical review decision provenance mismatch: {rel}")
+    findings = _structured_findings(decision) if decision is not None else None
     actor_status = manifest.get("actor_status")
-    failed = actor_status != "DONE" or execution.get("exit_code") not in (0, None)
-    verdict = execution.get("review_verdict") if not failed else None
+    failed = (actor_status != "DONE" or execution.get("exit_code") not in (0, None)) \
+        if execution is not None else False
+    verdict = decision.get("verdict") if decision is not None and not failed else None
     if verdict is not None and not isinstance(verdict, str):
         raise ValueError("review_verdict must be a string")
     entry.update({
         "job_id": manifest.get("job_id"), "actor": manifest.get("actor"),
         "mode": manifest.get("mode"), "canonical_head": manifest.get("canonical_head"),
+        "workspace": decision.get("workspace") if decision else None,
+        "capability": decision.get("capability") if decision else None,
         "head": _nullable(manifest.get("review"), "head_after"),
         "baseline_head": _nullable(manifest.get("review"), "head_before"),
-        "review_boundary": manifest.get("review_boundary"),
-        "actor_execution_status": actor_status, "review_verdict": verdict,
-        "findings": findings, "trust": ["WORKER_OBSERVED", "ACTOR_REPORTED"],
+        "review_boundary": manifest.get("review_boundary") if execution is not None else None,
+        "actor_execution_status": actor_status if execution is not None else None,
+        "review_verdict": verdict, "findings": findings,
+        "trust": (["WORKER_OBSERVED", "ACTOR_REPORTED"] if execution is not None
+                  else ["ACTOR_REPORTED", "HISTORICAL_MANUAL"]),
+        "review_of": (decision.get("review_of") or decision.get("target_job_id")) if decision else None,
         "source_files": files,
         "provenance": {"source": manifest.get("source_provenance"),
                        "adoption": manifest.get("adoption")},
+        "trust_limitation": manifest.get("trust_limitation"),
         "noncanonical_references": manifest.get("raw_local_only", []),
     })
     # A final prose result is not parsed into findings or a verdict.
-    if findings is not None and verdict is not None:
+    if decision is not None and findings is not None and verdict is not None and not failed:
         entry["quality"] = "STRUCTURED"
-    elif execution.get("final_result_text") and findings is None:
+    elif execution is not None and execution.get("final_result_text") and findings is None:
         entry["quality"] = "UNSTRUCTURED"
     else:
         entry["quality"] = "PARTIAL"

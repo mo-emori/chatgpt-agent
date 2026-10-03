@@ -10,6 +10,14 @@ from review_package import safe_path, validate_ref
 
 OUTCOMES = ("COMPLETE", "PACKAGE_INSUFFICIENT", "NEEDS_FULL_REVIEW")
 
+STRUCTURED_DECISION_CONTRACT = """
+In addition to the human-readable review, end with exactly one strict block:
+<REVIEW_DECISION>
+{"schema":"normalized-review-decision","schema_version":1,"review_job_id":"<current job id>","actor":"claude","workspace":"<workspace>","capability":"<capability when supplied>","review_mode":"<review mode>","review_of":"<target job when supplied>","target_job_id":"<target job when supplied>","verdict":"APPROVED|CHANGES_REQUESTED|COMMENTED|INCONCLUSIVE","package_sufficiency":"COMPLETE|PACKAGE_INSUFFICIENT|NEEDS_FULL_REVIEW when applicable","findings":[{"finding_id":"actor-supplied stable id","severity":"CRITICAL|HIGH|MODERATE|MEDIUM|MINOR|LOW|INFO when supplied","status":"OPEN|RESOLVED|ACCEPTED|REJECTED|DEFERRED|SUPERSEDED when explicit","summary":"...","affected_paths":[],"authority_refs":[],"evidence_refs":[],"trust_class":"ACTOR_REPORTED"}],"expansion_result":{},"actor_usage":{},"provenance":{},"trust_class":"ACTOR_REPORTED"}
+</REVIEW_DECISION>
+Do not invent finding IDs, status, severity, references, or relationships. Omit optional fields not established by the review.
+"""
+
 
 class PackageLaunchError(ValueError):
     pass
@@ -79,7 +87,8 @@ Do not mutate approved_semantics or reconcile authority. You may only analyze an
 End the review with a JSON object named REVIEW_CONTEXT containing outcome ({', '.join(OUTCOMES)}), expansions, and full_review_escalated=false. This invocation never authorizes full-repository fallback.
 
 Original independent-review instruction follows:
-{original_prompt or ''}"""
+{original_prompt or ''}
+{STRUCTURED_DECISION_CONTRACT}"""
 
 
 def _usage(raw: str) -> dict:

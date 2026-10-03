@@ -1177,6 +1177,40 @@ callback後のhost-side ACL inspectionでは、workspace root、`.git`、`baseli
 条件付きDrive upload、Slack Result、Browser callback成功・失敗終端系、busy state synchronization、
 およびBrowser停止時failure isolationを維持する。
 
+## 23. Structured Review Decision / Finding（IMPLEMENTED）
+
+Claude reviewはhuman-readable summaryに加え、末尾の単一`<REVIEW_DECISION>` JSON blockで
+`normalized-review-decision` schema version 1を返す。recordはreview JOB identity、actor、workspace、
+optional capability、review mode、review target/baseline/head/instruction/package hash、actor verdict、package
+sufficiency、findings、expansion result、actor usage、provenanceを保持する。Findingはactorが明示した場合だけ
+stable ID、severity/category、status、summary/title、workspace-relative affected/authority/evidence refs、
+predecessor、disposition/recommendationを保持する。欠落値をproseから推論しない。
+
+judgment、verdict、finding、dispositionのtrust classは常に`ACTOR_REPORTED`である。Workerが観測するのは
+process exit、boundary、bytes、hash、source JOB identity、schema validity、persistenceだけであり、structurally
+validであることはsubstantive correctnessを意味しない。malformed、duplicate ID、invalid enum、identity mismatch、
+unsafe refはdecisionをreject/quarantineするが、review execution自体が完了した場合はJOBを失敗させない。
+missing/rejected decisionはEvidence Indexで`PARTIAL`/`UNSTRUCTURED`のままとしfindingを作らない。429等の
+failed executionはvalid completed decisionがなければverdictにならない。
+
+LIVE Review Evidence Adoptionはvalidな`review-decision.json`だけをhash付きnormalized fileとして採用し、
+raw transcriptはlocal-onlyのままとする。Evidence Indexはexecution status（`WORKER_OBSERVED`）とdecision
+（`ACTOR_REPORTED`）を分離して投影する。Job ContextとReview Packageは`STRUCTURED` findingだけをexact IDで
+搬送し、自動resolveやprose extractionを行わない。
+
+historical reviewは一般的prose scraperを持たない。Human/ChatGPTがsource JOBとmapping JSONを明示し、
+`--historical-manual --human-approved`を与えた一回限りのadoptionだけを許可する。Workerはexact local
+`review-execution.json` hash、successful completion、mapped IDのliteral presence、schema/pathを検証し、
+source transcriptをcanonical repoへcopyしない。結果は`HISTORICAL_MANUAL`かつ`ACTOR_REPORTED`であり、
+`WORKER_OBSERVED`へ昇格しない。このhistorical manifestはhash検証対象の`review-decision.json`だけを
+`normalized_files`に持ち、source `review-execution.json`はhash/provenance付き`LOCAL_ONLY_NOT_COPIED`参照に
+留める。この明示的subtypeだけはcanonical execution fileを要求せず、Evidence Index上のexecution statusと
+boundaryをunknown (`null`) とする。LIVE manifestは引き続きhash検証可能な`review-execution.json`を必須とする。
+
+package-first移行はmeasurement限定である。`DELTA_REVIEW`はworkspace configの明示allowlistにあるcapability
+だけが使用でき、ARGUSでは`bootstrap-contract`と`RUNTIME-BOOTSTRAP-ORCHESTRATOR`だけを許可する。
+universal enableは行わず、通常/default/reference pathは引き続き`FULL_REVIEW`である。
+
 ### 17.4 Status summary
 
 > ChatGPTはControl Plane、Notionはv3 Instruction source / Control / Registry、SlackはCommand /

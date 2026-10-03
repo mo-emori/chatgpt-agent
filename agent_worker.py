@@ -6,12 +6,15 @@ from dataclasses import replace
 import threading
 import argparse
 import sys
+import copy
 from pathlib import Path
 
 from actors import run_agent
 from actors import claude
 from actors.claude_stream import parse_stream_json
-from review_invocation import PackageLaunchError, build_prompt as build_review_prompt, prepare as prepare_review_invocation, telemetry as review_telemetry
+from review_invocation import (PackageLaunchError, STRUCTURED_DECISION_CONTRACT,
+    build_prompt as build_review_prompt, prepare as prepare_review_invocation,
+    telemetry as review_telemetry)
 from actors.process_runner import ProcessResult
 from actors.review_workspace import (
     ReviewPreparationError, cleanup_review, create_review_workspace, diff_head_stat, finish_review,
@@ -44,7 +47,9 @@ from runtime_diagnostics import (
 from review_evidence import (
     adopt_review_evidence, failed_review_evidence, not_run_review_evidence,
 )
+from review_decision import parse_block
 from historical_job_evidence import adopt_historical_job_evidence
+from historical_review_decision import adopt_historical_review_decision
 from job_log import (
     create_job_log,
     get_attributable_changed_paths,
@@ -1017,9 +1022,18 @@ def execute_claude_review(job, say):
         save_text(log_dir, "canonical-diff-head-before.stat", review.canonical_diff_stat)
         save_text(log_dir, "review-diff-head-before.stat", review.review_diff_stat)
         try:
-            actor_job = job
+            actor_job = copy.copy(job)
+            structured_identity = json.dumps({
+                "review_job_id": job.job_id, "actor": job.actor,
+                "workspace": job.workspace,
+                "capability": (context_session or {}).get("capability"),
+                "review_mode": getattr(job, "review_mode", None) or "FULL_REVIEW",
+            }, ensure_ascii=False, sort_keys=True)
+            actor_job.prompt = ((job.prompt or "") + "\n" + STRUCTURED_DECISION_CONTRACT
+                                + "\nRequired decision identity: " + structured_identity)
             if review_launch is not None:
                 actor_job = replace(job, prompt=build_review_prompt(job.prompt, review_launch))
+                actor_job.prompt += "\nRequired decision identity: " + structured_identity
             result = claude.run(actor_job, workdir=review.root, settings_path=review.settings_path)
             exit_code = result.returncode
             actor_status = "DONE" if result.returncode == 0 else "AGENT_ERROR"
@@ -1042,12 +1056,32 @@ def execute_claude_review(job, say):
             save_text(log_dir, "claude-stream.jsonl", result.stdout)
             save_text(log_dir, "stderr.txt", result.stderr)
             final_text, normalized = parse_stream_json(result.stdout)
+            capability = (context_session or {}).get("capability")
+            decision, decision_error = parse_block(
+                final_text, review_job_id=job.job_id, workspace=job.workspace,
+                capability=capability,
+            )
+            if decision is not None:
+                save_json(log_dir, "review-decision.json", decision)
+            elif decision_error:
+                save_json(log_dir, "review-decision-quarantine.json", {
+                    "status": "REJECTED", "error": decision_error,
+                    "review_job_id": job.job_id,
+                })
             save_json(log_dir, "review-execution.json", {
                 "events": normalized, "final_result_text": final_text,
                 "exit_code": result.returncode,
                 "review_context": review_telemetry(
                     review_launch, normalized, result.stdout, final_text
                 ),
+                "review_decision": {
+                    "status": "VALID" if decision is not None else
+                              "REJECTED" if decision_error else "MISSING",
+                    "path": "review-decision.json" if decision is not None else None,
+                    "error": decision_error,
+                    "finding_count": len(decision["findings"]) if decision else 0,
+                    "trust": "ACTOR_REPORTED" if decision else None,
+                },
             })
         transcript_persisted = result is not None
         evidence_persisted = transcript_persisted and final_text is not None
@@ -1342,10 +1376,36 @@ def main(argv=()):
     parser.add_argument("--historical-manual", action="store_true")
     parser.add_argument("--human-approved", action="store_true")
     parser.add_argument("--slack-result-manifest", metavar="JSON_FILE")
+    parser.add_argument("--adopt-review-decision", metavar="SOURCE_JOB_ID")
+    parser.add_argument("--decision-mapping", metavar="JSON_FILE")
     args = parser.parse_args(argv)
     if args.check:
         actors = ("codex", "claude") if args.check == "all" else (args.check,)
         return run_checks(actors)
+
+    if args.adopt_review_decision:
+        if (not args.workspace or not args.historical_manual or not args.human_approved
+                or not args.decision_mapping or args.workspace not in WORKSPACES):
+            result={"status":"FAILED","mode":"HISTORICAL_MANUAL",
+                    "source_job_id":args.adopt_review_decision,
+                    "error":"--workspace, --historical-manual, --human-approved and --decision-mapping are required"}
+        else:
+            wc=WORKSPACES[args.workspace]; state_store.initialize()
+            owner=f"historical-review:{args.adopt_review_decision}"
+            if not state_store.acquire_manual_workspace_claim(args.workspace,owner):
+                result={"status":"FAILED","mode":"HISTORICAL_MANUAL",
+                        "source_job_id":args.adopt_review_decision,"error":"WORKSPACE_BUSY"}
+            else:
+                try:
+                    result=adopt_historical_review_decision(
+                        canonical=wc["path"], evidence_root=wc.get("review_evidence_root"),
+                        source_job_id=args.adopt_review_decision, workspace=args.workspace,
+                        log_dir=Path(__file__).parent/"logs"/args.adopt_review_decision,
+                        mapping_path=args.decision_mapping, human_approved=True)
+                finally:
+                    state_store.release_manual_workspace_claim(args.workspace,owner)
+        print(json.dumps(result,ensure_ascii=False,sort_keys=True))
+        return 0 if result["status"] in ("ADOPTED","NOOP") else 1
 
     if args.adopt_job_evidence:
         if not args.workspace or not args.historical_manual or not args.slack_result_manifest:

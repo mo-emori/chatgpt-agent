@@ -19,6 +19,7 @@ NORMALIZED_FILES = (
     "review-diff-head-before.stat",
     "review-diff-head-after.stat",
 )
+OPTIONAL_NORMALIZED_FILES = ("review-decision.json",)
 RAW_LOCAL_ONLY_FILES = ("claude-stream.jsonl", "stderr.txt")
 _RESERVED = {
     "CON", "PRN", "AUX", "NUL",
@@ -144,6 +145,12 @@ def _package_matches(destination: Path, files: dict[str, bytes]) -> bool:
 
 
 def _validate_normalized(name: str, data: bytes):
+    if name == "review-decision.json":
+        from review_decision import validate
+        try:
+            return validate(json.loads(data.decode("utf-8")))
+        except Exception as exc:
+            raise ReviewEvidenceError("corrupt normalized evidence: review-decision.json") from exc
     if name not in ("review-input.json", "review-execution.json"):
         return None
     try:
@@ -216,6 +223,17 @@ def adopt_review_evidence(*, canonical, review_evidence_root, job_id, log_dir,
                 raise ReviewEvidenceError("review-input.json provenance mismatch")
             package[name] = data
             normalized.append({"path": name, "sha256": _sha256(data)})
+        for name in OPTIONAL_NORMALIZED_FILES:
+            source = log_dir / name
+            if source.exists():
+                if not source.is_file() or source.is_symlink():
+                    raise ReviewEvidenceError(f"unsafe optional normalized evidence: {name}")
+                data = source.read_bytes()
+                parsed = _validate_normalized(name, data)
+                if parsed["review_job_id"] != job_id or parsed["actor"] != actor:
+                    raise ReviewEvidenceError("review-decision identity mismatch")
+                package[name] = data
+                normalized.append({"path": name, "sha256": _sha256(data)})
         manifest = {
             "schema": "worker-review-evidence",
             "version": 1,
@@ -238,6 +256,10 @@ def adopt_review_evidence(*, canonical, review_evidence_root, job_id, log_dir,
                 "owner": "Local Agent Worker",
                 "source": "Worker-owned local job log evidence",
             },
+            "review_decision": next(({"path": x["path"], "sha256": x["sha256"],
+                                      "finding_count": len(parsed["findings"]),
+                                      "trust": "ACTOR_REPORTED"}
+                                     for x in normalized if x["path"] == "review-decision.json"), None),
         }
         manifest_bytes = (json.dumps(manifest, ensure_ascii=False, sort_keys=True,
                                      separators=(",", ":")) + "\n").encode("utf-8")

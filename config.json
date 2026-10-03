@@ -14,7 +14,7 @@
       "job_evidence_root": "validation/evidence/job-results",
       "review_measurement": {
         "enabled": true,
-        "capabilities": ["bootstrap-contract"]
+        "capabilities": ["bootstrap-contract", "RUNTIME-BOOTSTRAP-ORCHESTRATOR"]
       },
       "artifact_roots": [
         "validation/reports",

@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 
 from evidence_index import generate as generate_evidence_index
 from job_context import generate as generate_job_context
+from context_materializer import generate as generate_materialized_context
 from review_package import generate as generate_review_package
 
 
@@ -382,6 +383,7 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
         os.replace(temp, cache)
         evidence_index = refresh_evidence_index(root, session)
         job_context = None
+        materialized_context = None
         review_package = None
         if evidence_index and evidence_index.get("status") == "READY":
             index_rel = _safe_relative(
@@ -415,9 +417,28 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                                          "detail": str(exc)[:1000]}],
                     }
                 if job_context and job_context.get("job_context_path"):
+                    job_context_value = json.loads(
+                        (root / job_context["job_context_path"]).read_text("utf-8"))
                     try:
-                        job_context_value = json.loads(
-                            (root / job_context["job_context_path"]).read_text("utf-8"))
+                        materialized_context = generate_materialized_context(
+                            root, generated_root=session["declaration"].get(
+                                "generated_root", "validation/context"),
+                            workspace=session["workspace"], capability=capability,
+                            job_context=job_context_value,
+                            job_context_path=job_context["job_context_path"],
+                            evidence_index=index_value, evidence_index_path=index_rel)
+                    except Exception as exc:
+                        materialized_context = {
+                            "mode": "COMPARISON_ONLY", "status": "UNVERIFIABLE",
+                            "schema_version": 1, "sha256": None,
+                            "source_context_sha256": current["lifecycle"]["manifest_sha256"],
+                            "evidence_index_sha256": evidence_index.get("index_sha256"),
+                            "item_count": 0, "bytes": 0, "payload_bytes": 0,
+                            "report_path": None,
+                            "diagnostics": [{"code": "MATERIALIZED_CONTEXT_BUILD_FAILED",
+                                             "detail": str(exc)[:1000]}],
+                        }
+                    try:
                         review_package = generate_review_package(
                             root, generated_root=session["declaration"].get(
                                 "generated_root", "validation/context"),
@@ -458,6 +479,7 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                 "report_path": report_path, "changed_sources": report["changed_sources"],
                 "unverifiable_reasons": report["unverifiable_reasons"],
                 "evidence_index": evidence_index, "job_context": job_context,
+                "materialized_context": materialized_context,
                 "review_package": review_package}
     except Exception as exc:
         return {"mode": "SHADOW", "capability": capability,

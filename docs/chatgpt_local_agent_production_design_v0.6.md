@@ -542,7 +542,7 @@ failed actor execution（429/session limitを含む）はreview verdictではな
 5. **Full Review:** critical、closure、authority-changing、security/boundary-sensitiveなcaseでは常に選択可能とし、必要な全範囲を確認する。
 
 Phase 2A Evidence Indexer、JOB・capability・actor/modeに応じてcandidateを組み立てるcomparison-only
-**Job Context Slicer**、およびPhase 3A **Review Delta Package Builder** は実装済みである。次段階はactor package consumptionである。設計authorityはcompleted design job
+**Job Context Slicer**、Phase 2C **Materialized Context Builder**、およびPhase 3A **Review Delta Package Builder** は実装済みである。次段階はactor package consumptionである。設計authorityはcompleted design job
 `LOCAL-AGENT-CONTEXT-HARNESS-PHASE23-DESIGN-20261003-001` とし、その範囲を越えて本書で発明しない。
 
 **NOT IMPLEMENTED:** prompt reduction/injection、Actorによる `context_ref` / `job_context_ref` /
@@ -598,6 +598,32 @@ reparse escape、stale substitution、hash mismatchを拒否する。evidence/co
 Result Manifestにはbackward-compatibleな `job_context` diagnosticを追加する：`mode: COMPARISON_ONLY`、`status`、
 `schema_version`、`sha256`、`source_context_sha256`、`evidence_index_sha256`、`delta_status`、`authority_ref_count`、
 `evidence_ref_count`、`expansion_required_count`、`bytes`、`report_path`。Phase 2B status単独ではjob outcomeを変更しない。
+
+### 7.7.1 Materialized Context（PHASE 2C / IMPLEMENTED_COMPARISON_ONLY）
+
+Phase 2Cは `READY_BOUNDED` Job Contextの選択を再順位付けせず、actor入力候補となるbounded data product
+`context-harness-materialized-context` version 1へ決定的にmaterializeする。生成順はterminal Evidence Index → Job Context →
+Materialized Context candidate →既存Review Packageである。ただし本phaseはSHADOW診断のみであり、Codex/Claudeのprompt、
+effective prompt、clone/read scope、job qualificationを変更しない。supplied `DELTA_REVIEW` package pathも従来どおり再利用し、
+materializerを通らない。
+
+Notion authoritative instruction bytesは常にbyte-identicalであり、`instruction_sha256`はそのbytesだけを識別する。
+Context Harnessはinstructionをtruncate、rewrite、summarize、normalizeしない。Materialized Contextは別data productであり、
+canonical bodyから計算した独立の `materialized_context_sha256` を持つ。将来のEffective Inputはexact instructionとこの別identityの
+contextを組み合わせ得るが、本変更では接続しない。
+
+declared authoritative UTF-8 textはsource SHA-256を再検証し、bytesを変更せずbase64で保持する。required evidenceはEvidence
+Indexが検証したcanonical source filesを再検証した上で、index entryのstructured fieldsだけをcanonical JSONとして保持する。
+raw local-only evidenceを代用せず、proseから関係・finding・relevanceを推論しない。`BOUNDED_CANDIDATE`は明示的なstructured
+promotion ruleがないためmaterializeせず、`IRRELEVANT`も除外する。binary/unsupported required source、PARTIAL/UNSTRUCTURED、
+未解決項目は隠さずdiagnosticと `REQUIRED_BEFORE_REVIEW` semanticsを保持する。
+
+budgetはstructured `context_request.max_text_bytes`だけを使用する。現在declaration/default budget contractは存在しないため、
+値がない場合は `MISSING_EXPLICIT_BYTE_BUDGET` としてfail closedする。required item単位のtruncate/dropは禁止し、required totalが
+budgetを超える場合はpayloadを空にして `NEEDS_EXPANSION` とする。optional omissionはPhase 2B classificationに従う決定的な規則
+だけで行う。canonical hash materialにtimestampは含めない。path traversal、absolute/drive path、symlink/reparse、protected/
+forbidden boundary、stale substitution、source/dependency hash mismatchを拒否する。測定値はsource/payload/known omitted bytesと
+authority/quality別item countであり、token savingsは主張しない。
 
 ARGUS `RUNTIME-BOOTSTRAP-ORCHESTRATOR` acceptanceでは、declarationが明示するBootstrap Contract/ADR/Registry authority、
 dependency state、structured prior review/correction evidenceを表現できる。429 rereviewはfailureのみである。六 findingsは

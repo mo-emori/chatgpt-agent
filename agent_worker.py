@@ -723,6 +723,8 @@ def build_result(
             response["evidence_index"] = context["evidence_index"]
         if context.get("job_context") is not None:
             response["job_context"] = context["job_context"]
+        if context.get("materialized_context") is not None:
+            response["materialized_context"] = context["materialized_context"]
         if context.get("review_package") is not None:
             response["review_package"] = context["review_package"]
     if artifact_result is not None:

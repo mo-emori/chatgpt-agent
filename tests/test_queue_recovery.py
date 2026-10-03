@@ -317,6 +317,7 @@ class QueueRecoveryTests(unittest.TestCase):
         self.assertEqual(response["existing_status"], "QUEUED")
 
     @patch.object(agent_worker, "SlackBridge")
+    @patch.object(agent_worker, "WorkerInstanceGuard")
     @patch.object(agent_worker, "recover_queued_jobs")
     @patch.object(agent_worker, "recover_running_jobs")
     @patch.object(agent_worker, "check_cli_versions")
@@ -327,20 +328,29 @@ class QueueRecoveryTests(unittest.TestCase):
         check_cli,
         recover_running,
         recover_queued,
+        guard_class,
         bridge_class,
     ):
         events = []
         initialize.side_effect = lambda: events.append("initialize")
         check_cli.side_effect = lambda: events.append("cli")
+        guard = guard_class.return_value.acquire.return_value
+        guard.__enter__.side_effect = lambda: events.append("guard-enter")
+        guard.__exit__.return_value = False
+        guard_class.return_value.acquire.side_effect = lambda: (events.append("guard-acquire") or guard)
         recover_running.side_effect = lambda: events.append("running")
         recover_queued.side_effect = lambda say: events.append("queued")
         bridge_class.return_value.start.side_effect = lambda: events.append("start")
 
-        agent_worker.main()
+        with patch.object(
+            agent_worker, "configure_logging", side_effect=lambda: events.append("logging")
+        ):
+            agent_worker.main()
 
         self.assertEqual(
             events,
-            ["initialize", "cli", "running", "queued", "start"],
+            ["logging", "initialize", "cli", "guard-acquire", "guard-enter",
+             "running", "queued", "start"],
         )
 
 

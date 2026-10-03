@@ -69,6 +69,7 @@ from notion_client import (
     fetch_instruction,
 )
 from operational_logging import configure_logging, emit_lifecycle
+from single_instance import SingleInstanceAlreadyRunning, WorkerInstanceGuard
 from context_harness import begin_shadow, finish_shadow, refresh_evidence_index
 
 logger = logging.getLogger(__name__)
@@ -1526,19 +1527,26 @@ def main(argv=()):
 
     cli_available = check_cli_versions()
 
-    recover_running_jobs()
+    try:
+        guard = WorkerInstanceGuard().acquire()
+    except SingleInstanceAlreadyRunning as exc:
+        logger.error(str(exc))
+        return 2
 
-    bridge = SlackBridge(
-        process_message
-    )
+    with guard:
+        recover_running_jobs()
 
-    recover_queued_jobs(bridge.say)
+        bridge = SlackBridge(
+            process_message
+        )
 
-    logger.info("ChatGPT Local Agent Worker started.")
-    logger.info("Authorization and state store enabled.")
-    logger.info("Press Ctrl+C to stop.")
+        recover_queued_jobs(bridge.say)
 
-    bridge.start()
+        logger.info("ChatGPT Local Agent Worker started.")
+        logger.info("Authorization and state store enabled.")
+        logger.info("Press Ctrl+C to stop.")
+
+        bridge.start()
     return 0
 
 

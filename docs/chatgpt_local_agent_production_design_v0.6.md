@@ -611,6 +611,50 @@ manual adoptionはscanとraceせず `WORKSPACE_BUSY` で失敗する。ARGUS PoC
 review済みのexact candidateは `docs/argus_runtime_bootstrap_context_phase1.json` であり、authorized ARGUS jobが
 ARGUS `.agent/context.json` へcopyする必要がある。
 
+### 7.9 Worker single-instance ownership
+
+The production incident in which `JOB START` / `JOB END` appeared to be missing was
+caused by stale, concurrent `agent_worker.py` processes owning multiple Slack Socket
+Mode connections. Console capture, the Windows console, and the lifecycle sink were
+not the cause.
+
+One installation permits exactly one daemon Worker. `WorkerInstanceGuard` holds an
+OS byte-range lock on `logs/worker/agent_worker.lock` for the entire daemon lifetime.
+On Windows it uses the standard-library `msvcrt.locking` primitive; POSIX uses
+`fcntl.flock`. The JSON PID/host text in the file is diagnostic metadata only: lock
+ownership is decided by the OS, not by trusting a PID file. Normal exit and Ctrl+C
+close/unlock the handle. After abnormal process death, the kernel releases the lock;
+the next Worker atomically acquires it and replaces stale metadata. The lock file is
+intentionally retained to avoid unlink/recreate races. No process is killed or
+replaced automatically.
+
+Daemon startup order is:
+
+1. `configure_logging`
+2. `state_store.initialize`
+3. CLI availability checks
+4. acquire the single-instance guard
+5. recover RUNNING jobs
+6. construct `SlackBridge`
+7. recover queued jobs
+8. open Slack Socket Mode via `SlackBridge.start`
+
+The guard precedes both recovery paths so two daemons cannot concurrently recover
+queues or own Socket Mode. A contender exits non-zero with
+`SINGLE_INSTANCE_ALREADY_RUNNING` before constructing `SlackBridge`. Maintenance and
+adoption CLI paths return before daemon guard acquisition and remain usable while the
+daemon runs.
+
+The canonical liveness contract remains exactly:
+
+```text
+Request:  LOCAL-AGENT PING
+Response: LOCAL-AGENT PONG — Worker ready
+```
+
+Normal lifecycle console output is limited to `JOB START` and `JOB END` blocks;
+temporary forensic `DIAG_*` probes are not part of the production path.
+
 ## 8. Result Manifest and terminal status domains
 
 Actor executionとArtifact deliveryを独立状態として扱う。

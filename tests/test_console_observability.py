@@ -216,6 +216,7 @@ class ProductionPathConsoleTests(unittest.TestCase):
         self.assertNotIn("JOB END", transient.getvalue())
         self.assertNotIn("JOB START", actor_transcript)
         self.assertNotIn("JOB END", actor_transcript)
+        self.assertNotIn("DIAG_", output)
         return output
 
     def test_registered_bolt_path_codex_uses_visible_non_tty_sink(self):

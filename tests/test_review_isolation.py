@@ -115,8 +115,11 @@ class LauncherContractTests(unittest.TestCase):
     @patch.object(claude, "validate_workspace")
     def test_claude_restricted_stream_launcher_contract(self, validate, run_process):
         job = SimpleNamespace(workspace="local-agent", prompt="review", actor="claude")
-        claude.run(job, workdir=Path("review"), settings_path=Path("managed.json"))
+        claude.run(job, prompt="effective review", workdir=Path("review"),
+                   settings_path=Path("managed.json"))
         args = run_process.call_args.kwargs["args"]
+        self.assertIn("effective review", run_process.call_args.kwargs["input_text"])
+        self.assertEqual(job.prompt, "review")
         self.assertEqual(args[0:2], [claude.CLAUDE_CMD, "-p"])
         for required in ("--restricted", "--tools", "Read,Glob,Grep,Bash", "--settings",
                          "--safe-mode", "--strict-mcp-config", "--permission-mode",
@@ -373,6 +376,35 @@ class ReviewTerminalConvergenceTests(unittest.TestCase):
         self.assertEqual(response["failure_class"], "BRIDGE_ERROR")
         self.assertEqual(say.call_count, 1)
         mocks[7].assert_called_once()  # callback
+
+    def test_pre_actor_prompt_setup_failure_is_local_and_not_started(self):
+        temp_root = Path(__file__).parents[1] / ".tmp-tests"
+        temp_root.mkdir(exist_ok=True)
+        job = self.job(); say = Mock()
+        with tempfile.TemporaryDirectory(dir=temp_root, ignore_cleanup_errors=True) as td:
+            root = Path(td); review = self.review(root)
+            review.root.mkdir(); review.settings_path.write_text("{}")
+            with patch.object(agent_worker, "create_job_log", return_value=root), \
+                 patch.object(agent_worker, "prepare_execution",
+                              return_value=({"artifact_roots": []}, root, root, {})), \
+                 patch.object(agent_worker, "begin_shadow", return_value=None), \
+                 patch.object(agent_worker, "prepare_review_invocation", return_value=None), \
+                 patch.object(agent_worker, "create_review_workspace", return_value=review), \
+                 patch.object(agent_worker, "prepare_effective_prompt",
+                              side_effect=RuntimeError("prompt setup failed")), \
+                 patch.object(agent_worker.claude, "run") as run, \
+                 patch.object(agent_worker, "finish_shadow", return_value=None), \
+                 patch.object(agent_worker, "cleanup_review", return_value="DONE"), \
+                 patch.object(agent_worker.state_store, "mark_completed"), \
+                 patch.object(agent_worker, "finalize_browser_callback"), \
+                 patch.object(agent_worker, "dispatch_next_queued"), \
+                 patch.object(agent_worker, "log_job_end"):
+                agent_worker.execute_claude_review(job, say)
+            response = json.loads((root / "result.json").read_text(encoding="utf-8"))
+        run.assert_not_called()
+        self.assertEqual(response["failure_class"], "BRIDGE_ERROR")
+        self.assertEqual(response["review_execution"]["actor_status"], "NOT_STARTED")
+        self.assertIsNone(response["review_execution"]["raw_transcript"])
 
     def test_boundary_verification_exception_converges_once(self):
         response, say, mocks = self.run_case(boundary_error=OSError("verify failed"))

@@ -963,9 +963,18 @@ bytes、escalation、context/evidence/job-context hash、Claude streamに構造�
 `semantic_freshness_status`、`execution_job_context_hash`、`source_chain_valid`、`package_reused=true`、
 `package_regenerated=false`、stale reasonsを記録する。pre-actor failureでも要求された`DELTA_REVIEW`とrefを保持し、
 `FULL_REVIEW`へ偽装しない。
+Prompt ownershipは分離する。受理・永続化されたfrozen `Job`はcanonical instructionと
+`prompt_sha256 == instruction_sha256`を保持し、変更しない。package-first preamble、bounded expansion、
+decision contractを加えたactor入力はReview Invocationが`effective_prompt`として所有し、別の
+`effective_prompt_sha256`を記録する。Claude runnerにはこのeffective promptを明示的に渡す。
 Bash等でread pathを完全に観測できない場合は `measurement_complete=false` とし、metricを推測しない。
 normalized Review Evidenceにも同metadataを保存する。independent clone、canonical boundary、cleanup、Evidence
 Adoption、callback、JOB ENDの意味は変更しない。
+
+ローカルconsole lifecycleはclaimed worker threadが所有する。stateを`RUNNING`にした直後に
+flush済みの`JOB START`をstdoutへ一度だけ出し、setup、actor、callbackの成否にかかわらず
+terminal state確定後のfinally pathで`JOB END`を一度だけ出す。同じblockはworker logにも残し、
+actorのbulk stdout/stderr captureとは分離する。
 
 `FULL_REVIEW` は現在の安全なreference/fallbackであり既定動作は不変である。`BOUNDARY_REVIEW` のpackage
 consumptionは未実装であり、package refを受理しない。universal differential reviewはまだ有効化されていない。

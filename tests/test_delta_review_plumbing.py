@@ -1,9 +1,10 @@
 import json
+import hashlib
 import tempfile
 import unittest
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import agent_worker
 import review_invocation
@@ -14,7 +15,7 @@ from slack_bridge import SlackBridge
 
 FIXTURE = {
     "protocol_version": "3",
-    "job_id": "ARGUS-BOOTSTRAP-CONTEXT-HARNESS-DELTA-REVIEW-E2E-20261003-002",
+    "job_id": "ARGUS-BOOTSTRAP-CONTEXT-HARNESS-DELTA-REVIEW-E2E-20261003-004",
     "actor": "claude",
     "mode": "review",
     "workspace": "argus",
@@ -98,6 +99,47 @@ class DeltaReviewPlumbingTests(unittest.TestCase):
             with self.assertRaises(ValidatorReached):
                 review_invocation.prepare(job, Path("C:/dev/argus"), policy, context)
         self.assertEqual(validate.call_args.args[1], FIXTURE["review_package_ref"])
+
+    def test_frozen_job_delta_effective_prompt_has_separate_provenance(self):
+        original = "Perform independent review"
+        instruction_sha = hashlib.sha256(original.encode("utf-8")).hexdigest()
+        job = replace(self.parse(), prompt=original, prompt_sha256=instruction_sha)
+        with self.assertRaises(FrozenInstanceError):
+            job.prompt = "mutated"
+        launch = {
+            "manifest": {"workspace": "argus", "capability": "RUNTIME-BOOTSTRAP-ORCHESTRATOR",
+                         "target": {"job_id": FIXTURE["review_package_ref"]["target_job_id"]}},
+            "ref": FIXTURE["review_package_ref"],
+            "package_path": FIXTURE["review_package_ref"]["path"],
+            "allowed_paths": ["agent_worker.py"],
+        }
+        effective, effective_sha = review_invocation.prepare_effective_prompt(
+            job, launch, "RUNTIME-BOOTSTRAP-ORCHESTRATOR"
+        )
+        self.assertEqual(job.prompt, original)
+        self.assertEqual(job.prompt_sha256, instruction_sha)
+        self.assertEqual(launch["effective_prompt"], effective)
+        self.assertEqual(launch["effective_prompt_sha256"], effective_sha)
+        self.assertNotEqual(effective_sha, instruction_sha)
+        self.assertIn(FIXTURE["review_package_ref"]["path"], effective)
+        self.assertIn("package-first", effective)
+        with patch.object(agent_worker.claude, "run", return_value=Mock(returncode=0)) as runner:
+            runner(job, prompt=effective, workdir=Path("review"),
+                   settings_path=Path("managed.json"))
+        self.assertIs(runner.call_args.args[0], job)
+        self.assertEqual(runner.call_args.kwargs["prompt"], effective)
+        self.assertEqual(job.prompt, original)
+
+    def test_full_review_effective_prompt_remains_unwrapped(self):
+        full = dict(FIXTURE)
+        full["review_mode"] = "FULL_REVIEW"
+        full.pop("review_package_ref")
+        job = replace(self.parse(full), prompt="full independent review",
+                      prompt_sha256="a" * 64)
+        effective, _ = review_invocation.prepare_effective_prompt(job, None)
+        self.assertTrue(effective.startswith("full independent review\n"))
+        self.assertNotIn("DELTA_REVIEW package-first", effective)
+        self.assertEqual(job.prompt, "full independent review")
 
     def test_missing_and_malformed_refs_fail_closed(self):
         missing = dict(FIXTURE)

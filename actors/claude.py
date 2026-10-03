@@ -11,7 +11,7 @@ from actors.process_runner import (
     validate_workspace,
 )
 
-def run(job, *, workdir=None, settings_path=None):
+def run(job, *, prompt=None, workdir=None, settings_path=None):
     config = WORKSPACES[job.workspace]
     validate_workspace(config)
     workdir = workdir or config["path"]
@@ -39,7 +39,7 @@ def run(job, *, workdir=None, settings_path=None):
     ]
 
     prompt = append_manifest_instruction(
-        job.prompt
+        job.prompt if prompt is None else prompt
     )
 
     return run_process(

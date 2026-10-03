@@ -114,6 +114,35 @@ Original independent-review instruction follows:
 {STRUCTURED_DECISION_CONTRACT}"""
 
 
+def set_effective_prompt(launch: dict, prompt: str) -> str:
+    """Attach actor-owned prompt provenance without changing the canonical Job."""
+    launch["effective_prompt"] = prompt
+    launch["effective_prompt_sha256"] = hashlib.sha256(
+        prompt.encode("utf-8")
+    ).hexdigest()
+    return prompt
+
+
+def prepare_effective_prompt(job, launch: dict | None, capability=None) -> tuple[str, str]:
+    """Build actor input while preserving the immutable accepted instruction."""
+    identity = json.dumps({
+        "review_job_id": job.job_id,
+        "actor": job.actor,
+        "workspace": job.workspace,
+        "capability": capability,
+        "review_mode": getattr(job, "review_mode", None) or "FULL_REVIEW",
+    }, ensure_ascii=False, sort_keys=True)
+    if launch is None:
+        prompt = (job.prompt or "") + "\n" + STRUCTURED_DECISION_CONTRACT
+    else:
+        prompt = build_prompt(job.prompt, launch)
+    prompt += "\nRequired decision identity: " + identity
+    digest = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    if launch is not None:
+        set_effective_prompt(launch, prompt)
+    return prompt, digest
+
+
 def _usage(raw: str) -> dict:
     result = {k: None for k in ("input_tokens", "cache_read", "cache_creation", "output_tokens")}
     for line in raw.splitlines():
@@ -130,14 +159,22 @@ def _usage(raw: str) -> dict:
     return result
 
 
-def telemetry(launch, normalized, raw, final_text):
+def telemetry(launch, normalized, raw, final_text, *, instruction_sha256=None,
+              effective_prompt_sha256=None):
+    prompt_provenance = {
+        "instruction_sha256": instruction_sha256,
+        "effective_prompt_sha256": effective_prompt_sha256 or (
+            launch.get("effective_prompt_sha256") if launch else None
+        ),
+    }
     if launch is None:
         return {"mode": "FULL_REVIEW", "package_ref": None, "package_hash": None,
                 "package_status": None, "package_bytes": None, "package_file_count": None,
                 "expansion_count": 0, "expansion_paths": [], "expansion_bytes": None,
                 "measurement_complete": None, "full_review_escalated": False,
                 "escalation_reason": None, "context_hash": None, "evidence_hash": None,
-                "job_context_hash": None, "actor_usage": _usage(raw)}
+                "job_context_hash": None, "prompt_provenance": prompt_provenance,
+                "actor_usage": _usage(raw)}
     if launch.get("prelaunch_failed"):
         ref = launch.get("ref") or {}
         return {"mode": launch.get("mode", "DELTA_REVIEW"),
@@ -154,6 +191,7 @@ def telemetry(launch, normalized, raw, final_text):
                 "package_reused": False, "package_regenerated": False,
                 "stale_reasons": [launch.get("error")] if launch.get("error") else [],
                 "evidence_hash": None, "job_context_hash": None,
+                "prompt_provenance": prompt_provenance,
                 "actor_usage": _usage(raw)}
     m = launch["manifest"]
     expansions = list(launch["declared_expansions"])
@@ -207,4 +245,5 @@ def telemetry(launch, normalized, raw, final_text):
         "package_reused": launch["package_reused"],
         "package_regenerated": launch["package_regenerated"], "stale_reasons": [],
         "evidence_hash": m["evidence_index_sha256"], "job_context_hash": m["job_context_sha256"],
+        "prompt_provenance": prompt_provenance,
         "actor_usage": _usage(raw)}

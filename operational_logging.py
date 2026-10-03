@@ -1,4 +1,6 @@
 import logging
+import sys
+import threading
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -6,6 +8,32 @@ from pathlib import Path
 DEFAULT_LOG_PATH = Path(__file__).parent / "logs" / "worker" / "worker.log"
 MAX_LOG_BYTES = 10 * 1024 * 1024
 BACKUP_COUNT = 5
+LIFECYCLE_LOGGER = "local_agent.lifecycle"
+_console_lock = threading.RLock()
+
+
+class LifecycleConsoleFilter(logging.Filter):
+    def filter(self, record):
+        return record.name != LIFECYCLE_LOGGER
+
+
+def _safe_console_write(message, stream=None):
+    """Write one console record promptly, tolerating hostile stream encodings."""
+    stream = stream or sys.stdout
+    with _console_lock:
+        try:
+            stream.write(message)
+        except UnicodeEncodeError:
+            encoding = getattr(stream, "encoding", None) or "ascii"
+            stream.write(message.encode(encoding, "backslashreplace").decode(encoding))
+        stream.flush()
+
+
+def emit_lifecycle(message):
+    """Emit a lifecycle block once to stdout and also to the persistent log."""
+    text = message.rstrip("\n")
+    _safe_console_write(text + "\n")
+    logging.getLogger(LIFECYCLE_LOGGER).info(text)
 
 
 class ThirdPartyDebugFilter(logging.Filter):
@@ -24,8 +52,14 @@ def configure_logging(log_path=DEFAULT_LOG_PATH, level=logging.INFO):
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
-    console = logging.StreamHandler()
+    for handler in root.handlers[:]:
+        if getattr(handler, "_local_agent_handler", False):
+            root.removeHandler(handler)
+            handler.close()
+
+    console = logging.StreamHandler(sys.stdout)
     console.setLevel(level)
+    console.addFilter(LifecycleConsoleFilter())
     console.setFormatter(logging.Formatter("%(message)s"))
     console._local_agent_handler = True
 

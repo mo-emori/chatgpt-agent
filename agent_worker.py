@@ -6,15 +6,15 @@ from dataclasses import replace
 import threading
 import argparse
 import sys
-import copy
+import os
 from pathlib import Path
 
 from actors import run_agent
 from actors import claude
 from actors.claude_stream import parse_stream_json
-from review_invocation import (PackageLaunchError, STRUCTURED_DECISION_CONTRACT,
-    build_prompt as build_review_prompt, prepare as prepare_review_invocation,
-    telemetry as review_telemetry)
+from review_invocation import (PackageLaunchError,
+    prepare as prepare_review_invocation,
+    prepare_effective_prompt, telemetry as review_telemetry)
 from actors.process_runner import ProcessResult
 from actors.review_workspace import (
     ReviewPreparationError, cleanup_review, create_review_workspace, diff_head_stat, finish_review,
@@ -68,10 +68,24 @@ from notion_client import (
     NotionInstructionError,
     fetch_instruction,
 )
-from operational_logging import configure_logging
+from operational_logging import configure_logging, emit_lifecycle
 from context_harness import begin_shadow, finish_shadow, refresh_evidence_index
 
 logger = logging.getLogger(__name__)
+_execution_context = threading.local()
+
+
+def log_job_start(job, baseline=None):
+    if getattr(_execution_context, "lifecycle_started", None) == job.job_id:
+        return
+    _execution_context.lifecycle_started = job.job_id
+    baseline_line = f"\nbaseline : {baseline}" if baseline is not None else ""
+    emit_lifecycle(
+        "\n==============================\n"
+        f"JOB START\njob_id   : {job.job_id}\nactor    : {job.actor}\n"
+        f"mode     : {job.mode}\nworkspace: {job.workspace}\nstatus   : RUNNING"
+        f"{baseline_line}\n=============================="
+    )
 
 def send_json(say, data):
     say(
@@ -403,6 +417,11 @@ def dispatch_next_queued(workspace, say):
 def execute_claimed_job(job, say):
     """Run a claimed job and fail closed if setup fails before execution."""
     try:
+        _execution_context.claimed = True
+        _execution_context.lifecycle_started = None
+        _execution_context.lifecycle_ended = None
+        state_store.mark_running(job.job_id, os.getpid(), HOSTNAME)
+        log_job_start(job)
         execute_job(job, say)
     except Exception as e:
         state_store.mark_completed(
@@ -417,14 +436,21 @@ def execute_claimed_job(job, say):
             error_summary=str(e)[:4000],
         )
         send_json(say, response)
-        send_browser_callback(
-            job,
-            status="FAILED",
-            artifact_status="NOT_RUN",
-            failure_class="DISPATCH_START_FAILED",
-        )
+        try:
+            send_browser_callback(
+                job,
+                status="FAILED",
+                artifact_status="NOT_RUN",
+                failure_class="DISPATCH_START_FAILED",
+            )
+        except Exception:
+            logger.exception("Failure callback failed: job_id=%s", job.job_id)
         logger.exception("DISPATCH START FAILED: job_id=%s", job.job_id)
+    finally:
+        row = state_store.get_job(job.job_id) or {}
+        log_job_end(job, row.get("status", "FAILED"), row.get("exit_code"))
         dispatch_next_queued(job.workspace, say)
+        _execution_context.claimed = False
 
 
 def validate_recoverable_queued_job(job):
@@ -511,12 +537,7 @@ def prepare_execution(job, *, log_dir=None):
     before = get_git_snapshot(workdir)
     save_git_snapshot(log_dir, "before", before)
 
-    logger.info(
-        "\n==============================\n"
-        "JOB START\njob_id   : %s\nactor    : %s\nmode     : %s\n"
-        "workspace: %s\nbaseline : %s\n==============================",
-        job.job_id, job.actor, job.mode, job.workspace, before["head"],
-    )
+    log_job_start(job, before["head"])
 
     return workspace, workdir, log_dir, before
 
@@ -751,12 +772,20 @@ def finalize_browser_callback(
     artifact_status,
     failure_class=None,
 ):
-    response["callback"] = send_browser_callback(
-        job,
-        status=status,
-        artifact_status=artifact_status,
-        failure_class=failure_class,
-    )
+    try:
+        response["callback"] = send_browser_callback(
+            job,
+            status=status,
+            artifact_status=artifact_status,
+            failure_class=failure_class,
+        )
+    except Exception as exc:
+        logger.exception("Browser callback failed: job_id=%s", job.job_id)
+        response["callback"] = {
+            "type": job.callback_type,
+            "status": "FAILED",
+            "error": str(exc)[:4000],
+        }
     save_json(log_dir, "result.json", response)
 
 
@@ -801,13 +830,16 @@ def handle_execution_failure(
 
 
 def log_job_end(job, status, exit_code):
-    logger.info(
+    if getattr(_execution_context, "lifecycle_ended", None) == job.job_id:
+        return
+    _execution_context.lifecycle_ended = job.job_id
+    emit_lifecycle(
         "\n==============================\n"
-        "JOB END\njob_id   : %s\nactor    : %s\nmode     : %s\n"
-        "workspace: %s\nstatus   : %s\nexit_code: %s\n"
-        "==============================",
-        job.job_id, job.actor, job.mode, job.workspace, status, exit_code,
+        f"JOB END\njob_id   : {job.job_id}\nactor    : {job.actor}\n"
+        f"mode     : {job.mode}\nworkspace: {job.workspace}\nstatus   : {status}\n"
+        f"exit_code: {exit_code}\n=============================="
     )
+    _execution_context.lifecycle_started = None
 
 
 def execute_job(job, say):
@@ -824,9 +856,14 @@ def execute_job(job, say):
     )
 
     try:
+        logger.info("ACTOR START: job_id=%s actor=%s", job.job_id, job.actor)
         result = run_agent(job)
 
         exit_code = result.returncode
+        logger.info(
+            "ACTOR END: job_id=%s actor=%s exit_code=%s",
+            job.job_id, job.actor, exit_code,
+        )
 
         after, changed_paths = collect_execution_evidence(
             result,
@@ -971,10 +1008,8 @@ def execute_job(job, say):
     finally:
         log_job_end(job, status, exit_code)
 
-        dispatch_next_queued(
-            job.workspace,
-            say,
-        )
+        if not getattr(_execution_context, "claimed", False):
+            dispatch_next_queued(job.workspace, say)
 
 
 def execute_claude_review(job, say):
@@ -1021,21 +1056,18 @@ def execute_claude_review(job, say):
         save_json(log_dir, "review-input.json", review.input_manifest)
         save_text(log_dir, "canonical-diff-head-before.stat", review.canonical_diff_stat)
         save_text(log_dir, "review-diff-head-before.stat", review.review_diff_stat)
+        effective_prompt, effective_prompt_sha256 = prepare_effective_prompt(
+            job, review_launch, (context_session or {}).get("capability")
+        )
         try:
-            actor_job = copy.copy(job)
-            structured_identity = json.dumps({
-                "review_job_id": job.job_id, "actor": job.actor,
-                "workspace": job.workspace,
-                "capability": (context_session or {}).get("capability"),
-                "review_mode": getattr(job, "review_mode", None) or "FULL_REVIEW",
-            }, ensure_ascii=False, sort_keys=True)
-            actor_job.prompt = ((job.prompt or "") + "\n" + STRUCTURED_DECISION_CONTRACT
-                                + "\nRequired decision identity: " + structured_identity)
-            if review_launch is not None:
-                actor_job = replace(job, prompt=build_review_prompt(job.prompt, review_launch))
-                actor_job.prompt += "\nRequired decision identity: " + structured_identity
-            result = claude.run(actor_job, workdir=review.root, settings_path=review.settings_path)
+            logger.info("ACTOR START: job_id=%s actor=%s", job.job_id, job.actor)
+            result = claude.run(
+                job, prompt=effective_prompt, workdir=review.root,
+                settings_path=review.settings_path,
+            )
             exit_code = result.returncode
+            logger.info("ACTOR END: job_id=%s actor=%s exit_code=%s",
+                        job.job_id, job.actor, exit_code)
             actor_status = "DONE" if result.returncode == 0 else "AGENT_ERROR"
             if actor_status != "DONE":
                 failure_class = "ACTOR_FAILED"
@@ -1072,7 +1104,9 @@ def execute_claude_review(job, say):
                 "events": normalized, "final_result_text": final_text,
                 "exit_code": result.returncode,
                 "review_context": review_telemetry(
-                    review_launch, normalized, result.stdout, final_text
+                    review_launch, normalized, result.stdout, final_text,
+                    instruction_sha256=job.prompt_sha256,
+                    effective_prompt_sha256=effective_prompt_sha256,
                 ),
                 "review_decision": {
                     "status": "VALID" if decision is not None else
@@ -1168,7 +1202,11 @@ def execute_claude_review(job, say):
             "cleanup_status": "PENDING",
         })
         response["review_context"] = review_telemetry(
-            review_launch, normalized, result.stdout if result is not None else "", final_text
+            review_launch, normalized, result.stdout if result is not None else "", final_text,
+            instruction_sha256=job.prompt_sha256,
+            effective_prompt_sha256=(
+                effective_prompt_sha256 if "effective_prompt_sha256" in locals() else None
+            ),
         )
         if review is not None:
             response.update({
@@ -1293,7 +1331,8 @@ def execute_claude_review(job, say):
     logger.info("Claude review end: job_id=%s status=%s actor=%s boundary=%s cleanup=%s",
                 job.job_id, status, actor_status, boundary, cleanup_status)
     log_job_end(job, status, exit_code)
-    dispatch_next_queued(job.workspace, say)
+    if not getattr(_execution_context, "claimed", False):
+        dispatch_next_queued(job.workspace, say)
 
 
 def process_exists(pid):

@@ -199,7 +199,7 @@ def mark_running(job_id, pid, host):
             SET status = 'RUNNING',
                 pid = ?,
                 host = ?,
-                started_at = ?,
+                started_at = COALESCE(started_at, ?),
                 heartbeat_at = ?
             WHERE job_id = ?
             """,

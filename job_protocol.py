@@ -385,17 +385,23 @@ def parse_job(text: str) -> Job:
                 reject("REVIEW_PACKAGE_REF_INVALID")
             if not isinstance(review_package_ref.get("target_job_id"), str) or not review_package_ref["target_job_id"]:
                 reject("REVIEW_PACKAGE_REF_INVALID")
-        measurement_mode = data.get("measurement_mode", False)
-        if not isinstance(measurement_mode, bool):
+        supplied_measurement_mode = data.get("measurement_mode")
+        if supplied_measurement_mode is not None and not isinstance(supplied_measurement_mode, bool):
             reject("MEASUREMENT_MODE_INVALID")
-        if (review_mode is not None or review_package_ref is not None or measurement_mode) and actor_mode != ("claude", "review"):
+        if (review_mode is not None or review_package_ref is not None or supplied_measurement_mode is not None) and actor_mode != ("claude", "review"):
             reject("REVIEW_METADATA_NOT_ALLOWED")
-        if review_mode == "DELTA_REVIEW" and (not measurement_mode or review_package_ref is None):
+        if review_mode == "DELTA_REVIEW" and review_package_ref is None:
+            reject("DELTA_REVIEW_REQUIRES_MEASUREMENT_PACKAGE")
+        if review_mode == "DELTA_REVIEW" and supplied_measurement_mode is False:
             reject("DELTA_REVIEW_REQUIRES_MEASUREMENT_PACKAGE")
         if review_mode == "BOUNDARY_REVIEW" and review_package_ref is not None:
             reject("BOUNDARY_PACKAGE_NOT_SUPPORTED")
-        if review_mode != "DELTA_REVIEW" and measurement_mode:
+        if review_mode != "DELTA_REVIEW" and supplied_measurement_mode:
             reject("MEASUREMENT_MODE_REQUIRES_DELTA_REVIEW")
+        # A validated DELTA_REVIEW package reference is the wire-level
+        # measurement activation contract.  Keep accepting the former explicit
+        # true flag, but normalize both shapes to the same internal state.
+        measurement_mode = review_mode == "DELTA_REVIEW" and review_package_ref is not None
 
     # callback
     callback = data.get(

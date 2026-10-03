@@ -921,11 +921,17 @@ source Context/Job Context freshness、path containment、traversal、symlink/re
 Result Manifestへadditive `review_package` comparison diagnosticを出すがstatus単独でcurrent executionをblockしない。
 
 **Phase 3B-1 / IMPLEMENTED_EXPERIMENTAL_MEASUREMENT_ONLY:** protocol v3 の明示的な
-`review_mode=DELTA_REVIEW`、`review_package_ref`、`measurement_mode=true` を、workspace/capability
+`review_mode=DELTA_REVIEW` と `review_package_ref` を、workspace/capability
 allowlist と組み合わせた場合に限り、Claude package-first invocation を行う。package manifest、Context
 Manifest、Delta Report、Evidence Index、Job Context、target implementation job provenance、全hash、path containment、
 symlink/reparse point をactor起動前に再検証する。`READY_PACKAGE` かつ current context が検証可能な場合のみ起動し、
 `NEEDS_RECONCILIATION`、`UNVERIFIABLE`、stale/tamper、identity mismatch はfail closedとする。
+
+accepted envelope の `review_package_ref` は `path`、64文字 lowercase hex の `sha256`、
+`target_job_id` の3 fieldだけからなる。これは `actor=claude`、`mode=review`、
+`review_mode=DELTA_REVIEW` の protocol v3 job でのみ許可する。この組合せ自体が measurement activation を表し、
+内部 Job は `measurement_mode=true` に正規化する。移行互換のため明示的な `measurement_mode=true` も受理するが、
+省略時と同じ意味であり、`false`、ref欠落、余分なref field、malformed path/hash/target identity はfail closedとする。
 
 Claudeにはpackageをprimary inputとして先に読むこと、repo全体を既定で再探索しないこと、最小のbounded expansion
 だけを要求すること、各path/refとreasonを記録すること、範囲外を `OUT_OF_PACKAGE_SCOPE` とすることを指示する。

@@ -173,6 +173,14 @@ def test_v3_delta_review_metadata_is_explicit_and_validated():
     assert job.measurement_mode is True
 
 
+def test_v3_delta_review_ref_activates_measurement_when_flag_is_omitted():
+    ref = {"path": "validation/context/C/J/review-package",
+           "sha256": "a" * 64, "target_job_id": "IMPLEMENT-1"}
+    job = parse(make_v3_job(review_mode="DELTA_REVIEW", review_package_ref=ref))
+    assert job.review_package_ref == ref
+    assert job.measurement_mode is True
+
+
 def test_v3_delta_review_rejects_silent_fallback_shapes():
     expect_error(make_v3_job(review_mode="DELTA_REVIEW"),
                  "DELTA_REVIEW_REQUIRES_MEASUREMENT_PACKAGE")
@@ -194,6 +202,7 @@ TESTS = [
     test_v3_rejects_prompt_encoding,
     test_v3_rejects_prompt_sha256,
     test_v3_delta_review_metadata_is_explicit_and_validated,
+    test_v3_delta_review_ref_activates_measurement_when_flag_is_omitted,
     test_v3_delta_review_rejects_silent_fallback_shapes,
 ]
 

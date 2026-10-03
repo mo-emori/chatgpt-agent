@@ -335,7 +335,8 @@ def generate(root: str | Path, *, generated_root: str, **kwargs) -> dict:
 
 def validate_ref(root: str | Path, ref: dict, *, workspace: str, capability: str,
                  current_context_sha256: str | None = None,
-                 current_job_context_sha256: str | None = None) -> dict:
+                 current_job_context_sha256: str | None = None,
+                 target_job_id: str | None = None) -> dict:
     root = Path(root).resolve()
     package_rel = safe_relative(ref["path"])
     manifest_path = safe_path(root, f"{package_rel}/package-manifest.json")
@@ -348,6 +349,9 @@ def validate_ref(root: str | Path, ref: dict, *, workspace: str, capability: str
     actual = sha256(canonical(material))
     if actual != claimed or actual != ref.get("sha256"):
         raise ValueError("package manifest/hash mismatch")
+    expected_target = target_job_id or ref.get("target_job_id")
+    if expected_target is not None and manifest.get("target", {}).get("job_id") != expected_target:
+        raise ValueError("package target job identity mismatch")
     for fact in manifest.get("files", []):
         rel = safe_relative(fact["path"])
         raw = safe_path(root, f"{package_rel}/{rel}").read_bytes()
@@ -358,6 +362,11 @@ def validate_ref(root: str | Path, ref: dict, *, workspace: str, capability: str
         raw = safe_path(root, rel).read_bytes()
         if len(raw) != fact["size"] or sha256(raw) != fact["raw_sha256"]:
             raise ValueError(f"package ref stale or tampered: {rel}")
+    for name, fact in manifest.get("source_inputs", {}).items():
+        rel = safe_relative(fact["path"])
+        raw = safe_path(root, rel).read_bytes()
+        if len(raw) != fact["size"] or sha256(raw) != fact["sha256"]:
+            raise ValueError(f"package source input stale or tampered: {name}")
     if current_context_sha256 is not None and manifest.get("source_context_manifest_sha256") != current_context_sha256:
         raise ValueError("stale source Context Manifest SHA")
     if current_job_context_sha256 is not None and manifest.get("job_context_sha256") != current_job_context_sha256:

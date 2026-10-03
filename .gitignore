@@ -15,6 +15,7 @@ sandbox/
 
 # Temporary
 .tmp/
+.tmp-tests/
 .pip-audit-cache/
 *.diff
 

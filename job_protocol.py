@@ -61,6 +61,9 @@ class Job:
     prompt: str | None = None
     prompt_sha256: str | None = None
     instruction_ref: dict | None = None
+    review_mode: str | None = None
+    review_package_ref: dict | None = None
+    measurement_mode: bool = False
     callback_type: str | None = None
     callback_url: str | None = None
 
@@ -295,6 +298,10 @@ def parse_job(text: str) -> Job:
         ):
             reject("prompt must be non-empty")
 
+    review_mode = None
+    review_package_ref = None
+    measurement_mode = False
+
     if protocol_version == "1":
         # 現行処理をそのまま維持
         try:
@@ -360,6 +367,35 @@ def parse_job(text: str) -> Job:
         prompt = None
         verified_hash = None
         instruction_ref = ref
+
+        review_mode = data.get("review_mode")
+        if review_mode is not None and review_mode not in (
+            "DELTA_REVIEW", "BOUNDARY_REVIEW", "FULL_REVIEW"
+        ):
+            reject("INVALID_REVIEW_MODE")
+        review_package_ref = data.get("review_package_ref")
+        if review_package_ref is not None:
+            if not isinstance(review_package_ref, dict) or set(review_package_ref) - {
+                "path", "sha256", "target_job_id"
+            }:
+                reject("REVIEW_PACKAGE_REF_INVALID")
+            if not isinstance(review_package_ref.get("path"), str) or not review_package_ref["path"]:
+                reject("REVIEW_PACKAGE_REF_INVALID")
+            if not SHA256_RE.fullmatch(str(review_package_ref.get("sha256", ""))):
+                reject("REVIEW_PACKAGE_REF_INVALID")
+            if not isinstance(review_package_ref.get("target_job_id"), str) or not review_package_ref["target_job_id"]:
+                reject("REVIEW_PACKAGE_REF_INVALID")
+        measurement_mode = data.get("measurement_mode", False)
+        if not isinstance(measurement_mode, bool):
+            reject("MEASUREMENT_MODE_INVALID")
+        if (review_mode is not None or review_package_ref is not None or measurement_mode) and actor_mode != ("claude", "review"):
+            reject("REVIEW_METADATA_NOT_ALLOWED")
+        if review_mode == "DELTA_REVIEW" and (not measurement_mode or review_package_ref is None):
+            reject("DELTA_REVIEW_REQUIRES_MEASUREMENT_PACKAGE")
+        if review_mode == "BOUNDARY_REVIEW" and review_package_ref is not None:
+            reject("BOUNDARY_PACKAGE_NOT_SUPPORTED")
+        if review_mode != "DELTA_REVIEW" and measurement_mode:
+            reject("MEASUREMENT_MODE_REQUIRES_DELTA_REVIEW")
 
     # callback
     callback = data.get(
@@ -472,6 +508,9 @@ def parse_job(text: str) -> Job:
         prompt=prompt,
         prompt_sha256=verified_hash,
         instruction_ref=instruction_ref,
+        review_mode=review_mode,
+        review_package_ref=review_package_ref,
+        measurement_mode=measurement_mode,
         callback_type=callback_type,
         callback_url=callback_url,
     )
@@ -491,6 +530,11 @@ def job_from_row(row):
             if row["instruction_ref"]
             else None
         ),
+        review_mode=(row["review_mode"] if "review_mode" in row.keys() else None),
+        review_package_ref=(json.loads(row["review_package_ref"])
+                            if "review_package_ref" in row.keys() and row["review_package_ref"] else None),
+        measurement_mode=(bool(row["measurement_mode"])
+                          if "measurement_mode" in row.keys() else False),
         callback_type=row["callback_type"],
         callback_url=row["callback_url"],
     )

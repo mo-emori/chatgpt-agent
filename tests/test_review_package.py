@@ -2,6 +2,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,6 +10,7 @@ import context_harness
 import evidence_index
 import job_context
 import review_package
+import review_invocation
 from job_log import get_attributable_changed_paths, get_git_snapshot
 
 
@@ -191,6 +193,47 @@ class ReviewPackageTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             review_package.validate_ref(self.root, {"path": "link/pkg", "sha256": "x"},
                                         workspace="ws", capability="CAP")
+
+    def test_package_first_prompt_expansion_and_usage_telemetry(self):
+        job = self.job(); args = self.inputs(job)
+        report = review_package.generate(self.root, generated_root="validation/context", **args,
+            before=self.before, after=self.after, changed_paths=self.paths)
+        ref = {"path": report["package_path"], "sha256": report["sha256"],
+               "target_job_id": "JOB"}
+        review_job = SimpleNamespace(review_mode="DELTA_REVIEW", measurement_mode=True,
+            review_package_ref=ref, workspace="ws", prompt="independent review")
+        with patch.object(review_invocation, "observe", return_value=self.manifest):
+            launch = review_invocation.prepare(review_job, self.root,
+                {"review_measurement": {"enabled": True, "capabilities": ["CAP"]}},
+                {"capability": "CAP"})
+        prompt = review_invocation.build_prompt(review_job.prompt, launch)
+        self.assertIn(report["sha256"], prompt)
+        self.assertIn("Do not rediscover or scan the whole repository", prompt)
+        self.assertIn("OUT_OF_PACKAGE_SCOPE", prompt)
+        raw = json.dumps({"type":"assistant", "message":{"usage":{
+            "input_tokens":10,"cache_read_input_tokens":20,"output_tokens":3}, "content":[]}})
+        events = [{"kind":"tool_use", "tool":"Read", "path":"outside.txt"},
+                  {"kind":"tool_use", "tool":"Bash", "command":"type secret.txt"}]
+        telemetry = review_invocation.telemetry(launch, events, raw, "PACKAGE_INSUFFICIENT")
+        self.assertEqual(telemetry["package_outcome"], "PACKAGE_INSUFFICIENT")
+        self.assertFalse(telemetry["full_review_escalated"])
+        self.assertFalse(telemetry["measurement_complete"])
+        self.assertIn("OUT_OF_PACKAGE_SCOPE", [x["outcome"] for x in telemetry["expansion_paths"]])
+        self.assertEqual(telemetry["actor_usage"]["cache_read"], 20)
+        self.assertIsNone(telemetry["actor_usage"]["cache_creation"])
+
+    def test_package_gate_rejects_wrong_target(self):
+        job = self.job(); args = self.inputs(job)
+        report = review_package.generate(self.root, generated_root="validation/context", **args,
+            before=self.before, after=self.after, changed_paths=self.paths)
+        ref = {"path": report["package_path"], "sha256": report["sha256"],
+               "target_job_id": "WRONG"}
+        review_job = SimpleNamespace(review_mode="DELTA_REVIEW", measurement_mode=True,
+            review_package_ref=ref, workspace="ws")
+        with patch.object(review_invocation, "observe", return_value=self.manifest), self.assertRaises(ValueError):
+            review_invocation.prepare(review_job, self.root,
+                {"review_measurement": {"enabled": True, "capabilities": ["CAP"]}},
+                {"capability": "CAP"})
 
 
 if __name__ == "__main__":

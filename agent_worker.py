@@ -2,6 +2,7 @@ import json
 import hashlib
 import logging
 import subprocess
+from dataclasses import replace
 import threading
 import argparse
 import sys
@@ -10,6 +11,7 @@ from pathlib import Path
 from actors import run_agent
 from actors import claude
 from actors.claude_stream import parse_stream_json
+from review_invocation import PackageLaunchError, build_prompt as build_review_prompt, prepare as prepare_review_invocation, telemetry as review_telemetry
 from actors.process_runner import ProcessResult
 from actors.review_workspace import (
     ReviewPreparationError, cleanup_review, create_review_workspace, diff_head_stat, finish_review,
@@ -488,6 +490,12 @@ def prepare_execution(job, *, log_dir=None):
         request_data["instruction_sha256"] = (
             job.prompt_sha256
         )
+        if job.review_mode is not None:
+            request_data["review_mode"] = job.review_mode
+        if job.review_package_ref is not None:
+            request_data["review_package_ref"] = job.review_package_ref
+        if job.measurement_mode:
+            request_data["measurement_mode"] = True
 
     save_json(
         log_dir,
@@ -989,6 +997,7 @@ def execute_claude_review(job, say):
     review_evidence = not_run_review_evidence(bool(workspace.get("review_evidence_root")))
     context_session = None
     context = None
+    review_launch = None
 
     try:
         log_dir = create_job_log(job.job_id)
@@ -999,13 +1008,19 @@ def execute_claude_review(job, say):
             evidence_roots=_evidence_roots(workspace),
             job=job,
         )
+        review_launch = prepare_review_invocation(
+            job, canonical, workspace, context_session
+        )
         review = create_review_workspace(canonical, job.job_id)
 
         save_json(log_dir, "review-input.json", review.input_manifest)
         save_text(log_dir, "canonical-diff-head-before.stat", review.canonical_diff_stat)
         save_text(log_dir, "review-diff-head-before.stat", review.review_diff_stat)
         try:
-            result = claude.run(job, workdir=review.root, settings_path=review.settings_path)
+            actor_job = job
+            if review_launch is not None:
+                actor_job = replace(job, prompt=build_review_prompt(job.prompt, review_launch))
+            result = claude.run(actor_job, workdir=review.root, settings_path=review.settings_path)
             exit_code = result.returncode
             actor_status = "DONE" if result.returncode == 0 else "AGENT_ERROR"
             if actor_status != "DONE":
@@ -1030,6 +1045,9 @@ def execute_claude_review(job, say):
             save_json(log_dir, "review-execution.json", {
                 "events": normalized, "final_result_text": final_text,
                 "exit_code": result.returncode,
+                "review_context": review_telemetry(
+                    review_launch, normalized, result.stdout, final_text
+                ),
             })
         transcript_persisted = result is not None
         evidence_persisted = transcript_persisted and final_text is not None
@@ -1055,6 +1073,9 @@ def execute_claude_review(job, say):
             artifact_result = process_artifacts(job, bridge_result, workspace, review.root)
             artifact_status = artifact_result[1]
 
+    except PackageLaunchError as exc:
+        failure_class = "PACKAGE_PRELAUNCH_REJECTED"
+        error_summary = str(exc)[:4000]
     except ReviewPreparationError as exc:
         failure_class = exc.failure_class
         error_summary = str(exc)[:4000]
@@ -1093,6 +1114,9 @@ def execute_claude_review(job, say):
             "review_workspace": None,
             "cleanup_status": "PENDING",
         })
+        response["review_context"] = review_telemetry(
+            review_launch, normalized, result.stdout if result is not None else "", final_text
+        )
         if review is not None:
             response.update({
                 "canonical_head": review.canonical_before["head"],
@@ -1134,6 +1158,7 @@ def execute_claude_review(job, say):
                     actor_status=actor_status,
                     evidence_persisted=evidence_persisted,
                     adoptable=adoptable,
+                    review_context=response["review_context"],
                 )
             except Exception as exc:
                 # Evidence delivery is deliberately not a review qualification

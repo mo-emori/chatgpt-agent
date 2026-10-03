@@ -15,6 +15,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     prompt TEXT NOT NULL,
     prompt_sha256 TEXT,
     instruction_ref TEXT,
+    review_mode TEXT,
+    review_package_ref TEXT,
+    measurement_mode INTEGER NOT NULL DEFAULT 0,
     callback_type TEXT,
     callback_url TEXT,
     status TEXT NOT NULL,
@@ -93,6 +96,12 @@ def initialize():
                 ADD COLUMN instruction_ref TEXT
                 """
             )
+        if "review_mode" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN review_mode TEXT")
+        if "review_package_ref" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN review_package_ref TEXT")
+        if "measurement_mode" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN measurement_mode INTEGER NOT NULL DEFAULT 0")
 
 
 def create_job(job):
@@ -108,12 +117,15 @@ def create_job(job):
                 prompt,
                 prompt_sha256,
                 instruction_ref,
+                review_mode,
+                review_package_ref,
+                measurement_mode,
                 callback_type,
                 callback_url,
                 status,
                 received_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVED', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVED', ?)
             """,
             (
                 job.job_id,
@@ -132,6 +144,9 @@ def create_job(job):
                     is not None
                     else None
                 ),
+                job.review_mode,
+                json.dumps(job.review_package_ref, ensure_ascii=False) if job.review_package_ref else None,
+                int(job.measurement_mode),
                 job.callback_type,
                 job.callback_url,
                 now_iso(),

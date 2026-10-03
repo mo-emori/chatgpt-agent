@@ -25,6 +25,10 @@ def parse_stream_json(raw):
                     command = block.get("input", {}).get("command") if isinstance(block.get("input"), dict) else None
                     if command is not None:
                         entry["command"] = command
+                    tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                    path = tool_input.get("file_path") or tool_input.get("path")
+                    if isinstance(path, str):
+                        entry["path"] = path.replace("\\", "/")
                     events.append(entry)
                 elif block.get("type") == "tool_result":
                     events.append({"order": order, "kind": "tool_result",

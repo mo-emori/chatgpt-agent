@@ -12,6 +12,10 @@
       "allow_skip_git_repo_check": false,
       "review_evidence_root": "validation/evidence/external-review",
       "job_evidence_root": "validation/evidence/job-results",
+      "review_measurement": {
+        "enabled": true,
+        "capabilities": ["bootstrap-contract"]
+      },
       "artifact_roots": [
         "validation/reports",
         "validation/metrics",

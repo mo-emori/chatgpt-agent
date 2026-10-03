@@ -907,7 +907,30 @@ statusは `READY_PACKAGE` / `NEEDS_RECONCILIATION` / `UNVERIFIABLE` である。
 source Context/Job Context freshness、path containment、traversal、symlink/reparse、全included file/ref bytesを再検証する。
 Result Manifestへadditive `review_package` comparison diagnosticを出すがstatus単独でcurrent executionをblockしない。
 
-**NOT IMPLEMENTED:** actor-consumed `review_package_ref`、Claude lightweight/package-first invocation、modeによるactor routing、
+**Phase 3B-1 / IMPLEMENTED_EXPERIMENTAL_MEASUREMENT_ONLY:** protocol v3 の明示的な
+`review_mode=DELTA_REVIEW`、`review_package_ref`、`measurement_mode=true` を、workspace/capability
+allowlist と組み合わせた場合に限り、Claude package-first invocation を行う。package manifest、Context
+Manifest、Delta Report、Evidence Index、Job Context、target implementation job provenance、全hash、path containment、
+symlink/reparse point をactor起動前に再検証する。`READY_PACKAGE` かつ current context が検証可能な場合のみ起動し、
+`NEEDS_RECONCILIATION`、`UNVERIFIABLE`、stale/tamper、identity mismatch はfail closedとする。
+
+Claudeにはpackageをprimary inputとして先に読むこと、repo全体を既定で再探索しないこと、最小のbounded expansion
+だけを要求すること、各path/refとreasonを記録すること、範囲外を `OUT_OF_PACKAGE_SCOPE` とすることを指示する。
+confidenceを確立できなければ `PACKAGE_INSUFFICIENT` / `NEEDS_FULL_REVIEW` を返す。これは別の明示的
+FULL_REVIEW jobを要求する結果であり、同一invocation内でのsilent broad fallbackを許可しない。Claudeは
+`approved_semantics` を変更せず、reconciliationを提案できるだけである。通常のaccept authorityはChatGPT、
+critical/ambiguous/authority-changing caseはHumanに残る。
+
+Result Manifestのadditive `review_context` はmode、package identity/status/bytes/files、expansion、観測可能な
+bytes、escalation、context/evidence/job-context hash、Claude streamに構造化されたtoken/cache usageだけを記録する。
+Bash等でread pathを完全に観測できない場合は `measurement_complete=false` とし、metricを推測しない。
+normalized Review Evidenceにも同metadataを保存する。independent clone、canonical boundary、cleanup、Evidence
+Adoption、callback、JOB ENDの意味は変更しない。
+
+`FULL_REVIEW` は現在の安全なreference/fallbackであり既定動作は不変である。`BOUNDARY_REVIEW` のpackage
+consumptionは未実装であり、package refを受理しない。universal differential reviewはまだ有効化されていない。
+
+**NOT IMPLEMENTED:** universal package-first default、`BOUNDARY_REVIEW` package consumption、Codex implementation slicing、
 review clone visibility制限、automatic expansion/reconciliation。通常reviewはfull-repo input behaviorを維持する。
 
 ## 14. Notion Integration / Control & Registry Plane

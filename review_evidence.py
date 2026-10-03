@@ -167,7 +167,7 @@ def adopt_review_evidence(*, canonical, review_evidence_root, job_id, log_dir,
                           actor, mode, canonical_head, review_head_before,
                           review_head_after, input_manifest_sha256, file_count,
                           review_boundary, actor_status, evidence_persisted,
-                          adoptable) -> dict:
+                          adoptable, review_context=None) -> dict:
     """Atomically adopt a deterministic, normalized LIVE evidence package."""
     if not review_evidence_root:
         return not_run_review_evidence(False)
@@ -230,6 +230,7 @@ def adopt_review_evidence(*, canonical, review_evidence_root, job_id, log_dir,
             "actor_status": actor_status,
             "evidence_persisted": bool(evidence_persisted),
             "adoptable": bool(adoptable),
+            "review_context": review_context,
             "adoption": {"mode": "LIVE"},
             "normalized_files": normalized,
             "raw_local_only": raw,

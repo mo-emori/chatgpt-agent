@@ -38,6 +38,23 @@ class ContextMaterializerTests(JobContextTests):
         evidence = next(x for x in value["materialized_items"] if x["authority_class"] == "evidence")
         self.assertEqual(json.loads(evidence["content"])["findings"][0]["finding_id"], "F-1")
 
+    def test_refined_phase_2b_set_is_consumed_without_reselection(self):
+        sources = self.declaration["capabilities"]["CAP"]["sources"][:2]
+        sources[0].update(always_required=False, target_files=["src/bootstrap.py"])
+        sources[1].update(always_required=False, target_files=["src/other.py"])
+        self.conditional_sources(sources)
+        context, _ = self.build(job=self.job({"target_files": ["src/bootstrap.py"],
+                                               "max_text_bytes": 100000}))
+        write_json(self.dest / "job-context.json", context)
+        value, _ = context_materializer.build(
+            self.root, workspace="ws", capability="CAP", job_context=context,
+            job_context_path="validation/context/CAP/job-context.json",
+            evidence_index=self.index,
+            evidence_index_path="validation/context/CAP/evidence-index.json")
+        refs = {x["source_ref"] for x in value["materialized_items"]}
+        self.assertIn("bootstrap-contract.md", refs)
+        self.assertNotIn("bootstrap-adr.md", refs)
+
     def test_irrelevant_and_optional_are_not_materialized(self):
         index = copy.deepcopy(self.index)
         extra = copy.deepcopy(index["entries"][0]); extra["evidence_id"] = "other"
@@ -61,6 +78,21 @@ class ContextMaterializerTests(JobContextTests):
         value, _ = context_materializer.build(self.root, workspace="ws", capability="CAP",
             job_context=context, job_context_path="validation/context/CAP/job-context.json",
             evidence_index=self.index, evidence_index_path="validation/context/CAP/evidence-index.json")
+        self.assertEqual(value["materialization_status"], "UNVERIFIABLE")
+        self.assertEqual(value["materialized_items"], [])
+
+    def test_reconciliation_required_job_context_fails_closed(self):
+        delta = dict(self.delta)
+        delta.update(delta_status="POTENTIAL_AUTHORITY_CHANGE", changed_sources=[{
+            "source": "bootstrap-contract.md", "authority": "authoritative"}])
+        context, _ = self.build(job=self.job({"max_text_bytes": 100000}), delta=delta)
+        write_json(self.dest / "job-context.json", context)
+        value, _ = context_materializer.build(
+            self.root, workspace="ws", capability="CAP", job_context=context,
+            job_context_path="validation/context/CAP/job-context.json",
+            evidence_index=self.index,
+            evidence_index_path="validation/context/CAP/evidence-index.json")
+        self.assertEqual(context["selection_status"], "NEEDS_RECONCILIATION")
         self.assertEqual(value["materialization_status"], "UNVERIFIABLE")
         self.assertEqual(value["materialized_items"], [])
 

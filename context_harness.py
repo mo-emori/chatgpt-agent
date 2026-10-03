@@ -65,10 +65,68 @@ def load_declaration(root: str | Path) -> tuple[dict | None, str | None, list[st
         # approved semantics cannot be declared by an actor-editable mapping.
         if "approved_semantics" in value:
             raise ValueError("approved_semantics is not allowed in a workspace declaration")
+        for capability, config in sorted(value["capabilities"].items()):
+            if not isinstance(config, dict):
+                raise ValueError(f"capability must be an object: {capability}")
+            _validate_source_mappings(config, capability)
         return value, _sha(raw), []
     except Exception as exc:
         errors.append(f"DECLARATION_UNREADABLE: {exc}")
         return None, None, errors
+
+
+def _source_ref(spec: dict) -> str:
+    if isinstance(spec.get("path"), str):
+        return _safe_relative(spec["path"])
+    if isinstance(spec.get("glob"), str):
+        return "glob:" + _safe_relative(spec["glob"])
+    raise ValueError("source requires exactly one path or glob")
+
+
+def _validate_source_mappings(config: dict, capability: str = "") -> None:
+    sources = config.get("sources", [])
+    if not isinstance(sources, list):
+        raise ValueError(f"sources must be a list: {capability}")
+    refs = []
+    for spec in sources:
+        if not isinstance(spec, dict) or not isinstance(spec.get("kind"), str):
+            raise ValueError(f"invalid source declaration: {capability}")
+        if ("path" in spec) == ("glob" in spec):
+            raise ValueError(f"source requires exactly one path or glob: {capability}")
+        ref = _source_ref(spec)
+        if ref in refs:
+            raise ValueError(f"duplicate source reference: {ref}")
+        refs.append(ref)
+        authority = spec.get("authority", "authoritative")
+        if authority not in ("authoritative", "non_authority", "observed"):
+            raise ValueError(f"invalid authority class: {ref}")
+        if "always_required" in spec and not isinstance(spec["always_required"], bool):
+            raise ValueError(f"always_required must be boolean: {ref}")
+        for field in ("context_items", "target_files", "depends_on"):
+            values = spec.get(field, [])
+            if (not isinstance(values, list) or
+                    any(not isinstance(x, str) or not x for x in values)):
+                raise ValueError(f"{field} must be a list of non-empty strings: {ref}")
+        for target in spec.get("target_files", []):
+            _safe_relative(target)
+        if (authority == "authoritative" and spec.get("always_required") is False and
+                "glob" in spec):
+            raise ValueError(f"conditional authority requires a stable path reference: {ref}")
+    known = set(refs)
+    referenced = set()
+    for spec, ref in zip(sources, refs):
+        for dependency in spec.get("depends_on", []):
+            normalized = ("glob:" + _safe_relative(dependency[5:])
+                          if dependency.startswith("glob:") else _safe_relative(dependency))
+            if normalized not in known:
+                raise ValueError(f"unknown source dependency: {ref}->{normalized}")
+            referenced.add(normalized)
+    for spec, ref in zip(sources, refs):
+        if (spec.get("authority", "authoritative") == "authoritative" and
+                spec.get("always_required") is False and
+                not spec.get("target_files") and not spec.get("context_items") and
+                ref not in referenced):
+            raise ValueError(f"conditional authority lacks a structural mapping: {ref}")
 
 
 def select_capability(declaration: dict, *, actor: str, mode: str) -> str | None:
@@ -89,6 +147,11 @@ def _file_fact(root: Path, rel: str, spec: dict) -> tuple[dict, str | None]:
         "authority": spec.get("authority", "authoritative"),
         "context_items": sorted(set(spec.get("context_items", []))),
         "required": bool(spec.get("required", True)),
+        "always_required": (bool(spec.get("always_required", True))
+                            if spec.get("authority", "authoritative") == "authoritative"
+                            else False),
+        "target_files": sorted(set(spec.get("target_files", []))),
+        "depends_on": sorted(set(spec.get("depends_on", []))),
     }
     try:
         if not target.exists():
@@ -178,6 +241,11 @@ def observe(root: str | Path, capability: str, *, previous_context_hash: str | N
             f"{('path:' + source['path']) if 'path' in source else ('glob:' + source['glob'])}->{item}"
             for source in config.get("sources", [])
             for item in source.get("context_items", [])
+        }),
+        "source_dependency_edges": sorted({
+            f"{_source_ref(source)}->{dependency}"
+            for source in config.get("sources", [])
+            for dependency in source.get("depends_on", [])
         }),
         "unverifiable_reasons": sorted(set(errors)),
         "scan_identity": {"head_before": head_before, "head_after": head_after,

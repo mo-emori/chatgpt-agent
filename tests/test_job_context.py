@@ -86,6 +86,12 @@ class JobContextTests(unittest.TestCase):
             evidence_index=index, evidence_index_path="validation/context/CAP/evidence-index.json",
             declaration=self.declaration)
 
+    def conditional_sources(self, sources):
+        self.declaration["capabilities"]["CAP"]["sources"] = sources
+        write_json(self.root / ".agent/context.json", self.declaration)
+        self.manifest = context_harness.observe(self.root, "CAP")
+        self.delta = context_harness.scan(self.manifest, self.manifest)
+
     def test_deterministic_order_no_impact_and_explicit_dependency(self):
         job = self.job({"context_items": ["runtime"], "target_files": [], "finding_ids": ["F-1"]})
         one, report1 = self.build(job); two, report2 = self.build(job)
@@ -200,6 +206,150 @@ class JobContextTests(unittest.TestCase):
         result, _ = self.build(job=self.job({"finding_ids": [f"F-{n}" for n in range(1, 7)]}), index=index)
         self.assertEqual(len(result["evidence_refs"][0]["findings"]), 6)
         self.assertFalse(any(x["code"].startswith("REQUESTED_FINDING") for x in result["unresolved_items"]))
+
+    def test_legacy_and_explicit_base_authority(self):
+        self.declaration["capabilities"]["CAP"]["sources"][1]["always_required"] = True
+        self.conditional_sources(self.declaration["capabilities"]["CAP"]["sources"])
+        result, _ = self.build()
+        refs = {x["source_ref"]: x for x in result["authoritative_source_refs"]}
+        self.assertEqual(set(refs), {"bootstrap-contract.md", "bootstrap-adr.md"})
+        self.assertIn("BASE_AUTHORITY", refs["bootstrap-contract.md"]["reason_codes"])
+        self.assertIn("BASE_AUTHORITY", refs["bootstrap-adr.md"]["reason_codes"])
+
+    def test_conditional_target_match_and_unrelated_omission(self):
+        sources = self.declaration["capabilities"]["CAP"]["sources"][:2]
+        sources[0].update(always_required=False, target_files=["src/bootstrap.py"])
+        sources[1].update(always_required=False, target_files=["src/other.py"])
+        self.conditional_sources(sources)
+        result, _ = self.build(self.job({"target_files": ["src/bootstrap.py"]}))
+        self.assertEqual([x["source_ref"] for x in result["authoritative_source_refs"]],
+                         ["bootstrap-contract.md"])
+        self.assertEqual(result["authoritative_source_refs"][0]["reason"], "TARGET_MATCH")
+        self.assertEqual(result["omitted_sources"][0]["reason"], "PROVEN_UNRELATED_CONDITIONAL")
+
+    def test_conditional_context_item_dependency_closure_and_cycle(self):
+        sources = self.declaration["capabilities"]["CAP"]["sources"][:2]
+        sources[0].update(always_required=False, context_items=["bootstrap"],
+                          depends_on=["bootstrap-adr.md"])
+        sources[1].update(always_required=False, context_items=["adr"],
+                          depends_on=["bootstrap-contract.md"])
+        self.conditional_sources(sources)
+        first, _ = self.build(self.job({"context_items": ["bootstrap"]}))
+        second, _ = self.build(self.job({"context_items": ["bootstrap"]}))
+        self.assertEqual(first["package_sha256"], second["package_sha256"])
+        refs = {x["source_ref"]: x for x in first["authoritative_source_refs"]}
+        self.assertIn("CONTEXT_ITEM_MATCH", refs["bootstrap-contract.md"]["reason_codes"])
+        self.assertIn("DEPENDENCY_CLOSURE", refs["bootstrap-adr.md"]["reason_codes"])
+
+    def test_conditional_empty_request_fails_closed(self):
+        source = self.declaration["capabilities"]["CAP"]["sources"][0]
+        source.update(always_required=False, target_files=["src/bootstrap.py"])
+        self.conditional_sources([source])
+        result, _ = self.build(self.job({}))
+        self.assertEqual(result["selection_status"], "NEEDS_RECONCILIATION")
+        self.assertEqual([x["source_ref"] for x in result["authoritative_source_refs"]],
+                         ["bootstrap-contract.md"])
+        self.assertTrue(any(x["code"] == "MISSING_STRUCTURED_REQUEST"
+                            for x in result["reconciliation_requirements"]))
+
+    def test_conditional_ambiguous_mapping_fails_closed(self):
+        source = self.declaration["capabilities"]["CAP"]["sources"][0]
+        source.update(always_required=False, target_files=["src/bootstrap.py"])
+        self.conditional_sources([source])
+        result, _ = self.build(self.job({"target_files": ["src/unmapped.py"]}))
+        self.assertEqual(result["selection_status"], "NEEDS_RECONCILIATION")
+        self.assertIn("AMBIGUOUS_SELECTOR_MAPPING",
+                      result["authoritative_source_refs"][0]["reason_codes"])
+
+    def test_changed_conditional_authority_is_required(self):
+        sources = self.declaration["capabilities"]["CAP"]["sources"][:2]
+        sources[0].update(always_required=False, target_files=["src/bootstrap.py"])
+        sources[1].update(always_required=False, target_files=["src/other.py"])
+        self.conditional_sources(sources)
+        delta = dict(self.delta)
+        delta.update(delta_status="POTENTIAL_AUTHORITY_CHANGE", changed_sources=[{
+            "source": "bootstrap-contract.md", "authority": "authoritative"}])
+        result, _ = self.build(self.job({"target_files": ["src/other.py"]}), delta=delta)
+        refs = {x["source_ref"]: x for x in result["authoritative_source_refs"]}
+        self.assertIn("CHANGED_AUTHORITY", refs["bootstrap-contract.md"]["reason_codes"])
+        self.assertIn("TARGET_MATCH", refs["bootstrap-adr.md"]["reason_codes"])
+
+    def test_changed_non_authority_evidence_is_not_authority_and_keeps_evidence_semantics(self):
+        self.declaration["capabilities"]["CAP"]["sources"].append({
+            "path": "evidence/result.json", "kind": "evidence", "authority": "non_authority",
+            "context_items": ["review"], "required": True})
+        self.conditional_sources(self.declaration["capabilities"]["CAP"]["sources"])
+        delta = dict(self.delta)
+        delta.update(delta_status="CONTEXT_UPDATE", changed_sources=[{
+            "source": "evidence/result.json", "authority": "non_authority",
+            "change_kind": "STATUS_CHANGED"}])
+        result, report = self.build(self.job({"finding_ids": ["F-1"]}), delta=delta)
+        self.assertNotIn("evidence/result.json",
+                         {x["source_ref"] for x in result["authoritative_source_refs"]})
+        self.assertEqual(report["authority_ref_count"], 2)
+        self.assertEqual(result["evidence_refs"][0]["relevance"], "REQUIRED_RELEVANT")
+        self.assertEqual(result["evidence_refs"][0]["trust"], self.index["entries"][0]["trust"])
+        self.assertEqual(result["evidence_refs"][0]["quality"], self.index["entries"][0]["quality"])
+        self.assertEqual(result["changed_sources"][0]["source"], "evidence/result.json")
+
+    def test_mixed_four_authority_and_one_evidence_change_counts_only_authority(self):
+        (self.root / "authority-three.md").write_text("three\n", encoding="utf-8")
+        (self.root / "authority-four.md").write_text("four\n", encoding="utf-8")
+        self.declaration["capabilities"]["CAP"]["sources"].extend([
+            {"path": "authority-three.md", "kind": "contract", "authority": "authoritative"},
+            {"path": "authority-four.md", "kind": "adr", "authority": "authoritative"},
+            {"path": "evidence/result.json", "kind": "evidence", "authority": "non_authority"},
+        ])
+        self.conditional_sources(self.declaration["capabilities"]["CAP"]["sources"])
+        changed = [{"source": path, "authority": authority, "change_kind": "STATUS_CHANGED"}
+                   for path, authority in (
+                       ("bootstrap-contract.md", "authoritative"),
+                       ("bootstrap-adr.md", "authoritative"),
+                       ("authority-three.md", "authoritative"),
+                       ("authority-four.md", "authoritative"),
+                       ("evidence/result.json", "non_authority"))]
+        delta = dict(self.delta)
+        delta.update(delta_status="POTENTIAL_AUTHORITY_CHANGE", changed_sources=changed)
+        result, report = self.build(self.job({"finding_ids": ["F-1"]}), delta=delta)
+        self.assertEqual(report["authority_ref_count"], 4)
+        self.assertEqual({x["source_ref"] for x in result["authoritative_source_refs"]}, {
+            "bootstrap-contract.md", "bootstrap-adr.md", "authority-three.md", "authority-four.md"})
+        self.assertTrue(all("CHANGED_AUTHORITY" in x["reason_codes"]
+                            for x in result["authoritative_source_refs"]))
+        self.assertEqual(result["selection_status"], "NEEDS_RECONCILIATION")
+        self.assertTrue(any(x["code"] == "CHANGED_AUTHORITY_REQUIRES_DECISION"
+                            for x in result["reconciliation_requirements"]))
+
+    def test_invalid_declaration_dependency_reference_rejected(self):
+        source = self.declaration["capabilities"]["CAP"]["sources"][0]
+        source["depends_on"] = ["missing.md"]
+        write_json(self.root / ".agent/context.json", self.declaration)
+        declaration, _, errors = context_harness.load_declaration(self.root)
+        self.assertIsNone(declaration)
+        self.assertIn("unknown source dependency", errors[0])
+
+    def test_selector_semantics_change_job_context_hash(self):
+        source = self.declaration["capabilities"]["CAP"]["sources"][0]
+        source.update(always_required=False, target_files=["src/bootstrap.py"])
+        self.conditional_sources([source])
+        one, _ = self.build(self.job({"target_files": ["src/bootstrap.py"]}))
+        self.declaration["capabilities"]["CAP"]["sources"][0]["target_files"] = ["src/renamed.py"]
+        # Keep the same observed inputs to prove selector semantics themselves are identity material.
+        two, _ = self.build(self.job({"target_files": ["src/bootstrap.py"]}))
+        self.assertNotEqual(one["package_sha256"], two["package_sha256"])
+
+    def test_lower_trust_evidence_does_not_replace_authority(self):
+        result, _ = self.build(self.job({"finding_ids": ["F-1"]}))
+        self.assertEqual(len([x for x in result["authoritative_source_refs"]
+                              if x["authority"] == "authoritative"]), 2)
+        self.assertEqual(result["evidence_refs"][0]["relevance"], "REQUIRED_RELEVANT")
+
+    def test_argus_like_legacy_fixture_still_selects_four_authorities(self):
+        template = json.loads((Path(__file__).parents[1] /
+            "docs/argus_runtime_bootstrap_context_phase1.json").read_text("utf-8"))
+        specs = template["capabilities"]["RUNTIME-BOOTSTRAP-ORCHESTRATOR"]["sources"]
+        self.assertEqual(sum(s.get("authority", "authoritative") == "authoritative" and
+                             s.get("always_required", True) for s in specs), 4)
 
 
 if __name__ == "__main__":

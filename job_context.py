@@ -12,8 +12,8 @@ from pathlib import Path, PurePosixPath
 
 
 SCHEMA = "context-harness-job-context"
-SCHEMA_VERSION = 1
-BUILDER_VERSION = "context-harness-phase2b-1"
+SCHEMA_VERSION = 2
+BUILDER_VERSION = "context-harness-phase2b-2"
 MODE = "COMPARISON_ONLY"
 STATUSES = ("READY_BOUNDED", "NEEDS_RECONCILIATION", "UNVERIFIABLE")
 RELEVANCE = ("REQUIRED_RELEVANT", "BOUNDED_CANDIDATE", "IRRELEVANT")
@@ -138,6 +138,65 @@ def _expansion(*, evidence_ref=None, source_ref=None, reason: str,
             "origin": origin, "suggested_scope": sorted(set(suggested_scope or []))}
 
 
+def _source_ref(spec: dict) -> str:
+    if isinstance(spec.get("path"), str):
+        return safe_relative(spec["path"])
+    if isinstance(spec.get("glob"), str):
+        return "glob:" + safe_relative(spec["glob"])
+    raise ValueError("source requires exactly one path or glob")
+
+
+def _selector_contract(config: dict) -> dict:
+    """Validate and return the declaration-owned selector identity."""
+    specs = config.get("sources", [])
+    if not isinstance(specs, list):
+        raise ValueError("sources must be a list")
+    result, known = [], set()
+    for spec in specs:
+        if not isinstance(spec, dict) or not isinstance(spec.get("kind"), str):
+            raise ValueError("invalid source declaration")
+        if ("path" in spec) == ("glob" in spec):
+            raise ValueError("source requires exactly one path or glob")
+        ref = _source_ref(spec)
+        if ref in known:
+            raise ValueError(f"duplicate source reference: {ref}")
+        known.add(ref)
+        authority = spec.get("authority", "authoritative")
+        if authority not in ("authoritative", "non_authority", "observed"):
+            raise ValueError(f"invalid authority class: {ref}")
+        if "always_required" in spec and not isinstance(spec["always_required"], bool):
+            raise ValueError(f"always_required must be boolean: {ref}")
+        fields = {}
+        for field in ("context_items", "target_files", "depends_on"):
+            values = spec.get(field, [])
+            if not isinstance(values, list) or any(not isinstance(x, str) or not x for x in values):
+                raise ValueError(f"{field} must be a list of non-empty strings: {ref}")
+            fields[field] = sorted(set(safe_relative(x) for x in values)) if field == "target_files" else sorted(set(values))
+        conditional = authority == "authoritative" and spec.get("always_required") is False
+        if conditional and "glob" in spec:
+            raise ValueError(f"conditional authority requires a stable path reference: {ref}")
+        result.append({"source_ref": ref, "authority": authority,
+                       "always_required": authority == "authoritative" and bool(spec.get("always_required", True)),
+                       **fields})
+    referenced = set()
+    for item in result:
+        normalized = []
+        for dependency in item["depends_on"]:
+            dep = ("glob:" + safe_relative(dependency[5:])
+                   if dependency.startswith("glob:") else safe_relative(dependency))
+            if dep not in known:
+                raise ValueError(f"unknown source dependency: {item['source_ref']}->{dep}")
+            normalized.append(dep)
+            referenced.add(dep)
+        item["depends_on"] = sorted(set(normalized))
+    for item in result:
+        if (item["authority"] == "authoritative" and not item["always_required"] and
+                not item["target_files"] and not item["context_items"] and
+                item["source_ref"] not in referenced):
+            raise ValueError(f"conditional authority lacks a structural mapping: {item['source_ref']}")
+    return {"version": 1, "sources": sorted(result, key=lambda x: x["source_ref"])}
+
+
 def build(root: str | Path, *, workspace: str, capability: str, job,
           manifest: dict, manifest_path: str, delta: dict, delta_path: str,
           evidence_index: dict, evidence_index_path: str, declaration: dict) -> tuple[dict, dict]:
@@ -179,6 +238,11 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
         manifest_file_sha = delta_sha = index_sha = None
 
     config = declaration.get("capabilities", {}).get(capability, {})
+    try:
+        selector_contract = _selector_contract(config)
+    except Exception as exc:
+        selector_contract = {"version": 1, "sources": []}
+        unresolved.append({"code": "INVALID_DECLARATION_REFERENCE", "detail": str(exc)[:1000]})
     sources, omitted_sources, dependency_states = [], [], []
     changed = {x.get("source"): x for x in stored_delta.get("changed_sources", [])}
     target_files = set(request["target_files"])
@@ -186,21 +250,107 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
     observed_by_path = {x.get("path"): x for x in stored_manifest.get("observed", {}).get("sources", [])}
     protected = sorted(set(_strings(config.get("protected_paths"), "protected_paths") +
                            _strings(config.get("forbidden_paths"), "forbidden_paths")))
-    for spec in sorted(config.get("sources", []), key=lambda x: (x.get("path", x.get("glob", "")), x.get("kind", ""))):
+    specs = sorted(config.get("sources", []), key=lambda x: (x.get("path", x.get("glob", "")), x.get("kind", "")))
+    spec_by_ref = {}
+    for spec in specs:
+        try:
+            spec_by_ref[_source_ref(spec)] = spec
+        except ValueError:
+            continue
+    conditional_refs = {ref for ref, spec in spec_by_ref.items()
+                        if spec.get("authority", "authoritative") == "authoritative"
+                        and spec.get("always_required") is False}
+    selected_reasons: dict[str, set[str]] = {}
+    for ref, spec in spec_by_ref.items():
+        if (spec.get("authority", "authoritative") == "authoritative" and
+                spec.get("always_required", True)):
+            selected_reasons.setdefault(ref, set()).add("BASE_AUTHORITY")
+
+    selector_present = bool(target_files or wanted_items)
+    if conditional_refs and not selector_present:
+        reconciliation.append({"code": "MISSING_STRUCTURED_REQUEST",
+                               "conditional_source_refs": sorted(conditional_refs)})
+        expansion.append(_expansion(reason="MISSING_STRUCTURED_REQUEST",
+            requirement="REQUIRED_BEFORE_REVIEW", authority_class="authoritative",
+            suggested_scope=sorted(conditional_refs)))
+        for ref in conditional_refs:
+            selected_reasons.setdefault(ref, set()).add("MISSING_STRUCTURED_REQUEST")
+    else:
+        mapped_targets, mapped_items = set(), set()
+        for ref in sorted(spec_by_ref):
+            spec = spec_by_ref[ref]
+            target_hits = target_files.intersection(spec.get("target_files", []))
+            item_hits = wanted_items.intersection(spec.get("context_items", []))
+            if target_hits and ref in conditional_refs:
+                selected_reasons.setdefault(ref, set()).add("TARGET_MATCH")
+            if item_hits and ref in conditional_refs:
+                selected_reasons.setdefault(ref, set()).add("CONTEXT_ITEM_MATCH")
+            mapped_targets.update(target_hits)
+            mapped_items.update(item_hits)
+        unmapped_targets = target_files - mapped_targets
+        unmapped_items = wanted_items - mapped_items
+        if conditional_refs and (unmapped_targets or unmapped_items):
+            reconciliation.append({"code": "AMBIGUOUS_SELECTOR_MAPPING",
+                "unmapped_target_files": sorted(unmapped_targets),
+                "unmapped_context_items": sorted(unmapped_items)})
+            expansion.append(_expansion(reason="AMBIGUOUS_SELECTOR_MAPPING",
+                requirement="REQUIRED_BEFORE_REVIEW", authority_class="authoritative",
+                suggested_scope=sorted(conditional_refs)))
+            for ref in conditional_refs:
+                selected_reasons.setdefault(ref, set()).add("AMBIGUOUS_SELECTOR_MAPPING")
+
+    # Authority changes are always required, independently of request selection.
+    for ref, spec in spec_by_ref.items():
+        if spec.get("authority", "authoritative") != "authoritative":
+            continue
         declared = spec.get("path")
+        if declared in changed:
+            selected_reasons.setdefault(ref, set()).add("CHANGED_AUTHORITY")
+
+    # Deterministic transitive closure. A visited set makes cycles terminate.
+    pending = sorted(selected_reasons)
+    visited = set()
+    while pending:
+        ref = pending.pop(0)
+        if ref in visited:
+            continue
+        visited.add(ref)
+        for dependency in sorted(spec_by_ref.get(ref, {}).get("depends_on", [])):
+            dep = ("glob:" + safe_relative(dependency[5:])
+                   if dependency.startswith("glob:") else safe_relative(dependency))
+            if dep not in spec_by_ref:
+                unresolved.append({"code": "INVALID_DECLARATION_REFERENCE",
+                                   "source_ref": ref, "dependency_ref": dep})
+                continue
+            if dep not in selected_reasons:
+                selected_reasons[dep] = {"DEPENDENCY_CLOSURE"}
+            else:
+                selected_reasons[dep].add("DEPENDENCY_CLOSURE")
+            if dep not in visited:
+                pending.append(dep)
+        pending.sort()
+
+    for spec in specs:
+        declared = spec.get("path")
+        try:
+            spec_ref = _source_ref(spec)
+        except ValueError:
+            continue
         matches = ([observed_by_path[declared]] if declared in observed_by_path else
                    [v for k, v in sorted(observed_by_path.items())
                     if declared is None and v.get("kind") == spec.get("kind")])
         items = sorted(set(spec.get("context_items", [])))
         authoritative = spec.get("authority", "authoritative") == "authoritative"
-        relevant = authoritative or bool(wanted_items.intersection(items)) or declared in target_files or any(
-            fact.get("path") in target_files for fact in matches) or any(fact.get("path") in changed for fact in matches)
+        direct_non_authority = (not authoritative and (bool(wanted_items.intersection(items)) or
+            declared in target_files or any(fact.get("path") in target_files for fact in matches)))
+        relevant = spec_ref in selected_reasons or direct_non_authority
         if relevant:
             for fact in matches:
+                reasons = sorted(selected_reasons.get(spec_ref) or {"EXPLICIT_DEPENDENCY_OR_TARGET"})
                 sources.append({"source_ref": fact.get("path"), "kind": fact.get("kind"),
                                 "authority": fact.get("authority"), "raw_sha256": fact.get("raw_sha256"),
                                 "context_items": fact.get("context_items", []),
-                                "reason": "CAPABILITY_AUTHORITY" if authoritative else "EXPLICIT_DEPENDENCY_OR_TARGET"})
+                                "reason": reasons[0], "reason_codes": reasons})
                 for item in fact.get("context_items", []):
                     dependency_states.append({"context_item": item, "source_ref": fact.get("path"),
                                               "state": "CHANGED" if fact.get("path") in changed else "CURRENT"})
@@ -212,7 +362,8 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
                         requirement="REQUIRED_BEFORE_REVIEW", authority_class="authoritative"))
         else:
             omitted_sources.append({"source_ref": declared or spec.get("glob"),
-                                    "reason": "EXPLICITLY_UNRELATED_DEPENDENCY"})
+                                    "reason": "PROVEN_UNRELATED_CONDITIONAL" if authoritative else
+                                              "EXPLICITLY_UNRELATED_DEPENDENCY"})
 
     requested_findings = set(request["finding_ids"] + request["previous_finding_ids"])
     requested_evidence = set(request["evidence_ids"])
@@ -279,13 +430,26 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
         approved_refs = []
 
     status = ("UNVERIFIABLE" if unresolved and any(x["code"] in
-              ("INPUT_UNVERIFIABLE", "DELTA_UNVERIFIABLE") for x in unresolved)
+              ("INPUT_UNVERIFIABLE", "DELTA_UNVERIFIABLE", "INVALID_DECLARATION_REFERENCE") for x in unresolved)
               else "NEEDS_RECONCILIATION" if reconciliation or unresolved or any(
                   x["requirement"] == "REQUIRED_BEFORE_REVIEW" for x in expansion)
               else "READY_BOUNDED")
     selection_reasons = [
-        _reason("authoritative_sources", "INCLUDED", "ALL_CAPABILITY_DECLARED_AUTHORITY", len(sources)),
-        _reason("unrelated_sources", "OMITTED", "EXPLICITLY_UNRELATED_DEPENDENCY_ONLY", len(omitted_sources)),
+        _reason("authoritative_sources", "INCLUDED", "BASE_AUTHORITY", sum(
+            "BASE_AUTHORITY" in x.get("reason_codes", []) for x in sources)),
+        _reason("authoritative_sources", "INCLUDED", "TARGET_MATCH", sum(
+            "TARGET_MATCH" in x.get("reason_codes", []) for x in sources)),
+        _reason("authoritative_sources", "INCLUDED", "CONTEXT_ITEM_MATCH", sum(
+            "CONTEXT_ITEM_MATCH" in x.get("reason_codes", []) for x in sources)),
+        _reason("dependency_sources", "INCLUDED", "DEPENDENCY_CLOSURE", sum(
+            "DEPENDENCY_CLOSURE" in x.get("reason_codes", []) for x in sources)),
+        _reason("authoritative_sources", "INCLUDED", "CHANGED_AUTHORITY", sum(
+            "CHANGED_AUTHORITY" in x.get("reason_codes", []) for x in sources)),
+        _reason("conditional_authority", "EXPANSION", "MISSING_STRUCTURED_REQUEST", sum(
+            "MISSING_STRUCTURED_REQUEST" in x.get("reason_codes", []) for x in sources)),
+        _reason("conditional_authority", "EXPANSION", "AMBIGUOUS_SELECTOR_MAPPING", sum(
+            "AMBIGUOUS_SELECTOR_MAPPING" in x.get("reason_codes", []) for x in sources)),
+        _reason("unrelated_sources", "OMITTED", "PROVEN_UNRELATED_CONDITIONAL", len(omitted_sources)),
         _reason("evidence", "INCLUDED", "EXPLICIT_MATCH_OR_BOUNDED_CANONICAL_SET", len(evidence_refs)),
         _reason("approved_semantics", "INCLUDED", "EXPLICIT_APPROVAL_AND_PROVENANCE_ONLY", len(approved_refs)),
         _reason("prose", "OMITTED", "NEVER_PARSED_FOR_RELATIONSHIPS_OR_FINDINGS", 0),
@@ -293,6 +457,7 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
     body = {
         "schema": SCHEMA, "schema_version": SCHEMA_VERSION, "builder_version": BUILDER_VERSION,
         "mode": MODE, "workspace": workspace, "capability": capability, "phase": request["phase"],
+        "selector_contract": selector_contract,
         "source_context_manifest_sha256": stored_manifest.get("lifecycle", {}).get("manifest_sha256"),
         "source_context_file_sha256": manifest_file_sha,
         "delta_report_sha256": delta_sha, "delta_status": delta_status,

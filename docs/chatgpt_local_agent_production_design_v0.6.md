@@ -563,10 +563,12 @@ protocol-v3 job identity/instruction hash、および `instruction_ref.context_r
 `phase`、`target_files`、`finding_ids`、`previous_finding_ids`、`context_items`、`evidence_ids`、`max_text_bytes`
 を構造化入力として扱い、instruction proseからcapability/finding/dependencyを推論しない。LLMをslicer内部で使用しない。
 
-schemaは `context-harness-job-context` version 1であり、workspace/capability/phase、source manifest hash、delta hash/status、
+schemaは `context-harness-job-context` version 2であり、workspace/capability/phase、source manifest hash、delta hash/status、
 Evidence Index hash、job identity/instruction hash、selection status、authority refs、provenanced approved semantics、dependency
 state、evidence refs、structured finding IDs、target/changed files、protected/forbidden boundaries、unknowns、reconciliation/
-expansion requirements、included file/excerpt hashes、categoryごとのselection reason、size counts、deterministic package hashを持つ。
+expansion requirements、included file/excerpt hashes、declaration由来の `selector_contract`、categoryごとのselection reason、
+size counts、deterministic package hashを持つ。selector contractはsourceごとの `always_required`、`target_files`、
+`context_items`、`depends_on` を含み、mapping semanticsの変更もJob Context identity/hashを変更する。
 serializationはUTF-8、key sort、compact separator、末尾LFでcanonical化する。whole documentは複製せずref/hashを優先し、
 declarationにmechanically stable selectorがない場合はsemantic excerptを作らずexpansion requirementを記録する。
 
@@ -584,8 +586,29 @@ affected itemsを記録する。Delta `UNVERIFIABLE`はselectionも `UNVERIFIABL
 `approved_semantics`を変更しない。LLMは将来reconciliationを分析・提案できるが、通常のaccept/update authorityはChatGPT、
 critical/ambiguous/authority-changing decisionはHumanへescalateする。
 
-全capability-declared authoritative sourceを必ず含める。observed/non-authority sourceはexplicit dependency edge、structured
-target、またはDelta changeが一致した場合に含め、明示的にunrelatedなものだけ理由付きで除外する。STRUCTURED evidenceの
+authorityは常時必須と同義ではない。authoritative sourceの `always_required` はbooleanであり、省略時はmigration互換のため
+`true` とする。従って既存declarationは従来どおり全authorityをbase authorityとして含める。選択的authorityはdeclarationが
+`always_required: false` を明示し、exact workspace-relative `target_files` または `context_items` と、必要ならsource refを指す
+`depends_on` を宣言した場合だけ有効である。conditional glob authority、重複source ref、未知dependency ref、unsafe target/ref、
+型不正はdeclaration validationで拒否する。
+
+決定的selectionは **base authority ∪ structured-request seedのdependency closure ∪ changed authority ∪ existing explicitly-required
+evidence** の順で構成する。seedはexact target matchを `TARGET_MATCH`、exact context item matchを `CONTEXT_ITEM_MATCH` とし、
+`depends_on` のtransitive closureを `DEPENDENCY_CLOSURE` として加える。closureはsorted queueとvisited setでcycleを決定的に終端する。
+authoritative sourceのDelta changeはrequestと無関係に `CHANGED_AUTHORITY` として必須集合へunionし、Phase 1の
+`POTENTIAL_AUTHORITY_CHANGE` / reconciliation semanticsを保持する。このunionはdeclaration/manifestのauthority classが
+`authoritative` のsourceだけを対象とし、changed non-authority evidenceはauthority refs/countへ昇格せず、既存のEvidence Index
+selectionとtrust/quality規則に従う。lower-trust evidenceはauthorityを置換または上書きしない。
+
+conditional authorityが存在するのにstructured requestの `target_files` と `context_items` が両方空なら、全conditional authorityを
+安全側へ展開して `MISSING_STRUCTURED_REQUEST` により `NEEDS_RECONCILIATION` とする。request valueをdeclaration mappingへ一意に
+閉じられない場合も全conditional authorityを展開し `AMBIGUOUS_SELECTOR_MAPPING` とする。silent omissionやprompt/prose semantic
+relevance inferenceは行わない。完全にmappingされたrequestでseed/closure/changeのいずれにも属さないconditional authorityだけを
+`PROVEN_UNRELATED_CONDITIONAL` として除外できる。base/target/context/dependency/changeの各選択理由はsource refごとの
+`reason_codes` と集計 `selection_reasons` に保持する。
+
+observed/non-authority sourceはexplicit dependency edgeまたはstructured targetが一致した場合に含め、明示的にunrelatedなものだけ
+理由付きで除外する。Delta change自体をauthority refへの昇格条件にはしない。STRUCTURED evidenceの
 fieldはselectionに利用できる。PARTIALは既知fieldを利用しunknownを保持、UNSTRUCTUREDはrefとして含められるがproseから
 finding/verdict/relationを生成しない。actor failure（429/session limitを含む）はexecution failureでありsuccessful review
 verdictではない。requested findingがstructured indexに存在しなければfabricateせずunknown + expansionとする。
@@ -628,7 +651,11 @@ authority/quality別item countであり、token savingsは主張しない。
 ARGUS `RUNTIME-BOOTSTRAP-ORCHESTRATOR` acceptanceでは、declarationが明示するBootstrap Contract/ADR/Registry authority、
 dependency state、structured prior review/correction evidenceを表現できる。429 rereviewはfailureのみである。六 findingsは
 structured evidenceに存在する場合だけ列挙し、proseにしかない場合はUNSTRUCTURED/unknownのままbounded expansionを要求する。
-比較上、安全側のover-inclusionはunfiltered canonical evidence refsと全declared authorityであり、既知のsilent omissionはない。
+比較上、安全側のover-inclusionはunfiltered canonical evidence refs、legacy/base authority、およびfail-closed時のconditional
+authorityであり、既知のsilent omissionはない。現行ARGUS declarationは新fieldを持たないため4 authority refsを従来どおり選択する。
+選択的削減には別jobでARGUS declarationへ `always_required: false`、完全な `target_files` / `context_items` / `depends_on` mappingを
+追加し、missing/ambiguous requestを解消するenrichmentと承認が必要である。Phase 2B/2Cはいずれも引き続き
+`COMPARISON_ONLY` で、actor input activationは行わない。
 
 ### 7.8 Lease and ARGUS PoC（IMPLEMENTED_BASELINE）
 

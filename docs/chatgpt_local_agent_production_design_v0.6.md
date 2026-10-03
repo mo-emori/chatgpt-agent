@@ -1105,9 +1105,23 @@ callback textも書き込まず、約120秒を上限として約500 ms間隔で�
 Fail Closedにし、overwrite / clear / append / sendのいずれも行わない。観測したliveな空contenteditableは
 `innerText="\n"`, `textContent=""`, placeholder paragraph HTMLであり、whitespace-onlyの `innerText` は空と扱う。
 
-空composerの確認後にのみcallback textをfillし、uniqueなvisible SEND buttonを約5秒まで待つ。
+空composerの確認後、element型ごとにcallback textを挿入し、uniqueなvisible SEND buttonを約5秒まで待つ。
+`INPUT` / `TEXTAREA` はPlaywright `locator.fill()` と `value` read-backを使用し、ブラウザ標準の改行表現差
+（CRLF / CR / LF）のみLFへ統一して比較できる。`DIV[contenteditable=true]` はfocus後にPlaywright
+`keyboard.insert_text()` を使用する。`fill()` はChatGPTのcontenteditable editorで段落構造を書き換え、
+8 LFを18 LFへ膨張させたlive evidenceがあるため使用しない。contenteditableのread-back contractは
+ChatGPT / ProseMirrorの直下 `P` / `DIV` 1個をlogical line 1行として順番にLF 1個で連結する。
+空行placeholderのsole `BR` は空文字、inline content中の `BR` はLF、block末尾のplaceholder `BR` は
+payloadに含めない。直下がblock-onlyでない場合はtext nodeをそのまま、inline `BR` をLFとして走査する。
+このelement-aware plain textと挿入前plain textをraw完全一致させ、改行のcanonicalize、whitespace collapse、
+段落変換を許可しない。`innerText` / `textContent` / DOM Range `toString()` は診断候補としてのみ記録する。
+その他のelement型はunsupportedとしてFail Closedとする。leading / trailing / internal whitespace、欠落、
+切詰め、改行数、marker / job_id差異、本文変更は許容しない。検証失敗時は本文全体を出さず、element型、contenteditable、
+value property有無、raw / 正規化後length、最初の不一致位置と短いescape済みsnippet、改行種別件数、
+先頭末尾whitespace差、exact marker / job_id有無をdiagnostic logへ残し、SENDをclickしない。
 SENDがenabledであることを必須としてからclickする。callback text挿入後、send前に失敗した場合のcleanupは
-best-effortであり、現在のcomposer textがそのinvocationが挿入したcallback messageと完全一致する場合に限ってclearする。
+best-effortであり、現在のcomposer textがそのinvocationの検証時read-backから変化していない場合に限ってclearする。
+form controlは `fill("")`、contenteditableはfocusして `ControlOrMeta+A` と `Backspace` を送り、空を再検証する。
 Humanが変更した、またはそれ以外のcomposer textは決してclearしない。unknown / ambiguous DOM stateは
 Fail Closedとし、Agent専用Browser profile、CDP endpoint、selectorのuniqueness / visibility safetyを維持する。
 

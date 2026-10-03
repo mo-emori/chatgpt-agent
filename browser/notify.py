@@ -136,10 +136,182 @@ def wait_for_send_button(page, selectors):
 
 
 def composer_text(composer):
-    value = composer.evaluate(
-        "element => 'value' in element ? element.value : element.innerText"
+    snapshot = composer_snapshot(composer)
+    if snapshot["tag_name"] in {"INPUT", "TEXTAREA"}:
+        return snapshot["value"] or ""
+    return snapshot["plain_text"] or ""
+
+
+def composer_kind(snapshot):
+    if snapshot["tag_name"] in {"INPUT", "TEXTAREA"}:
+        return "form_control"
+    if (
+        snapshot["tag_name"] == "DIV"
+        and (snapshot["contenteditable"] or "").lower() == "true"
+    ):
+        return "contenteditable"
+    raise BrowserNotifyError("UNSUPPORTED_COMPOSER_ELEMENT")
+
+
+def composer_snapshot(composer):
+    data = composer.evaluate("""element => {
+        const inlineText = node => {
+            if (node.nodeType === Node.TEXT_NODE) return node.data;
+            if (node.nodeType !== Node.ELEMENT_NODE) return '';
+            if (node.tagName === 'BR') return '\\n';
+            return Array.from(node.childNodes).map(inlineText).join('');
+        };
+        const children = Array.from(element.childNodes);
+        const isBlock = node => node.nodeType === Node.ELEMENT_NODE &&
+            (node.tagName === 'P' || node.tagName === 'DIV');
+        const blockText = node => {
+            if (node.childNodes.length === 1 && node.firstChild.nodeType === 1 &&
+                    node.firstChild.tagName === 'BR') return '';
+            let value = inlineText(node);
+            if (node.lastChild && node.lastChild.nodeType === 1 &&
+                    node.lastChild.tagName === 'BR') value = value.slice(0, -1);
+            return value;
+        };
+        const allBlocks = children.length > 0 && children.every(isBlock);
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        const describe = node => ({
+            node_type: node.nodeType,
+            tag_name: node.nodeType === 1 ? node.tagName : null,
+            text_length: (node.textContent || '').length,
+            ...(node.nodeType === 1 ? {
+                child_count: node.childNodes.length,
+                child_tags: Array.from(node.childNodes).slice(0, 12).map(child =>
+                    child.nodeType === 3 ? '#text' : child.tagName),
+            } : {}),
+        });
+        return ({
+        tagName: element.tagName,
+        contenteditable: element.getAttribute('contenteditable'),
+        hasValue: 'value' in element,
+        value: typeof element.value === 'string' ? element.value : null,
+        innerText: element.innerText,
+        textContent: element.textContent,
+        rangeText: range.toString(),
+        plainText: allBlocks
+            ? children.map(blockText).join('\\n')
+            : children.map(inlineText).join(''),
+        extractionMode: allBlocks ? 'direct-block-lines' : 'inline-tree',
+        childNodes: children.slice(0, 64).map(describe),
+        childNodeCount: children.length,
+    }); }""")
+    return {
+        "tag_name": (data.get("tagName") or "").upper(),
+        "contenteditable": data.get("contenteditable"),
+        "has_value": bool(data.get("hasValue")),
+        "value": data.get("value"),
+        "inner_text": data.get("innerText") or "",
+        "text_content": data.get("textContent") or "",
+        "range_text": data.get("rangeText") or "",
+        "plain_text": data.get("plainText") or "",
+        "extraction_mode": data.get("extractionMode"),
+        "child_nodes": data.get("childNodes") or [],
+        "child_node_count": data.get("childNodeCount", 0),
+    }
+
+
+def canonicalize_composer_text(value):
+    return value.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def composer_fill_matches(actual, expected, *, kind):
+    if actual == expected:
+        return True
+    if kind == "form_control":
+        return canonicalize_composer_text(actual) == canonicalize_composer_text(expected)
+    return False
+
+
+def insert_composer_text(page, composer, message, snapshot):
+    kind = composer_kind(snapshot)
+    if kind == "form_control":
+        composer.fill(message)
+    else:
+        # Playwright fill() rewrites contenteditable markup and can make a
+        # ProseMirror-style editor expose extra paragraph newlines.  CDP's
+        # Input.insertText path is the supported, user-like plain-text input
+        # primitive and leaves the editor responsible for its normal input
+        # event handling.
+        composer.focus()
+        page.keyboard.insert_text(message)
+    return kind
+
+
+def clear_composer(composer, *, kind):
+    if kind == "form_control":
+        composer.fill("")
+    else:
+        composer.focus()
+        composer.press("ControlOrMeta+A")
+        composer.press("Backspace")
+
+
+def _newline_counts(value):
+    crlf = value.count("\r\n")
+    return {
+        "crlf": crlf,
+        "lf": value.count("\n") - crlf,
+        "cr": value.count("\r") - crlf,
+    }
+
+
+def _escaped_mismatch_snippet(value, index, radius=16):
+    start = max(0, index - radius)
+    end = min(len(value), index + radius)
+    snippet = value[start:end].encode("unicode_escape").decode("ascii")
+    return f"{start}:{end}:{snippet!r}"
+
+
+def _candidate_diagnostics(value, expected):
+    expected_normalized = canonicalize_composer_text(expected)
+    actual_normalized = canonicalize_composer_text(value)
+    mismatch_index = next(
+        (
+            index
+            for index, (expected_char, actual_char) in enumerate(
+                zip(expected_normalized, actual_normalized)
+            )
+            if expected_char != actual_char
+        ),
+        min(len(expected_normalized), len(actual_normalized)),
     )
-    return value or ""
+    marker, job_id = callback_identity(expected)
+    actual_lines = {line.strip() for line in actual_normalized.splitlines()}
+    return {
+        "length": len(value),
+        "newline_counts": _newline_counts(value),
+        "first_mismatch_index": mismatch_index,
+        "matches": value == expected,
+        "marker_present": marker in actual_lines,
+        "job_id_present": f"job_id: {job_id}" in actual_lines,
+    }
+
+
+def composer_fill_diagnostics(snapshot, expected, actual):
+    expected_lines = expected.split("\n")
+    return {
+        "tag_name": snapshot["tag_name"],
+        "contenteditable": snapshot["contenteditable"],
+        "has_value": snapshot["has_value"],
+        "extraction_mode": snapshot["extraction_mode"],
+        "child_node_count": snapshot["child_node_count"],
+        "child_nodes": snapshot["child_nodes"],
+        "expected_length": len(expected),
+        "expected_line_count": len(expected_lines),
+        "expected_blank_line_positions": [
+            index for index, line in enumerate(expected_lines) if line == ""
+        ],
+        "expected_newlines": _newline_counts(expected),
+        "plain_text": _candidate_diagnostics(actual, expected),
+        "inner_text": _candidate_diagnostics(snapshot["inner_text"], expected),
+        "text_content": _candidate_diagnostics(snapshot["text_content"], expected),
+        "range_text": _candidate_diagnostics(snapshot["range_text"], expected),
+    }
 
 
 def composer_is_empty(composer):
@@ -324,13 +496,26 @@ def wait_for_delivery_ack(
         page.wait_for_timeout(STATE_POLL_INTERVAL_MS)
 
 
-def cleanup_inserted_callback(page, composer_selectors, message):
+def cleanup_inserted_callback(
+    page, composer_selectors, message, *, observed_readback=None,
+    inserted_kind=None,
+):
     try:
         composer = find_optional_unique_visible(
             page, composer_selectors, name="composer"
         )
-        if composer is not None and composer_text(composer) == message:
-            composer.fill("")
+        if composer is not None:
+            snapshot = composer_snapshot(composer)
+            kind = composer_kind(snapshot)
+            current = composer_text(composer)
+            invocation_text_unchanged = kind == inserted_kind and (
+                composer_fill_matches(current, message, kind=kind)
+                or (observed_readback is not None and current == observed_readback)
+            )
+            if invocation_text_unchanged:
+                clear_composer(composer, kind=kind)
+                if not composer_is_empty(composer):
+                    logger.error("Browser callback COMPOSER_CLEANUP_NOT_VERIFIED")
     except Exception:
         logger.warning("Browser callback composer cleanup failed", exc_info=True)
 
@@ -429,11 +614,32 @@ def notify_chatgpt(
 
             filled = False
             click_attempted = False
+            observed_readback = None
+            inserted_kind = None
             try:
-                composer.fill(message)
+                initial_snapshot = composer_snapshot(composer)
+                inserted_kind = insert_composer_text(
+                    page, composer, message, initial_snapshot
+                )
                 filled = True
-                if composer_text(composer) != message:
+                snapshot = composer_snapshot(composer)
+                actual = (
+                    snapshot["value"] or ""
+                    if snapshot["tag_name"] in {"INPUT", "TEXTAREA"}
+                    else snapshot["plain_text"] or ""
+                )
+                observed_readback = actual
+                if not composer_fill_matches(actual, message, kind=inserted_kind):
+                    logger.error(
+                        "Browser callback COMPOSER_FILL_NOT_VERIFIED: %s",
+                        composer_fill_diagnostics(snapshot, message, actual),
+                    )
                     raise BrowserNotifyError("COMPOSER_FILL_NOT_VERIFIED")
+                if inserted_kind == "contenteditable":
+                    logger.info(
+                        "Browser callback COMPOSER_STRUCTURE_VERIFIED: %s",
+                        composer_fill_diagnostics(snapshot, message, actual),
+                    )
 
                 send_button = wait_for_send_button(
                     page,
@@ -459,6 +665,8 @@ def notify_chatgpt(
                         page,
                         dom["composer"]["selectors"],
                         message,
+                        observed_readback=observed_readback,
+                        inserted_kind=inserted_kind,
                     )
                 raise
 

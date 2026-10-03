@@ -22,13 +22,22 @@ CALLBACK = (
 
 
 class Element:
-    def __init__(self, *, text="", enabled=True, on_click=None, visible=True):
+    def __init__(self, *, text="", enabled=True, on_click=None, visible=True,
+                 tag_name="DIV", contenteditable="true", has_value=False,
+                 readback=None, snapshot_data=None):
         self.text = text
         self.enabled = enabled
         self.fills = []
         self.clicks = 0
         self.on_click = on_click
         self.visible = visible
+        self.tag_name = tag_name
+        self.contenteditable = contenteditable
+        self.has_value = has_value
+        self.readback = readback
+        self.snapshot_data = snapshot_data or {}
+        self.page = None
+        self.presses = []
 
     def is_visible(self):
         return self.visible
@@ -36,12 +45,42 @@ class Element:
     def is_enabled(self):
         return self.enabled
 
-    def evaluate(self, _script):
+    def evaluate(self, script):
+        if "tagName" in script:
+            text = (
+                self.readback
+                if self.readback is not None and self.fills and self.fills[-1] != ""
+                else self.text
+            )
+            data = {
+                "tagName": self.tag_name,
+                "contenteditable": self.contenteditable,
+                "hasValue": self.has_value,
+                "value": text if self.has_value else None,
+                "innerText": text,
+                "textContent": text,
+                "rangeText": text,
+                "plainText": text,
+                "extractionMode": "inline-tree",
+                "childNodes": [],
+                "childNodeCount": 0,
+            }
+            data.update(self.snapshot_data)
+            return data
         return self.text
 
     def fill(self, value):
         self.fills.append(value)
         self.text = value
+
+    def focus(self):
+        self.page.focused = self
+
+    def press(self, key):
+        self.presses.append(key)
+        if key == "Backspace" and self.presses[-2:] == ["ControlOrMeta+A", "Backspace"]:
+            self.text = ""
+            self.readback = None
 
     def click(self):
         self.clicks += 1
@@ -71,6 +110,9 @@ class Page:
         self.legacy_messages = list(legacy_messages or [[]])
         self.other_elements = dict(other_elements or {})
         self.waits = []
+        self.focused = None
+        self.keyboard = Keyboard(self)
+        composer.page = self
         for send_state in self.sends:
             for send in send_state:
                 send.on_click = self._after_click
@@ -105,6 +147,17 @@ class Page:
             self.stops.pop(0)
         if len(self.sends) > 1:
             self.sends.pop(0)
+
+
+class Keyboard:
+    def __init__(self, page):
+        self.page = page
+        self.insertions = []
+
+    def insert_text(self, value):
+        self.insertions.append(value)
+        element = self.page.focused
+        element.text = element.readback if element.readback is not None else value
 
 
 class BrowserNotifyReadinessTests(unittest.TestCase):
@@ -144,8 +197,167 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
 
         self.run_notify(page)
 
-        self.assertEqual(composer.fills, [CALLBACK])
+        self.assertEqual(page.keyboard.insertions, [CALLBACK])
         self.assertEqual(send.clicks, 1)
+
+    def test_contenteditable_ignores_incidental_value_property(self):
+        composer = Element(has_value=True)
+        send = Element()
+        page = Page(composer, sends=[[send]])
+
+        self.run_notify(page)
+
+        self.assertEqual(send.clicks, 1)
+
+    def test_contenteditable_crlf_readback_is_rejected(self):
+        composer = Element(readback=CALLBACK.replace("\n", "\r\n"))
+        send = Element()
+        page = Page(composer, sends=[[send]])
+
+        with self.assertRaisesRegex(
+            notify.BrowserNotifyError, "COMPOSER_FILL_NOT_VERIFIED"
+        ):
+            self.run_notify(page)
+
+        self.assertEqual(send.clicks, 0)
+
+    def test_textarea_fill_and_newline_normalization_still_work(self):
+        composer = Element(
+            tag_name="TEXTAREA", contenteditable=None, has_value=True,
+            readback=CALLBACK.replace("\n", "\r\n"),
+        )
+        send = Element()
+        page = Page(composer, sends=[[send]])
+
+        self.run_notify(page)
+
+        self.assertEqual(composer.fills, [CALLBACK])
+        self.assertEqual(page.keyboard.insertions, [])
+        self.assertEqual(send.clicks, 1)
+
+    def test_input_uses_fill_and_value(self):
+        composer = Element(tag_name="INPUT", contenteditable=None, has_value=True)
+        send = Element()
+        page = Page(composer, sends=[[send]])
+
+        self.run_notify(page)
+
+        self.assertEqual(len(composer.fills), 1)
+        self.assertEqual(page.keyboard.insertions, [])
+        self.assertEqual(send.clicks, 1)
+
+    def test_prosemirror_block_lines_make_inner_text_inflate_but_extract_exactly(self):
+        expected = (
+            "LOCAL_AGENT_JOB_COMPLETED\njob_id: J\n\nactor: codex\n"
+            "workspace: x\n\nstatus: DONE\nartifact_status: DONE\nartifacts: []"
+        )
+        inflated = expected.replace("\n", "\n\n")
+        inflated = inflated.replace(
+            "LOCAL_AGENT_JOB_COMPLETED\n\n",
+            "LOCAL_AGENT_JOB_COMPLETED\n\n\n\n",
+            1,
+        )
+        lines = expected.split("\n")
+        composer = Element(snapshot_data={
+            "innerText": inflated,
+            "textContent": "".join(lines),
+            "rangeText": "".join(lines),
+            "plainText": expected,
+            "extractionMode": "direct-block-lines",
+            "childNodes": [
+                {
+                    "node_type": 1,
+                    "tag_name": "P",
+                    "text_length": len(line),
+                    "child_count": 1,
+                    "child_tags": ["BR" if line == "" else "#text"],
+                }
+                for line in lines
+            ],
+            "childNodeCount": len(lines),
+        })
+
+        snapshot = notify.composer_snapshot(composer)
+
+        self.assertEqual(expected.count("\n"), 8)
+        self.assertEqual(snapshot["inner_text"].count("\n"), 18)
+        self.assertEqual(snapshot["text_content"].count("\n"), 0)
+        self.assertEqual(snapshot["range_text"].count("\n"), 0)
+        self.assertEqual(snapshot["plain_text"], expected)
+        self.assertTrue(notify.composer_fill_matches(
+            snapshot["plain_text"], expected, kind="contenteditable"
+        ))
+
+    def test_structural_diagnostics_do_not_include_callback_text(self):
+        snapshot = {
+            "tag_name": "DIV", "contenteditable": "true", "has_value": False,
+            "extraction_mode": "direct-block-lines", "child_node_count": 2,
+            "child_nodes": [{"node_type": 1, "tag_name": "P", "text_length": 7}],
+            "inner_text": CALLBACK.replace("\n", "\n\n"),
+            "text_content": CALLBACK.replace("\n", ""),
+            "range_text": CALLBACK.replace("\n", ""),
+        }
+
+        diagnostic = notify.composer_fill_diagnostics(snapshot, CALLBACK, CALLBACK)
+
+        self.assertNotIn(CALLBACK, repr(diagnostic))
+        self.assertTrue(diagnostic["plain_text"]["matches"])
+        self.assertEqual(diagnostic["expected_blank_line_positions"], [1])
+
+    def test_contenteditable_insert_text_preserves_multiple_blank_lines(self):
+        message = CALLBACK + "\n\n\nfinal"
+        composer = Element()
+        send = Element()
+        page = Page(composer, sends=[[send]])
+
+        self.run_notify(page, message=message)
+
+        self.assertEqual(page.keyboard.insertions, [message])
+        self.assertEqual(composer.text, message)
+        self.assertEqual(send.clicks, 1)
+
+    def test_truncated_readback_fails_verification_without_click_and_cleans_up(self):
+        composer = Element(readback=CALLBACK[:-1])
+        send = Element()
+        page = Page(composer, sends=[[send]])
+
+        with self.assertLogs(notify.logger, level="ERROR") as captured:
+            with self.assertRaisesRegex(
+                notify.BrowserNotifyError, "COMPOSER_FILL_NOT_VERIFIED"
+            ):
+                self.run_notify(page)
+
+        self.assertEqual(send.clicks, 0)
+        self.assertEqual(page.keyboard.insertions, [CALLBACK])
+        self.assertEqual(composer.presses, ["ControlOrMeta+A", "Backspace"])
+        self.assertEqual(composer.text, "")
+        self.assertIn("'plain_text': {'length': 112", " ".join(captured.output))
+
+    def test_wrong_identity_readback_fails_without_click(self):
+        composer = Element(readback=CALLBACK.replace("JOB-ACK-001", "JOB-ACK-002"))
+        send = Element()
+        page = Page(composer, sends=[[send]])
+
+        with self.assertRaisesRegex(
+            notify.BrowserNotifyError, "COMPOSER_FILL_NOT_VERIFIED"
+        ):
+            self.run_notify(page)
+
+        self.assertEqual(send.clicks, 0)
+        self.assertEqual(composer.presses, ["ControlOrMeta+A", "Backspace"])
+
+    def test_material_mutation_readback_fails_without_click(self):
+        composer = Element(readback=CALLBACK.replace("status: DONE", "status: FAILED"))
+        send = Element()
+        page = Page(composer, sends=[[send]])
+
+        with self.assertRaisesRegex(
+            notify.BrowserNotifyError, "COMPOSER_FILL_NOT_VERIFIED"
+        ):
+            self.run_notify(page)
+
+        self.assertEqual(send.clicks, 0)
+        self.assertEqual(composer.presses, ["ControlOrMeta+A", "Backspace"])
 
     def test_click_without_new_matching_message_is_delivery_unknown(self):
         composer = Element()
@@ -157,7 +369,7 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
             self.run_notify(page, monotonic=[0, 0, 0, 11])
 
         self.assertEqual(send.clicks, 1)
-        self.assertEqual(composer.fills, [CALLBACK])
+        self.assertEqual(page.keyboard.insertions, [CALLBACK])
         self.assertEqual(composer.text, "user replacement")
 
     def test_old_identical_message_does_not_acknowledge_delivery(self):
@@ -181,7 +393,7 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
             self.run_notify(page)
 
         self.assertEqual(send.clicks, 1)
-        self.assertEqual(composer.fills, [CALLBACK])
+        self.assertEqual(page.keyboard.insertions, [CALLBACK])
 
     def test_new_identical_message_after_old_one_confirms_delivery(self):
         composer = Element()
@@ -336,7 +548,7 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
         self.run_notify(page)
 
         self.assertEqual(page.waits, [500])
-        self.assertEqual(composer.fills, [CALLBACK])
+        self.assertEqual(page.keyboard.insertions, [CALLBACK])
         self.assertEqual(send.clicks, 1)
         self.assertEqual(stop.clicks, 0)
 
@@ -368,7 +580,7 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
 
         self.run_notify(page)
 
-        self.assertEqual(composer.fills, [CALLBACK])
+        self.assertEqual(page.keyboard.insertions, [CALLBACK])
         self.assertEqual(send.clicks, 1)
 
     def test_send_timeout_attempts_callback_cleanup(self):
@@ -378,7 +590,8 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
         with self.assertRaisesRegex(notify.BrowserNotifyError, "SEND_BUTTON_TIMEOUT"):
             self.run_notify(page, monotonic=[0, 0, 6])
 
-        self.assertEqual(composer.fills, [CALLBACK, ""])
+        self.assertEqual(page.keyboard.insertions, [CALLBACK])
+        self.assertEqual(composer.presses, ["ControlOrMeta+A", "Backspace"])
 
     def test_multiple_stop_buttons_fails_closed(self):
         composer = Element()
@@ -399,7 +612,8 @@ class BrowserNotifyReadinessTests(unittest.TestCase):
         with self.assertRaisesRegex(notify.BrowserNotifyError, "send_button: multiple"):
             self.run_notify(page)
 
-        self.assertEqual(composer.fills, [CALLBACK, ""])
+        self.assertEqual(page.keyboard.insertions, [CALLBACK])
+        self.assertEqual(composer.presses, ["ControlOrMeta+A", "Backspace"])
         self.assertTrue(all(send.clicks == 0 for send in sends))
 
     def test_cleanup_does_not_clear_user_replacement(self):

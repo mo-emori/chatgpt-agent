@@ -359,8 +359,10 @@ def generate(root: str | Path, *, generated_root: str, **kwargs) -> dict:
 
 def validate_ref(root: str | Path, ref: dict, *, workspace: str, capability: str,
                  current_context_sha256: str | None = None,
+                 current_evidence_index_sha256: str | None = None,
                  current_job_context_sha256: str | None = None,
-                 target_job_id: str | None = None) -> dict:
+                 target_job_id: str | None = None,
+                 validate_current_target: bool = False) -> dict:
     root = Path(root).resolve()
     package_rel = safe_relative(ref["path"])
     manifest_path = safe_path(root, f"{package_rel}/package-manifest.json")
@@ -386,13 +388,77 @@ def validate_ref(root: str | Path, ref: dict, *, workspace: str, capability: str
         raw = safe_path(root, rel).read_bytes()
         if len(raw) != fact["size"] or sha256(raw) != fact["raw_sha256"]:
             raise ValueError(f"package ref stale or tampered: {rel}")
-    for name, fact in manifest.get("source_inputs", {}).items():
-        rel = safe_relative(fact["path"])
-        raw = safe_path(root, rel).read_bytes()
-        if len(raw) != fact["size"] or sha256(raw) != fact["sha256"]:
-            raise ValueError(f"package source input stale or tampered: {name}")
+
+    # A supplied package is bound to the immutable preparation context that
+    # produced it, not to the identity of the later review-execution job.  The
+    # package carries its source Job Context, so validate that copy and its
+    # source-chain declarations instead of comparing it with a mutable shared
+    # job-context.json that a later job may legitimately replace.
+    source_inputs = manifest.get("source_inputs", {})
+    source_job_fact = source_inputs.get("job_context", {})
+    packaged_job_raw = safe_path(root, f"{package_rel}/job-context.json").read_bytes()
+    if (len(packaged_job_raw) != source_job_fact.get("size") or
+            sha256(packaged_job_raw) != source_job_fact.get("sha256") or
+            sha256(packaged_job_raw) != manifest.get("job_context_sha256")):
+        raise ValueError("package source Job Context hash mismatch")
+    source_job = json.loads(packaged_job_raw.decode("utf-8"))
+    job_material = dict(source_job)
+    job_claimed = job_material.pop("manifest_sha256", None)
+    job_package_claimed = job_material.pop("package_sha256", None)
+    if (job_claimed != job_package_claimed or
+            sha256(canonical(job_material)) != job_claimed):
+        raise ValueError("package source Job Context internal hash mismatch")
+    if source_job.get("workspace") != workspace or source_job.get("capability") != capability:
+        raise ValueError("package source Job Context workspace/capability mismatch")
+    if source_job.get("source_context_manifest_sha256") != manifest.get("source_context_manifest_sha256"):
+        raise ValueError("package source Context chain mismatch")
+    if source_job.get("evidence_index_sha256") != manifest.get("evidence_index_sha256"):
+        raise ValueError("package source Evidence chain mismatch")
+
+    source_context_fact = source_inputs.get("context_manifest", {})
+    source_context_raw = safe_path(root, safe_relative(source_context_fact["path"])).read_bytes()
+    source_context = json.loads(source_context_raw.decode("utf-8"))
+    source_context_material = {"observed": source_context.get("observed"),
+                               "approved_semantics": source_context.get("approved_semantics")}
+    if (sha256(canonical(source_context_material)) !=
+            manifest.get("source_context_manifest_sha256")):
+        raise ValueError("package source Context Manifest internal hash mismatch")
+
+    # The Context Manifest and Evidence Index are current-state inputs.  Their
+    # stable identities are compared separately below.  Other source inputs are
+    # immutable diagnostics and only need to remain present; they must not turn
+    # review-job identity into package staleness.
+    for name, fact in source_inputs.items():
+        if name in ("job_context", "context_manifest"):
+            continue
+        safe_path(root, safe_relative(fact["path"]))
     if current_context_sha256 is not None and manifest.get("source_context_manifest_sha256") != current_context_sha256:
         raise ValueError("stale source Context Manifest SHA")
+    if (current_evidence_index_sha256 is not None and
+            manifest.get("evidence_index_sha256") != current_evidence_index_sha256):
+        raise ValueError("stale Evidence Index SHA")
+    # Kept for callers during migration: it validates the package source
+    # identity, never the execution job's newly generated Job Context.
     if current_job_context_sha256 is not None and manifest.get("job_context_sha256") != current_job_context_sha256:
         raise ValueError("stale Job Context SHA")
+    if validate_current_target:
+        git = manifest.get("git", {})
+        if git.get("attribution_status") != "EXACT":
+            raise ValueError("package target attribution is not EXACT")
+        head = _git(root, "rev-parse", "HEAD").decode("utf-8").strip()
+        if head != git.get("head") or head != git.get("base"):
+            raise ValueError("stale target git baseline")
+        paths = [safe_relative(path) for path in git.get("worker_observed_changed_paths", [])]
+        current_patch = (_git(root, "diff", "--binary", "--no-ext-diff", "HEAD", "--", *paths)
+                         if paths else b"")
+        for rel in paths:
+            if not _git(root, "status", "--porcelain=v1", "--untracked-files=all", "--", rel).strip().startswith(b"??"):
+                continue
+            result = subprocess.run(["git", "-C", str(root), "diff", "--binary", "--no-index",
+                                     "--", os.devnull, rel], capture_output=True, timeout=30)
+            if result.returncode not in (0, 1):
+                raise OSError(result.stderr.decode("utf-8", "replace"))
+            current_patch += result.stdout
+        if current_patch != safe_path(root, f"{package_rel}/diff.patch").read_bytes():
+            raise ValueError("stale target working tree delta")
     return manifest

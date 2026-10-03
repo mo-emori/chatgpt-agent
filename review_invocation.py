@@ -2,9 +2,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 from pathlib import Path
 
-from context_harness import observe
+from context_harness import observe, scan
 from review_package import safe_path, validate_ref
 
 
@@ -40,10 +41,29 @@ def prepare(job, canonical, workspace_config, context_session):
     if current["observed"].get("unverifiable_reasons"):
         raise PackageLaunchError("CURRENT_CONTEXT_UNVERIFIABLE")
     ref = job.review_package_ref
+    package_manifest_path = safe_path(
+        canonical, f"{ref['path']}/package-manifest.json")
+    source_inputs = json.loads(package_manifest_path.read_text("utf-8")).get("source_inputs", {})
+    evidence_fact = source_inputs.get("evidence_index")
+    context_fact = source_inputs.get("context_manifest")
+    if not context_fact:
+        raise PackageLaunchError("PACKAGE_SOURCE_CONTEXT_MISSING")
+    source_context = json.loads(
+        safe_path(canonical, context_fact["path"]).read_text("utf-8"))
+    freshness_delta = scan(source_context, current)
+    if freshness_delta.get("delta_status") != "NO_IMPACT":
+        raise PackageLaunchError(
+            f"PACKAGE_CONTEXT_STALE:{freshness_delta.get('delta_status')}")
+    current_evidence_sha = None
+    if evidence_fact:
+        current_evidence_sha = hashlib.sha256(
+            safe_path(canonical, evidence_fact["path"]).read_bytes()).hexdigest()
     manifest = validate_ref(
         canonical, ref, workspace=job.workspace, capability=capability,
         current_context_sha256=current["lifecycle"]["manifest_sha256"],
+        current_evidence_index_sha256=current_evidence_sha,
         target_job_id=ref["target_job_id"],
+        validate_current_target=True,
     )
     if manifest.get("status") != "READY_PACKAGE":
         raise PackageLaunchError(f"PACKAGE_{manifest.get('status', 'UNVERIFIABLE')}")
@@ -69,7 +89,10 @@ def prepare(job, canonical, workspace_config, context_session):
                 allowed.add(item["source_ref"])
     return {"mode": mode, "manifest": manifest, "ref": ref, "package_path": ref["path"],
             "allowed_paths": sorted(allowed), "declared_expansions": declared,
-            "current_context_sha256": current["lifecycle"]["manifest_sha256"]}
+            "current_context_sha256": current["lifecycle"]["manifest_sha256"],
+            "semantic_freshness_status": "NO_IMPACT", "source_chain_valid": True,
+            "package_reused": True, "package_regenerated": False,
+            "execution_job_context_sha256": None}
 
 
 def build_prompt(original_prompt: str | None, launch: dict) -> str:
@@ -115,6 +138,23 @@ def telemetry(launch, normalized, raw, final_text):
                 "measurement_complete": None, "full_review_escalated": False,
                 "escalation_reason": None, "context_hash": None, "evidence_hash": None,
                 "job_context_hash": None, "actor_usage": _usage(raw)}
+    if launch.get("prelaunch_failed"):
+        ref = launch.get("ref") or {}
+        return {"mode": launch.get("mode", "DELTA_REVIEW"),
+                "package_ref": ref.get("path"), "supplied_package_ref": ref.get("path"),
+                "package_hash": ref.get("sha256"), "supplied_package_hash": ref.get("sha256"),
+                "package_status": "PRELAUNCH_REJECTED", "package_bytes": None,
+                "package_file_count": None, "expansion_count": 0, "expansion_paths": [],
+                "expansion_bytes": None, "measurement_complete": False,
+                "full_review_escalated": False, "escalation_reason": None,
+                "context_hash": None, "package_source_context_hash": None,
+                "current_context_hash": launch.get("current_context_sha256"),
+                "semantic_freshness_status": "STALE_OR_INVALID",
+                "execution_job_context_hash": None, "source_chain_valid": False,
+                "package_reused": False, "package_regenerated": False,
+                "stale_reasons": [launch.get("error")] if launch.get("error") else [],
+                "evidence_hash": None, "job_context_hash": None,
+                "actor_usage": _usage(raw)}
     m = launch["manifest"]
     expansions = list(launch["declared_expansions"])
     observable = True
@@ -150,6 +190,8 @@ def telemetry(launch, normalized, raw, final_text):
         elif "PACKAGE_INSUFFICIENT" in final_text: outcome = "PACKAGE_INSUFFICIENT"
     escalated = outcome in ("PACKAGE_INSUFFICIENT", "NEEDS_FULL_REVIEW")
     return {"mode": "DELTA_REVIEW", "package_ref": launch["package_path"],
+        "supplied_package_ref": launch["package_path"],
+        "supplied_package_hash": m["package_sha256"],
         "package_hash": m["package_sha256"], "package_status": m["status"],
         "package_bytes": m["package_byte_count"], "package_file_count": m["package_file_count"],
         "expansion_count": len(expansions), "expansion_paths": expansions,
@@ -157,5 +199,12 @@ def telemetry(launch, normalized, raw, final_text):
         "full_review_escalated": False,
         "escalation_reason": outcome if escalated else None,
         "package_outcome": outcome, "context_hash": m["source_context_manifest_sha256"],
+        "package_source_context_hash": m["source_context_manifest_sha256"],
+        "current_context_hash": launch["current_context_sha256"],
+        "semantic_freshness_status": launch["semantic_freshness_status"],
+        "execution_job_context_hash": launch["execution_job_context_sha256"],
+        "source_chain_valid": launch["source_chain_valid"],
+        "package_reused": launch["package_reused"],
+        "package_regenerated": launch["package_regenerated"], "stale_reasons": [],
         "evidence_hash": m["evidence_index_sha256"], "job_context_hash": m["job_context_sha256"],
         "actor_usage": _usage(raw)}

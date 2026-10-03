@@ -389,7 +389,10 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                 f"{capability}/evidence-index.json")
             index_value = json.loads((root / index_rel).read_text("utf-8"))
             job = session.get("job")
-            if job is not None:
+            explicit_package = (job is not None and
+                getattr(job, "review_mode", None) == "DELTA_REVIEW" and
+                getattr(job, "review_package_ref", None) is not None)
+            if job is not None and not explicit_package:
                 try:
                     job_context = generate_job_context(
                         root, workspace=session["workspace"], capability=capability, job=job,
@@ -438,6 +441,15 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                             "diagnostics": [{"code": "REVIEW_PACKAGE_BUILD_FAILED",
                                              "detail": str(exc)[:1000]}],
                         }
+            elif explicit_package:
+                review_package = {
+                    "mode": "SUPPLIED_PACKAGE", "candidate_review_mode": "DELTA_REVIEW",
+                    "status": "REUSED", "schema_version": 1,
+                    "sha256": job.review_package_ref.get("sha256"),
+                    "package_path": job.review_package_ref.get("path"),
+                    "package_reused": True, "package_regenerated": False,
+                    "diagnostic_only": False,
+                }
         return {"mode": "SHADOW", "capability": capability,
                 "manifest_sha256": current["lifecycle"]["manifest_sha256"],
                 "previous_manifest_sha256": current["lifecycle"]["previous_context_hash"],

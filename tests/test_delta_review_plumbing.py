@@ -93,6 +93,7 @@ class DeltaReviewPlumbingTests(unittest.TestCase):
         observed = {"observed": {"unverifiable_reasons": []},
                     "lifecycle": {"manifest_sha256": "c" * 64}}
         with patch.object(review_invocation, "observe", return_value=observed), \
+             patch.object(review_invocation, "scan", return_value={"delta_status": "NO_IMPACT"}), \
              patch.object(review_invocation, "validate_ref", side_effect=ValidatorReached) as validate:
             with self.assertRaises(ValidatorReached):
                 review_invocation.prepare(job, Path("C:/dev/argus"), policy, context)

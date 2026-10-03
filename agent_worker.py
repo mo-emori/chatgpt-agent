@@ -1110,6 +1110,25 @@ def execute_claude_review(job, say):
     except PackageLaunchError as exc:
         failure_class = "PACKAGE_PRELAUNCH_REJECTED"
         error_summary = str(exc)[:4000]
+        review_launch = {"mode": getattr(job, "review_mode", None) or "FULL_REVIEW",
+                         "ref": getattr(job, "review_package_ref", None),
+                         "prelaunch_failed": True, "error": error_summary,
+                         "current_context_sha256": ((context_session or {}).get("pre") or {}).get(
+                             "lifecycle", {}).get("manifest_sha256")}
+    except ValueError as exc:
+        if (review_launch is None and
+                getattr(job, "review_mode", None) == "DELTA_REVIEW" and
+                getattr(job, "review_package_ref", None) is not None):
+            failure_class = "PACKAGE_PRELAUNCH_REJECTED"
+            error_summary = str(exc)[:4000]
+            review_launch = {"mode": "DELTA_REVIEW", "ref": job.review_package_ref,
+                             "prelaunch_failed": True, "error": error_summary,
+                             "current_context_sha256": ((context_session or {}).get("pre") or {}).get(
+                                 "lifecycle", {}).get("manifest_sha256")}
+        else:
+            failure_class = "BRIDGE_ERROR"
+            error_summary = str(exc)[:4000]
+            logger.exception("CLAUDE REVIEW BRIDGE ERROR: job_id=%s", job.job_id)
     except ReviewPreparationError as exc:
         failure_class = exc.failure_class
         error_summary = str(exc)[:4000]

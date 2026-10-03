@@ -920,12 +920,29 @@ statusは `READY_PACKAGE` / `NEEDS_RECONCILIATION` / `UNVERIFIABLE` である。
 source Context/Job Context freshness、path containment、traversal、symlink/reparse、全included file/ref bytesを再検証する。
 Result Manifestへadditive `review_package` comparison diagnosticを出すがstatus単独でcurrent executionをblockしない。
 
+明示的なpackage reuseでは、**Package Source Context** と **Review Execution Context** を分離する。Package Source
+Contextはpackage生成時のContext Manifest SHA、Evidence Index SHA、Job Context SHA、implementation/target job provenance、
+diff attribution/snapshot、authority refs/findingsからなる不変のsource chainである。Review Execution Contextは後続reviewの
+job_id、review instruction SHA、callback/runtime、review mode/package refであり、package source identityを書き換えない。
+したがってreview jobのjob_id、instruction、callback、runtimeだけが異なってもstaleではない。package内の
+`job-context.json` はmanifestのsource hashと自己hashを再検証し、そのContext/Evidence linkもsource chainと一致しなければ
+ならない。後続jobが共有diagnostic `job-context.json` を生成しても、そのhashをpackage source Job Context hashと比較しない。
+
+current-state freshnessは別のgateで判定する。現在のcapability Context Manifestのsemantic hash（context declaration、
+authority source hashes、dependency edgesを含む）、現在のEvidence Index SHA、packageに記録されたtarget HEADとEXACT attribution、
+対象pathの現在のbinary diff、およびmandatory Delta Scanをsource baselineと比較する。authority/context/dependency/evidence、
+または対象working-tree deltaが変化した場合はfail closedとし、package再生成を要求する。Contextがsemanticに同一で
+Deltaが`NO_IMPACT`、Evidence Indexが同一なら、review execution identityが異なってもpackageはfreshである。
+
 **Phase 3B-1 / IMPLEMENTED_EXPERIMENTAL_MEASUREMENT_ONLY:** protocol v3 の明示的な
 `review_mode=DELTA_REVIEW` と `review_package_ref` を、workspace/capability
 allowlist と組み合わせた場合に限り、Claude package-first invocation を行う。package manifest、Context
 Manifest、Delta Report、Evidence Index、Job Context、target implementation job provenance、全hash、path containment、
 symlink/reparse point をactor起動前に再検証する。`READY_PACKAGE` かつ current context が検証可能な場合のみ起動し、
 `NEEDS_RECONCILIATION`、`UNVERIFIABLE`、stale/tamper、identity mismatch はfail closedとする。
+明示refのpackageがreview inputであり、actor launch前にreview job用candidate packageを再生成・置換しない。source packageの
+attributionが`EXACT`でhash-boundされ、現在のHEAD/target diffが一致する場合、review execution job自身のWorker snapshotは
+不要である。これはattribution safetyの一般的緩和ではなく、検証済みsource attributionの再利用に限定する。
 
 accepted envelope の `review_package_ref` は `path`、64文字 lowercase hex の `sha256`、
 `target_job_id` の3 fieldだけからなる。これは `actor=claude`、`mode=review`、
@@ -942,6 +959,10 @@ critical/ambiguous/authority-changing caseはHumanに残る。
 
 Result Manifestのadditive `review_context` はmode、package identity/status/bytes/files、expansion、観測可能な
 bytes、escalation、context/evidence/job-context hash、Claude streamに構造化されたtoken/cache usageだけを記録する。
+明示reuse時はさらに `supplied_package_ref/hash`、`package_source_context_hash`、`current_context_hash`、
+`semantic_freshness_status`、`execution_job_context_hash`、`source_chain_valid`、`package_reused=true`、
+`package_regenerated=false`、stale reasonsを記録する。pre-actor failureでも要求された`DELTA_REVIEW`とrefを保持し、
+`FULL_REVIEW`へ偽装しない。
 Bash等でread pathを完全に観測できない場合は `measurement_complete=false` とし、metricを推測しない。
 normalized Review Evidenceにも同metadataを保存する。independent clone、canonical boundary、cleanup、Evidence
 Adoption、callback、JOB ENDの意味は変更しない。

@@ -249,6 +249,82 @@ class ReviewPackageTests(unittest.TestCase):
                 {"review_measurement": {"enabled": True, "capabilities": ["CAP"]}},
                 {"capability": "CAP"})
 
+    def test_explicit_package_survives_different_review_job_identity(self):
+        source_job = self.job(); args = self.inputs(source_job)
+        report = review_package.generate(self.root, generated_root="validation/context", **args,
+            before=self.before, after=self.after, changed_paths=self.paths)
+        # Reproduce E2E-003: a later review job replaces the shared diagnostic
+        # Job Context with a different job/instruction identity.
+        execution_job = self.job()
+        execution_job.job_id = "ARGUS-BOOTSTRAP-CONTEXT-HARNESS-DELTA-REVIEW-E2E-20261003-003"
+        execution_job.actor = "claude"; execution_job.mode = "review"
+        execution_job.prompt_sha256 = "b" * 64
+        replacement, _ = job_context.build(self.root, workspace="ws", capability="CAP",
+            job=execution_job, manifest=self.manifest,
+            manifest_path="validation/context/CAP/context-manifest.json",
+            delta=self.delta, delta_path="validation/context/CAP/delta-report.json",
+            evidence_index=self.index,
+            evidence_index_path="validation/context/CAP/evidence-index.json",
+            declaration=self.declaration)
+        write_json(self.dest / "job-context.json", replacement)
+        ref = {"path": report["package_path"], "sha256": report["sha256"],
+               "target_job_id": "JOB"}
+        manifest = review_package.validate_ref(self.root, ref, workspace="ws", capability="CAP",
+            current_context_sha256=self.manifest["lifecycle"]["manifest_sha256"],
+            current_evidence_index_sha256=review_package.sha256(
+                (self.dest / "evidence-index.json").read_bytes()), validate_current_target=True)
+        self.assertEqual(manifest["target"]["instruction_sha256"], "a" * 64)
+
+    def test_current_semantic_and_target_freshness_fail_closed(self):
+        args = self.inputs(); report = review_package.generate(
+            self.root, generated_root="validation/context", **args,
+            before=self.before, after=self.after, changed_paths=self.paths)
+        ref = {"path": report["package_path"], "sha256": report["sha256"],
+               "target_job_id": "JOB"}
+        kwargs = dict(workspace="ws", capability="CAP", target_job_id="JOB")
+        with self.assertRaisesRegex(ValueError, "Context Manifest"):
+            review_package.validate_ref(self.root, ref, current_context_sha256="0" * 64, **kwargs)
+        with self.assertRaisesRegex(ValueError, "Evidence Index"):
+            review_package.validate_ref(self.root, ref,
+                current_evidence_index_sha256="0" * 64, **kwargs)
+        (self.root / "implementation.py").write_text("VALUE = 3\n", encoding="utf-8")
+        with self.assertRaisesRegex(ValueError, "working tree delta"):
+            review_package.validate_ref(self.root, ref, validate_current_target=True, **kwargs)
+
+    def test_source_job_context_internal_hash_mismatch_fails(self):
+        args = self.inputs(); report = review_package.generate(
+            self.root, generated_root="validation/context", **args,
+            before=self.before, after=self.after, changed_paths=self.paths)
+        package = self.root / report["package_path"]
+        job_path = package / "job-context.json"
+        value = json.loads(job_path.read_text("utf-8")); value["job"]["job_id"] = "TAMPER"
+        raw = job_context.canonical(value); job_path.write_bytes(raw)
+        manifest_path = package / "package-manifest.json"
+        manifest = json.loads(manifest_path.read_text("utf-8"))
+        for fact in manifest["files"]:
+            if fact["path"] == "job-context.json":
+                fact.update(raw_sha256=review_package.sha256(raw), size=len(raw))
+        manifest["source_inputs"]["job_context"].update(
+            sha256=review_package.sha256(raw), size=len(raw))
+        manifest["job_context_sha256"] = review_package.sha256(raw)
+        material = dict(manifest); material.pop("manifest_sha256"); material.pop("package_sha256")
+        signed = review_package.sha256(review_package.canonical(material))
+        manifest.update(manifest_sha256=signed, package_sha256=signed)
+        manifest_path.write_bytes(review_package.canonical(manifest))
+        ref = {"path": report["package_path"], "sha256": signed, "target_job_id": "JOB"}
+        with self.assertRaisesRegex(ValueError, "internal hash mismatch"):
+            review_package.validate_ref(self.root, ref, workspace="ws", capability="CAP")
+
+    def test_failure_telemetry_preserves_delta_mode_and_ref(self):
+        ref = {"path": "validation/context/CAP/JOB/review-package",
+               "sha256": "a" * 64, "target_job_id": "JOB"}
+        telemetry = review_invocation.telemetry(
+            {"mode": "DELTA_REVIEW", "ref": ref, "prelaunch_failed": True,
+             "error": "stale", "current_context_sha256": "c" * 64}, [], "", None)
+        self.assertEqual(telemetry["mode"], "DELTA_REVIEW")
+        self.assertEqual(telemetry["supplied_package_ref"], ref["path"])
+        self.assertEqual(telemetry["stale_reasons"], ["stale"])
+
 
 if __name__ == "__main__":
     unittest.main()

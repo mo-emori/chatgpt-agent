@@ -677,6 +677,8 @@ def build_result(
             response["evidence_index"] = context["evidence_index"]
         if context.get("job_context") is not None:
             response["job_context"] = context["job_context"]
+        if context.get("review_package") is not None:
+            response["review_package"] = context["review_package"]
     if artifact_result is not None:
         (
             summary,
@@ -836,7 +838,9 @@ def execute_job(job, say):
             runtime_diagnostic = classify_runtime_failure(error_summary)
             failure_class = runtime_diagnostic["classification"]
 
-            context = finish_shadow(workdir, context_session, job_id=job.job_id)
+            context = finish_shadow(
+                workdir, context_session, job_id=job.job_id, before=before, after=after,
+                attributable_changed_paths=get_attributable_changed_paths(before, after))
             state_store.mark_completed(
                 job.job_id,
                 status="FAILED",
@@ -888,7 +892,9 @@ def execute_job(job, say):
             canonical_references,
         ) = unpack_artifact_result(artifact_result)
 
-        context = finish_shadow(workdir, context_session, job_id=job.job_id)
+        context = finish_shadow(
+            workdir, context_session, job_id=job.job_id, before=before, after=after,
+            attributable_changed_paths=get_attributable_changed_paths(before, after))
 
         state_store.mark_completed(
             job.job_id,

@@ -13,6 +13,7 @@ from pathlib import Path, PurePosixPath
 
 from evidence_index import generate as generate_evidence_index
 from job_context import generate as generate_job_context
+from review_package import generate as generate_review_package
 
 
 SCHEMA_VERSION = 1
@@ -340,7 +341,9 @@ def refresh_evidence_index(root: str | Path, session: dict | None) -> dict | Non
     )
 
 
-def finish_shadow(root: str | Path, session: dict | None, *, job_id: str) -> dict | None:
+def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
+                  before: dict | None = None, after: dict | None = None,
+                  attributable_changed_paths: list[str] | None = None) -> dict | None:
     if session is None:
         return None
     capability = session.get("capability")
@@ -379,6 +382,7 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str) -> dic
         os.replace(temp, cache)
         evidence_index = refresh_evidence_index(root, session)
         job_context = None
+        review_package = None
         if evidence_index and evidence_index.get("status") == "READY":
             index_rel = _safe_relative(
                 f"{session['declaration'].get('generated_root', 'validation/context')}/"
@@ -407,6 +411,33 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str) -> dic
                         "diagnostics": [{"code": "JOB_CONTEXT_BUILD_FAILED",
                                          "detail": str(exc)[:1000]}],
                     }
+                if job_context and job_context.get("job_context_path"):
+                    try:
+                        job_context_value = json.loads(
+                            (root / job_context["job_context_path"]).read_text("utf-8"))
+                        review_package = generate_review_package(
+                            root, generated_root=session["declaration"].get(
+                                "generated_root", "validation/context"),
+                            workspace=session["workspace"], capability=capability, job=job,
+                            manifest=current, manifest_path=manifest_path, delta=report,
+                            delta_path=report_path, evidence_index=index_value,
+                            evidence_index_path=index_rel, job_context=job_context_value,
+                            job_context_path=job_context["job_context_path"], before=before,
+                            after=after, changed_paths=attributable_changed_paths,
+                        )
+                    except Exception as exc:
+                        review_package = {
+                            "mode": "COMPARISON_ONLY", "candidate_review_mode": None,
+                            "status": "UNVERIFIABLE", "schema_version": 1,
+                            "sha256": None, "source_context_sha256": current["lifecycle"]["manifest_sha256"],
+                            "job_context_sha256": job_context.get("sha256"),
+                            "evidence_index_sha256": evidence_index.get("index_sha256"),
+                            "file_count": 0, "bytes": 0, "ref_count": 0, "finding_count": 0,
+                            "expansion_required_count": 0,
+                            "attribution_status": "ATTRIBUTION_UNCERTAIN", "report_path": None,
+                            "diagnostics": [{"code": "REVIEW_PACKAGE_BUILD_FAILED",
+                                             "detail": str(exc)[:1000]}],
+                        }
         return {"mode": "SHADOW", "capability": capability,
                 "manifest_sha256": current["lifecycle"]["manifest_sha256"],
                 "previous_manifest_sha256": current["lifecycle"]["previous_context_hash"],
@@ -414,7 +445,8 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str) -> dic
                 "would_block": report["would_block"], "manifest_path": manifest_path,
                 "report_path": report_path, "changed_sources": report["changed_sources"],
                 "unverifiable_reasons": report["unverifiable_reasons"],
-                "evidence_index": evidence_index, "job_context": job_context}
+                "evidence_index": evidence_index, "job_context": job_context,
+                "review_package": review_package}
     except Exception as exc:
         return {"mode": "SHADOW", "capability": capability,
                 "manifest_sha256": None, "previous_manifest_sha256": None,

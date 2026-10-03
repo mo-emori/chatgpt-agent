@@ -531,7 +531,7 @@ generated canonical index/reportは `.agent/context.json` の `generated_root` �
 failed actor execution（429/session limitを含む）はreview verdictではなくexecution failureとしてindexし、入力に古い
 `review_verdict` があってもfailed executionでは公開しない。generated indexはContract/ADR authorityではない。
 
-### 7.6 Differential context / reviewへの段階移行（PHASE 2B COMPARISON IMPLEMENTED / PHASE 3 NOT_IMPLEMENTED）
+### 7.6 Differential context / reviewへの段階移行（PHASE 3A COMPARISON IMPLEMENTED / PHASE 3B NOT_IMPLEMENTED）
 
 移行は一度にActorの読取りを狭めず、次の段階で行う。
 
@@ -541,13 +541,13 @@ failed actor execution（429/session limitを含む）はreview verdictではな
 4. **Differential-review:** 通常reviewは主にdelta packageを使い、必要時にboundaryまたはfull scopeへexpandする。
 5. **Full Review:** critical、closure、authority-changing、security/boundary-sensitiveなcaseでは常に選択可能とし、必要な全範囲を確認する。
 
-Phase 2A Evidence Indexerと、JOB・capability・actor/modeに応じてcandidateを組み立てるcomparison-only
-**Job Context Slicer** は実装済みである。次段階は **Review Delta Package** とactor package consumptionである。設計authorityはcompleted design job
+Phase 2A Evidence Indexer、JOB・capability・actor/modeに応じてcandidateを組み立てるcomparison-only
+**Job Context Slicer**、およびPhase 3A **Review Delta Package Builder** は実装済みである。次段階はactor package consumptionである。設計authorityはcompleted design job
 `LOCAL-AGENT-CONTEXT-HARNESS-PHASE23-DESIGN-20261003-001` とし、その範囲を越えて本書で発明しない。
 
 **NOT IMPLEMENTED:** prompt reduction/injection、Actorによる `context_ref` / `job_context_ref` /
-`review_package_ref` consumption、package-first Claude invocation、Review Delta Package、`DELTA_REVIEW` /
-`BOUNDARY_REVIEW` execution、LLM reconciliationのruntime接続、
+`review_package_ref` consumption、package-first Claude invocation、`DELTA_REVIEW` /
+`BOUNDARY_REVIEW` actor execution/routing、LLM reconciliationのruntime接続、
 automatic `approved_semantics` mutation、Actorのsupplemental repository read禁止。
 
 ### 7.7 Job Context Slicer（PHASE 2B / IMPLEMENTED_COMPARISON_ONLY）
@@ -555,7 +555,8 @@ automatic `approved_semantics` mutation、Actorのsupplemental repository read�
 Phase 2Bは、terminal Delta ScanとPhase 2A Evidence Index生成後、workspace leaseを保持したまま
 deterministic `job-context.json` candidateを生成する。これは観測・比較専用であり、Codex/Claudeへ送るinstruction、
 actor prompt、context visibility、Claude review cloneのfull-repo内容、jobの成功/失敗条件を変更しない。
-Review Delta Packageとactorによるpackage-first consumptionはPhase 3であり **NOT IMPLEMENTED** である。
+Review Delta Package BuilderはPhase 3Aとしてcomparison-onlyで実装済みである。actorによるpackage-first consumptionは
+Phase 3Bであり **NOT IMPLEMENTED** である。
 
 入力はcurrent Capability Context Manifest、mandatory Delta Report、Evidence Index、workspace/capability declaration、
 protocol-v3 job identity/instruction hash、および `instruction_ref.context_request` に明示された構造化metadataのみである。
@@ -873,10 +874,11 @@ Human → ChatGPT → Codex implementation → DONE / Evidence
 Codex implementation / Claude independent review境界を維持する。自動Actor chainを行わず、
 後続JOB発行前にChatGPT / Human control boundaryを置く。
 
-### 13.4 Review Delta Package and review modes（PLANNED / NOT_IMPLEMENTED）
+### 13.4 Review Delta Package and review modes（PHASE 3A / IMPLEMENTED_COMPARISON_ONLY）
 
-Review Delta Packageは、通常reviewで変更差分、関係context、必要なevidenceをbounded packageとして渡す将来設計である。
-現在のfull-repo clone behaviorを置き換える実装はまだ存在しない。planned modeは次の意味とする。
+Review Delta Package Builderはterminal Job Context生成後、同じworkspace lease内で決定的packageを
+`<generated_root>/<capability>/<job_id>/review-package/` に生成する。現在のfull-repo clone、actor prompt、review qualification、
+job statusは変更せず、package coverageを比較するだけである。mode schemaは次の意味とする。
 
 | Planned mode | 定義 |
 |---|---|
@@ -884,8 +886,29 @@ Review Delta Packageは、通常reviewで変更差分、関係context、必要�
 | `BOUNDARY_REVIEW` | security、authority、interface、dependency等の境界へ影響が及ぶため、deltaから関係boundaryまで範囲を拡張する。 |
 | `FULL_REVIEW` | critical、closure、authority-changing、またはboundary-sensitiveなcaseで、deltaに限定せず必要な全範囲を確認する。 |
 
-packageやmode routing、automatic expansionは **NOT IMPLEMENTED** である。Phase 2/3実装前の現在は、
-通常reviewもfull-repo input behaviorを維持する。
+packageは `package-manifest.json`、`job-context.json`、`delta.json`、`diff.patch`、`findings.json`、
+`authority-refs.json`、`validation-results.json`、`evidence-refs.json`、`expansion-plan.json`、`comparison.json` からなる。
+canonical JSONはsorted keys/compact separators/LFであり、manifest hash materialに時刻を含めない。manifestは各package fileと
+included authority/evidence refのworkspace-relative path、raw-byte SHA-256、size、source Context/Delta/Evidence Index/Job Context hash、
+job/instruction identity、Git base/head、Worker changed paths、provenance、previous context linkage、count/bytesを保持する。
+
+diff attributionはWorker before/after snapshotをauthorityとする。HEADが同一で、対象pathがjob開始時にcleanであり、path stateが
+job中に変わった場合だけ `git diff --binary HEAD -- <bounded paths>` をexact deltaとする。pre-existing dirty target、HEAD transition、
+snapshot欠落ではpatchを空にして `ATTRIBUTION_UNCERTAIN` / `NEEDS_RECONCILIATION` とし、unrelated dirty pathをtargetへ割り当てない。
+STRUCTURED findingsだけを選択し、PARTIAL/UNSTRUCTURED proseからfindingを作らない。429/session limitはexecution failureであり
+verdictではない。validationではWorker-observed execution factとactor-reported verdict/findingを別authority labelで保持する。
+
+`DELTA_REVIEW` はattributed hunks、selected authority、structured prior findings/evidence、direct declared dependency surfaceを含む。
+`BOUNDARY_REVIEW` はJob Contextのdeclared dependency boundaryを追加する。`FULL_REVIEW` はbroad repo visibilityが必要というmarkerと
+bounded expansionを記録し、packageがrepo全体を代替すると主張しない。expansion planはmissing ref、reason、authority/quality、
+required-before-review、deterministic bounded scopeを保持し、automatic unrestricted fallbackを行わない。
+
+statusは `READY_PACKAGE` / `NEEDS_RECONCILIATION` / `UNVERIFIABLE` である。safe resolverはworkspace/capability/schema/hash、
+source Context/Job Context freshness、path containment、traversal、symlink/reparse、全included file/ref bytesを再検証する。
+Result Manifestへadditive `review_package` comparison diagnosticを出すがstatus単独でcurrent executionをblockしない。
+
+**NOT IMPLEMENTED:** actor-consumed `review_package_ref`、Claude lightweight/package-first invocation、modeによるactor routing、
+review clone visibility制限、automatic expansion/reconciliation。通常reviewはfull-repo input behaviorを維持する。
 
 ## 14. Notion Integration / Control & Registry Plane
 
@@ -1037,12 +1060,13 @@ Slack Result ManifestのauthorityとCallbackより先に公開する順序は変
 - Cross-JOB Historical Job Evidence Adoption（`HISTORICAL_MANUAL`）
 - Phase 1 Capability Context Harness（`mode: SHADOW`）、deterministic Context Manifest、terminal Delta Scan、workspace lease
 - Phase 2A Evidence IndexerとPhase 2B Job Context Slicer（`mode: COMPARISON_ONLY`）
+- Phase 3A Review Delta Package Builder（`mode: COMPARISON_ONLY`、actor consumptionなし）
 
 ### 17.2 PLANNED / NOT_IMPLEMENTED
 
-Context Harness Phase 3はdesign directionのみであり、runtimeへは実装されていない。対象は
-package-first prompt/context供給、Review Delta Package、`DELTA_REVIEW` / `BOUNDARY_REVIEW` /
-`FULL_REVIEW` routing、LLM reconciliationのruntime接続である。automatic `approved_semantics` mutationと、
+Context Harness Phase 3Bは未実装である。対象はpackage-first prompt/context供給、actor-consumed `review_package_ref`、
+Claude lightweight invocation、`DELTA_REVIEW` / `BOUNDARY_REVIEW` / `FULL_REVIEW` actor routing、
+LLM reconciliationのruntime接続である。automatic `approved_semantics` mutationと、
 Actorのsupplemental repository read禁止も未実装である。Phase 1の `SHADOW` 観測はこれらを実装済みとみなす根拠にならない。
 
 ### 17.3 実装・E2E確認済み

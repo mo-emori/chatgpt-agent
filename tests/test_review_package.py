@@ -1,0 +1,197 @@
+import json
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+
+import context_harness
+import evidence_index
+import job_context
+import review_package
+from job_log import get_attributable_changed_paths, get_git_snapshot
+
+
+def write_json(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(job_context.canonical(value))
+
+
+class ReviewPackageTests(unittest.TestCase):
+    def setUp(self):
+        Path(".tmp-tests").mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=".tmp-tests")
+        self.root = Path(self.temp.name).resolve()
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.email", "test@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.name", "Test"], check=True)
+        (self.root / ".agent").mkdir()
+        (self.root / "authority.md").write_text("authority\n", encoding="utf-8")
+        (self.root / "implementation.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (self.root / "unrelated.txt").write_text("dirty baseline\n", encoding="utf-8")
+        self.declaration = {"schema_version": 1, "mode": "SHADOW",
+            "generated_root": "validation/context", "capabilities": {"CAP": {
+                "selectors": {"actors": ["codex"], "modes": ["execute"]},
+                "sources": [{"path": "authority.md", "kind": "contract",
+                             "authority": "authoritative", "context_items": ["api"],
+                             "required": True}]}}}
+        write_json(self.root / ".agent/context.json", self.declaration)
+        subprocess.run(["git", "-C", str(self.root), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", "fixture"], check=True)
+        # Pre-existing unrelated dirt must not enter the target delta.
+        (self.root / "unrelated.txt").write_text("unrelated pre-existing dirt\n", encoding="utf-8")
+        self.before = get_git_snapshot(self.root)
+        (self.root / "implementation.py").write_text("VALUE = 2\n", encoding="utf-8")
+        self.after = get_git_snapshot(self.root)
+        self.paths = get_attributable_changed_paths(self.before, self.after)
+        self.manifest = context_harness.observe(self.root, "CAP")
+        self.delta = context_harness.scan(self.manifest, self.manifest)
+        self.dest = self.root / "validation/context/CAP"
+        write_json(self.dest / "context-manifest.json", self.manifest)
+        write_json(self.dest / "delta-report.json", self.delta)
+        findings = [{"finding_id": x, "status": "OPEN"} for x in
+                    ("F-1", "F-2", "F-3", "MINOR-1", "MINOR-2", "MINOR-3")]
+        self.evidence = {"job_id": "REVIEW-1", "actor": "claude", "mode": "review",
+                         "workspace": "ws", "capability": "CAP", "status": "DONE",
+                         "review_execution": {"actor_status": "DONE"},
+                         "review_verdict": "CHANGES_REQUESTED", "findings": findings}
+        write_json(self.root / "evidence/review.json", self.evidence)
+        self.index, _ = evidence_index.build_index(self.root, workspace="ws", capability="CAP",
+            sources=[{"path": "evidence/review.json", "kind": "review", "required": True}])
+        write_json(self.dest / "evidence-index.json", self.index)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def job(self, mode="DELTA_REVIEW", findings=None):
+        request = {"review_mode": mode, "target_files": ["implementation.py"],
+                   "finding_ids": findings or ["F-1", "F-2", "F-3", "MINOR-1", "MINOR-2", "MINOR-3"]}
+        return SimpleNamespace(protocol_version="3", job_id="JOB", actor="codex", mode="execute", workspace="ws",
+            prompt_sha256="a" * 64, prompt="unchanged",
+            instruction_ref={"type": "notion_page", "page_id": "p", "context_request": request})
+
+    def inputs(self, job=None, index=None):
+        job, index = job or self.job(), index or self.index
+        write_json(self.dest / "evidence-index.json", index)
+        jc, _ = job_context.build(self.root, workspace="ws", capability="CAP", job=job,
+            manifest=self.manifest, manifest_path="validation/context/CAP/context-manifest.json",
+            delta=self.delta, delta_path="validation/context/CAP/delta-report.json",
+            evidence_index=index, evidence_index_path="validation/context/CAP/evidence-index.json",
+            declaration=self.declaration)
+        write_json(self.dest / "job-context.json", jc)
+        return dict(workspace="ws", capability="CAP", job=job, manifest=self.manifest,
+            manifest_path="validation/context/CAP/context-manifest.json", delta=self.delta,
+            delta_path="validation/context/CAP/delta-report.json", evidence_index=index,
+            evidence_index_path="validation/context/CAP/evidence-index.json", job_context=jc,
+            job_context_path="validation/context/CAP/job-context.json")
+
+    def build(self, **overrides):
+        args = self.inputs(overrides.pop("job", None), overrides.pop("index", None))
+        args.update(before=self.before, after=self.after, changed_paths=self.paths)
+        args.update(overrides)
+        return review_package.build(self.root, **args)
+
+    def test_deterministic_layout_hash_attribution_and_metrics(self):
+        one, report1 = self.build(); two, report2 = self.build()
+        self.assertEqual(one, two)
+        self.assertEqual(report1["sha256"], report2["sha256"])
+        manifest = json.loads(one["package-manifest.json"])
+        self.assertEqual([x["path"] for x in manifest["files"]], list(review_package.PACKAGE_FILES))
+        self.assertEqual(manifest["git"]["worker_observed_changed_paths"], ["implementation.py"])
+        self.assertNotIn(b"unrelated.txt", one["diff.patch"])
+        self.assertIn(b"implementation.py", one["diff.patch"])
+        self.assertEqual(report1["file_count"], 9)
+        self.assertEqual(report1["ref_count"], 2)
+        self.assertEqual(report1["bytes"], sum(len(one[x]) for x in review_package.PACKAGE_FILES))
+
+    def test_dirty_target_is_uncertain_and_not_silently_patched(self):
+        before = get_git_snapshot(self.root)
+        (self.root / "unrelated.txt").write_text("changed again\n", encoding="utf-8")
+        after = get_git_snapshot(self.root)
+        payload, report = self.build(before=before, after=after, changed_paths=["unrelated.txt"])
+        self.assertEqual(report["attribution_status"], "ATTRIBUTION_UNCERTAIN")
+        self.assertEqual(report["status"], "NEEDS_RECONCILIATION")
+        self.assertEqual(payload["diff.patch"], b"")
+
+    def test_structured_six_findings_and_429_is_not_a_verdict(self):
+        payload, report = self.build()
+        findings = json.loads(payload["findings.json"])["findings"]
+        self.assertEqual([x["finding_id"] for x in findings],
+                         ["F-1", "F-2", "F-3", "MINOR-1", "MINOR-2", "MINOR-3"])
+        failed = dict(self.evidence, status="FAILED", failure_class="RATE_LIMITED",
+                      review_execution={"actor_status": "AGENT_ERROR"}, review_verdict="APPROVED",
+                      findings=None, summary="429")
+        write_json(self.root / "evidence/review.json", failed)
+        index, _ = evidence_index.build_index(self.root, workspace="ws", capability="CAP",
+            sources=[{"path": "evidence/review.json", "kind": "review", "required": True}])
+        payload, report = self.build(index=index)
+        self.assertEqual(json.loads(payload["findings.json"])["findings"], [])
+        refs = json.loads(payload["evidence-refs.json"])["evidence_refs"]
+        self.assertIsNone(refs[0]["review_verdict"])
+        self.assertEqual(report["status"], "NEEDS_RECONCILIATION")
+
+    def test_review_modes_boundary_and_full_marker(self):
+        delta, _ = self.build(job=self.job("DELTA_REVIEW"))
+        boundary, _ = self.build(job=self.job("BOUNDARY_REVIEW"))
+        full, report = self.build(job=self.job("FULL_REVIEW"))
+        self.assertEqual(json.loads(delta["authority-refs.json"])["declared_boundary_refs"], [])
+        self.assertTrue(json.loads(boundary["authority-refs.json"])["declared_boundary_refs"])
+        reasons = [x["reason"] for x in json.loads(full["expansion-plan.json"])["requirements"]]
+        self.assertIn("FULL_REVIEW_REQUIRES_BROAD_REPO_VISIBILITY", reasons)
+        self.assertEqual(report["candidate_review_mode"], "FULL_REVIEW")
+
+    def test_generate_validate_tamper_stale_wrong_identity_and_prompt_unchanged(self):
+        job = self.job(); prompt = job.prompt; args = self.inputs(job)
+        report = review_package.generate(self.root, generated_root="validation/context", **args,
+            before=self.before, after=self.after, changed_paths=self.paths)
+        self.assertEqual(job.prompt, prompt)
+        ref = {"path": report["package_path"], "sha256": report["sha256"]}
+        manifest = review_package.validate_ref(self.root, ref, workspace="ws", capability="CAP",
+            current_context_sha256=self.manifest["lifecycle"]["manifest_sha256"],
+            current_job_context_sha256=args["job_context"] and
+                review_package.sha256(job_context.canonical(args["job_context"])))
+        self.assertEqual(manifest["package_sha256"], report["sha256"])
+        with self.assertRaises(ValueError):
+            review_package.validate_ref(self.root, ref, workspace="wrong", capability="CAP")
+        with self.assertRaises(ValueError):
+            review_package.validate_ref(self.root, ref, workspace="ws", capability="CAP",
+                                        current_context_sha256="0" * 64)
+        with self.assertRaises(ValueError):
+            review_package.validate_ref(self.root, ref, workspace="ws", capability="CAP",
+                                        current_job_context_sha256="0" * 64)
+        (self.root / report["package_path"] / "delta.json").write_text("{}\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            review_package.validate_ref(self.root, ref, workspace="ws", capability="CAP")
+
+    def test_included_ref_tamper_and_result_manifest_addition(self):
+        job = self.job(); args = self.inputs(job)
+        report = review_package.generate(self.root, generated_root="validation/context", **args,
+            before=self.before, after=self.after, changed_paths=self.paths)
+        ref = {"path": report["package_path"], "sha256": report["sha256"]}
+        (self.root / "authority.md").write_text("tampered\n", encoding="utf-8")
+        with self.assertRaises(ValueError):
+            review_package.validate_ref(self.root, ref, workspace="ws", capability="CAP")
+
+        import agent_worker
+        response = agent_worker.build_result(job, status="DONE", runtime={},
+            context={"review_package": report})
+        self.assertEqual(response["review_package"], report)
+        self.assertEqual(response["status"], "DONE")
+
+    def test_traversal_and_symlink_escape_rejected(self):
+        with self.assertRaises(ValueError):
+            review_package.validate_ref(self.root, {"path": "../outside", "sha256": "x"},
+                                        workspace="ws", capability="CAP")
+        outside = self.root.parent / (self.root.name + "-outside")
+        outside.mkdir(exist_ok=True)
+        try:
+            (self.root / "link").symlink_to(outside, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            return
+        with self.assertRaises(ValueError):
+            review_package.validate_ref(self.root, {"path": "link/pkg", "sha256": "x"},
+                                        workspace="ws", capability="CAP")
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -10,6 +10,7 @@ MAX_LOG_BYTES = 10 * 1024 * 1024
 BACKUP_COUNT = 5
 LIFECYCLE_LOGGER = "local_agent.lifecycle"
 _console_lock = threading.RLock()
+_console_sink = None
 
 
 class LifecycleConsoleFilter(logging.Filter):
@@ -19,7 +20,7 @@ class LifecycleConsoleFilter(logging.Filter):
 
 def _safe_console_write(message, stream=None):
     """Write one console record promptly, tolerating hostile stream encodings."""
-    stream = stream or sys.stdout
+    stream = stream if stream is not None else sys.stdout
     with _console_lock:
         try:
             stream.write(message)
@@ -29,10 +30,15 @@ def _safe_console_write(message, stream=None):
         stream.flush()
 
 
+def get_console_sink():
+    """Return the stream proven visible when worker logging was configured."""
+    return _console_sink if _console_sink is not None else sys.__stdout__
+
+
 def emit_lifecycle(message):
     """Emit a lifecycle block once to stdout and also to the persistent log."""
     text = message.rstrip("\n")
-    _safe_console_write(text + "\n")
+    _safe_console_write(text + "\n", get_console_sink())
     logging.getLogger(LIFECYCLE_LOGGER).info(text)
 
 
@@ -49,6 +55,7 @@ class ThirdPartyDebugFilter(logging.Filter):
 
 def configure_logging(log_path=DEFAULT_LOG_PATH, level=logging.INFO):
     """Configure console and persistent worker operational logging."""
+    global _console_sink
     root = logging.getLogger()
     root.setLevel(logging.DEBUG)
 
@@ -57,7 +64,11 @@ def configure_logging(log_path=DEFAULT_LOG_PATH, level=logging.INFO):
             root.removeHandler(handler)
             handler.close()
 
-    console = logging.StreamHandler(sys.stdout)
+    # Own the stream that displayed startup/Bolt diagnostics.  Event handlers,
+    # actor adapters, and test capture may later replace the process-global
+    # sys.stdout; lifecycle records must not follow that transient object.
+    _console_sink = sys.stdout if sys.stdout is not None else sys.__stdout__
+    console = logging.StreamHandler(_console_sink)
     console.setLevel(level)
     console.addFilter(LifecycleConsoleFilter())
     console.setFormatter(logging.Formatter("%(message)s"))

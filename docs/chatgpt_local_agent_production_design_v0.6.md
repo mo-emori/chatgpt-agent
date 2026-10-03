@@ -974,7 +974,8 @@ Adoption、callback、JOB ENDの意味は変更しない。
 ローカルconsole lifecycleはclaimed worker threadが所有する。stateを`RUNNING`にした直後に
 flush済みの`JOB START`をstdoutへ一度だけ出し、setup、actor、callbackの成否にかかわらず
 terminal state確定後のfinally pathで`JOB END`を一度だけ出す。同じblockはworker logにも残し、
-actorのbulk stdout/stderr captureとは分離する。
+actorのbulk stdout/stderr captureとは分離する。出力先は`configure_logging`時にstartup/Bolt diagnosticsを
+表示したworker-owned console sinkへ固定し、event thread実行中の一時的な`sys.stdout`置換には追従しない。
 
 `FULL_REVIEW` は現在の安全なreference/fallbackであり既定動作は不変である。`BOUNDARY_REVIEW` のpackage
 consumptionは未実装であり、package refを受理しない。universal differential reviewはまだ有効化されていない。

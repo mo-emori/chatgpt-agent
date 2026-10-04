@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 import context_harness as harness
+import context_trust
 
 
 class ContextHarnessTests(unittest.TestCase):
@@ -141,9 +142,13 @@ class ContextHarnessTests(unittest.TestCase):
                                     mode="implementation", cache_root=cache)
         accepted = harness.finish_shadow(self.root, seed, job_id="BOOTSTRAP")
         trusted_hash = accepted["manifest_sha256"]
-        self.assertTrue(accepted["trust_state"]["baseline_promoted"])
+        self.assertFalse(accepted["trust_state"]["baseline_promoted"])
         self.assertEqual(accepted["trust_state"]["promotion_reason"],
-                         "INITIAL_TRUST_BOOTSTRAP")
+                         "EXPLICIT_ACCEPTANCE_REQUIRED")
+        context_trust.accept_candidate(
+            root=self.root, cache_root=cache, workspace="fixture", capability="CAP",
+            expected_candidate_sha256=trusted_hash, operator="test-operator",
+            reason="establish fixture trust")
 
         (self.root / "contract.txt").write_text("unaccepted authority\n", encoding="utf-8")
         candidate_hash = None
@@ -185,7 +190,7 @@ class ContextHarnessTests(unittest.TestCase):
         retry_result = harness.finish_shadow(self.root, retry, job_id="RETRY")
         self.assertFalse(retry_result["trust_state"]["baseline_promoted"])
         self.assertEqual(retry_result["trust_state"]["promotion_reason"],
-                         "BOOTSTRAP_NOT_SAFE")
+                         "EXPLICIT_ACCEPTANCE_REQUIRED")
         baseline, _ = harness.load_trusted_baseline(cache, "fixture", "CAP")
         self.assertIsNone(baseline)
 

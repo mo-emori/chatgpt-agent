@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 import agent_worker
 import context_harness
+import context_trust
 from context_activation import legacy_input, prepare, resolve_activation_mode
 
 
@@ -51,14 +52,24 @@ class FooProjectGenericityTests(unittest.TestCase):
     def run_pipeline(self, request, cache_name="cache"):
         job = self.job(request)
         result = None
-        # The first observation establishes the trusted baseline.  The second is
-        # the unchanged PRE_ACTOR snapshot used by enforcement.
-        for _ in range(2):
+        # First observation creates an initialization candidate; the explicit
+        # acceptance is the only operation that establishes trust.
+        for attempt in range(2):
             session = context_harness.begin_shadow(
                 self.root, workspace=job.workspace, actor=job.actor, mode=job.mode,
                 cache_root=self.root / cache_name, job=job)
             self.assertEqual(session["capability"], CAPABILITY)
             result = context_harness.finish_shadow(self.root, session, job_id=job.job_id)
+            if attempt == 0:
+                record = json.loads(Path(result["trust_state"]["candidate_path"])
+                                    .read_text(encoding="utf-8"))
+                if record.get("reconciliation_eligible"):
+                    context_trust.accept_candidate(
+                        root=self.root, cache_root=self.root / cache_name,
+                        workspace=job.workspace, capability=CAPABILITY,
+                        expected_candidate_sha256=result["manifest_sha256"],
+                        operator="foo-test-operator",
+                        reason="establish FooProject fixture trust")
         return job, result
 
     def set_budget(self, budget):
@@ -180,7 +191,12 @@ class FooProjectGenericityTests(unittest.TestCase):
         seed = context_harness.begin_shadow(
             self.root, workspace=job.workspace, actor=job.actor, mode=job.mode,
             cache_root=cache, job=job)
-        context_harness.finish_shadow(self.root, seed, job_id=job.job_id)
+        seed_result = context_harness.finish_shadow(self.root, seed, job_id=job.job_id)
+        context_trust.accept_candidate(
+            root=self.root, cache_root=cache, workspace=job.workspace,
+            capability=CAPABILITY,
+            expected_candidate_sha256=seed_result["manifest_sha256"],
+            operator="foo-test-operator", reason="establish lineage fixture trust")
         session = context_harness.begin_shadow(
             self.root, workspace=job.workspace, actor=job.actor, mode=job.mode,
             cache_root=cache, job=job)

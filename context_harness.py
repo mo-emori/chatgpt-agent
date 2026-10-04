@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
 from pathlib import Path, PurePosixPath
 
 from attribution_policy import attribution_paths
@@ -22,6 +23,7 @@ from section_slicing import validate_contract as validate_section_contract
 
 SCHEMA_VERSION = 1
 BUILDER_VERSION = "context-harness-phase1-1"
+TRUST_SCHEMA_VERSION = 2
 DECLARATION = Path(".agent/context.json")
 STATES = ("NO_IMPACT", "CONTEXT_UPDATE", "POTENTIAL_AUTHORITY_CHANGE", "UNVERIFIABLE")
 SOURCE_ROLES = ("MATERIALIZED_CONTEXT", "STRUCTURED_PROJECTION", "PROVENANCE_SOURCE")
@@ -399,11 +401,29 @@ def _candidate_path(cache_root: str | Path, workspace: str, capability: str) -> 
     return Path(cache_root) / "context-candidates" / f"{safe}.json"
 
 
+def _receipt_path(cache_root: str | Path, workspace: str, capability: str,
+                  manifest_sha256: str) -> Path:
+    safe = hashlib.sha256(f"{workspace}\0{capability}".encode()).hexdigest()
+    return (Path(cache_root) / "context-acceptance-receipts" / safe /
+            f"{manifest_sha256}.json")
+
+
 def _atomic_write(path: Path, value: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(".tmp")
-    temp.write_bytes(_canonical(value))
-    os.replace(temp, path)
+    descriptor, temp_name = tempfile.mkstemp(prefix=path.name + ".",
+                                             suffix=".tmp", dir=path.parent)
+    temp = Path(temp_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(_canonical(value))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def _promotion_decision(*, baseline: dict | None, report: dict,
@@ -411,7 +431,7 @@ def _promotion_decision(*, baseline: dict | None, report: dict,
                         materialized_context: dict | None,
                         review_package: dict | None,
                         candidate_already_known: bool = False) -> tuple[bool, str]:
-    """Gate every trusted-baseline write after all fail-closed checks complete."""
+    """Compatibility diagnostic: observation is never an acceptance operation."""
     delta = report.get("delta_status")
     if report.get("would_block") or delta in ("POTENTIAL_AUTHORITY_CHANGE", "UNVERIFIABLE"):
         return False, "RECONCILIATION_OR_VERIFICATION_REQUIRED"
@@ -422,18 +442,10 @@ def _promotion_decision(*, baseline: dict | None, report: dict,
     if materialized_context is not None and materialized_context.get("status") not in (
             "READY_BOUNDED", "READY"):
         return False, "MATERIALIZED_CONTEXT_NOT_READY"
-    # A first observation has no prior actor-diff snapshots by definition.  Its
-    # context identity may bootstrap only after the context-specific gates above;
-    # review attribution ambiguity is not an ambiguity in that observed identity.
-    if baseline is None and not candidate_already_known and delta == "CONTEXT_UPDATE" and \
-            report.get("reasons") == ["NO_TRUSTED_BASELINE"]:
-        return True, "INITIAL_TRUST_BOOTSTRAP"
     if review_package is not None and review_package.get("status") not in (
             "READY_PACKAGE", "REUSED"):
         return False, "REVIEW_PACKAGE_NOT_READY"
-    if baseline is None:
-        return False, "BOOTSTRAP_NOT_SAFE"
-    return True, "NON_AUTHORITY_CHANGE_ACCEPTED"
+    return False, "EXPLICIT_ACCEPTANCE_REQUIRED"
 
 
 def load_trusted_baseline(cache_root: str | Path, workspace: str,
@@ -451,9 +463,56 @@ def load_trusted_baseline(cache_root: str | Path, workspace: str,
             raise ValueError("manifest content hash mismatch")
         if value["observed"]["capability"] != capability:
             raise ValueError("capability mismatch")
+        provenance = value.get("lifecycle", {}).get("acceptance_provenance")
+        if not isinstance(provenance, dict):
+            raise ValueError("legacy baseline has no acceptance provenance")
+        if provenance.get("schema_version") != TRUST_SCHEMA_VERSION:
+            raise ValueError("unsupported acceptance provenance schema")
+        receipt_path = _receipt_path(cache_root, workspace, capability,
+                                     value["lifecycle"]["manifest_sha256"])
+        if not receipt_path.is_file():
+            raise ValueError("acceptance receipt missing")
+        receipt_raw = receipt_path.read_bytes()
+        if _sha(receipt_raw) != provenance.get("receipt_sha256"):
+            raise ValueError("acceptance receipt hash mismatch")
+        receipt = json.loads(receipt_raw.decode("utf-8"))
+        domain = receipt.get("trust_domain", {})
+        accepted = receipt.get("accepted_candidate", {})
+        if (receipt.get("schema_version") != TRUST_SCHEMA_VERSION or
+                domain != {"workspace": workspace, "capability": capability} or
+                accepted.get("manifest_sha256") != value["lifecycle"]["manifest_sha256"] or
+                accepted.get("declaration_sha256") !=
+                value["observed"]["declaration"]["raw_sha256"] or
+                provenance.get("receipt_identity") != receipt.get("receipt_identity")):
+            raise ValueError("acceptance receipt does not bind this baseline")
+        identity_material = dict(receipt)
+        identity = identity_material.pop("receipt_identity", None)
+        if identity != _sha(_canonical(identity_material)):
+            raise ValueError("acceptance receipt identity mismatch")
         return value, []
     except Exception as exc:
         return None, [f"BASELINE_UNTRUSTED: {exc}"]
+
+
+def _load_legacy_baseline(cache_root: str | Path, workspace: str,
+                          capability: str) -> dict | None:
+    """Load hash-valid pre-receipt state solely as migration comparison material."""
+    path = _baseline_path(cache_root, workspace, capability)
+    if not path.is_file():
+        return None
+    try:
+        value = json.loads(path.read_text("utf-8"))
+        if value.get("lifecycle", {}).get("acceptance_provenance") is not None:
+            return None
+        material = {"observed": value["observed"],
+                    "approved_semantics": value["approved_semantics"]}
+        if (value["approved_semantics"] == {} and
+                value["observed"]["capability"] == capability and
+                _sha(_canonical(material)) == value["lifecycle"]["manifest_sha256"]):
+            return value
+    except Exception:
+        pass
+    return None
 
 
 def begin_shadow(root: str | Path, *, workspace: str, actor: str, mode: str,
@@ -470,13 +529,22 @@ def begin_shadow(root: str | Path, *, workspace: str, actor: str, mode: str,
     if capability is None:
         return None
     baseline, errors = load_trusted_baseline(cache_root, workspace, capability)
-    previous_hash = baseline["lifecycle"]["manifest_sha256"] if baseline else None
+    legacy_baseline = (_load_legacy_baseline(cache_root, workspace, capability)
+                       if baseline is None else None)
+    if legacy_baseline is not None:
+        errors = [error for error in errors
+                  if "legacy baseline has no acceptance provenance" not in error]
+    comparison_baseline = baseline or legacy_baseline
+    previous_hash = (comparison_baseline["lifecycle"]["manifest_sha256"]
+                     if comparison_baseline else None)
     try:
         pre = observe(root, capability, previous_context_hash=previous_hash)
     except Exception as exc:
         pre = None
         errors.append(f"PRE_OBSERVATION_FAILED: {exc}")
     session = {"capability": capability, "pre": pre, "baseline": baseline,
+               "comparison_baseline": comparison_baseline,
+               "legacy_baseline": legacy_baseline is not None,
                "errors": errors, "cache_root": str(cache_root), "workspace": workspace,
                "evidence_roots": evidence_roots or [], "declaration": declaration}
     session["candidate_already_known"] = _candidate_path(
@@ -528,13 +596,18 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
         # The mandatory terminal scan detects actor-time mutation.  If none occurred,
         # the prior trusted baseline still determines the externally reported delta.
         execution_delta = scan(pre, current)
-        baseline_delta = scan(session.get("baseline"), current)
+        baseline_delta = scan(session.get("comparison_baseline"), current)
         rank = {"NO_IMPACT": 0, "CONTEXT_UPDATE": 1,
                 "POTENTIAL_AUTHORITY_CHANGE": 2, "UNVERIFIABLE": 3}
         report = execution_delta if rank[execution_delta["delta_status"]] >= rank[baseline_delta["delta_status"]] else baseline_delta
         report = dict(report)
         report["baseline_delta_status"] = baseline_delta["delta_status"]
         report["execution_delta_status"] = execution_delta["delta_status"]
+        if session.get("legacy_baseline"):
+            report["delta_status"] = "POTENTIAL_AUTHORITY_CHANGE"
+            report["would_block"] = True
+            report["reasons"] = sorted(set(
+                report.get("reasons", []) + ["LEGACY_BASELINE_UNPROVEN"]))
         if errors:
             report["delta_status"] = "UNVERIFIABLE"
             report["would_block"] = True
@@ -662,15 +735,25 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
             evidence_index=evidence_index, job_context=job_context,
             materialized_context=materialized_context, review_package=review_package,
             candidate_already_known=session.get("candidate_already_known", False))
-        trusted = _baseline_path(session["cache_root"], session["workspace"], capability)
         candidate = _candidate_path(session["cache_root"], session["workspace"], capability)
-        if promote:
-            _atomic_write(trusted, current)
-        else:
-            _atomic_write(candidate, {
-                "schema_version": 1,
+        # Observation only ever records a candidate.  Trust changes are performed
+        # by context_trust.accept_candidate after explicit operator authorization.
+        _atomic_write(candidate, {
+                "schema_version": TRUST_SCHEMA_VERSION,
+                "trust_domain": {"workspace": session["workspace"],
+                                 "capability": capability},
+                "declaration_sha256": current["observed"]["declaration"]["raw_sha256"],
+                "candidate_kind": ("LEGACY_MIGRATION" if session.get("legacy_baseline")
+                                   else "RECONCILIATION"),
+                "reconciliation_eligible": bool(
+                    report.get("delta_status") != "UNVERIFIABLE" and
+                    evidence_index and evidence_index.get("status") == "READY" and
+                    (job_context is None or job_context.get("status") in
+                     ("READY_BOUNDED", "READY")) and
+                    (materialized_context is None or materialized_context.get("status") in
+                     ("READY_BOUNDED", "READY"))),
                 "trusted_baseline_sha256": (
-                    (session.get("baseline") or {}).get("lifecycle", {}).get(
+                    (session.get("comparison_baseline") or {}).get("lifecycle", {}).get(
                         "manifest_sha256")),
                 "candidate_manifest_sha256": current["lifecycle"]["manifest_sha256"],
                 "candidate": current,
@@ -691,13 +774,12 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                 "review_package": review_package}
         result["trust_state"] = {
             "trusted_baseline_sha256": (
-                current["lifecycle"]["manifest_sha256"] if promote else
                 (session.get("baseline") or {}).get("lifecycle", {}).get(
                     "manifest_sha256")),
             "observed_candidate_sha256": current["lifecycle"]["manifest_sha256"],
-            "baseline_promoted": promote,
+            "baseline_promoted": False,
             "promotion_reason": promotion_reason,
-            "candidate_path": (None if promote else str(candidate)),
+            "candidate_path": str(candidate),
         }
         if session.get("pre_actor_input") is not None:
             prior = session["pre_actor_input"]

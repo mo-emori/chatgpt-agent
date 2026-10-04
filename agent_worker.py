@@ -19,7 +19,8 @@ from actors.process_runner import ProcessResult
 from actors.review_workspace import (
     ReviewPreparationError, cleanup_review, create_review_workspace, diff_head_stat, finish_review,
 )
-from config import HOSTNAME, CONTEXT_HARNESS_ACTIVATION_MODE
+from config import (HOSTNAME, CONTEXT_HARNESS_ACTIVATION_MODE,
+                    CONTEXT_HARNESS_ENFORCE_CAPABILITIES)
 from job_protocol import (
     Job,
     JobValidationError,
@@ -72,7 +73,8 @@ from notion_client import (
 from operational_logging import configure_logging, emit_lifecycle
 from single_instance import SingleInstanceAlreadyRunning, WorkerInstanceGuard
 from context_harness import begin_shadow, finish_shadow, refresh_evidence_index
-from context_activation import has_context_request, prepare as prepare_context_activation
+from context_activation import (has_context_request, prepare as prepare_context_activation,
+                                resolve_activation_mode)
 
 logger = logging.getLogger(__name__)
 _execution_context = threading.local()
@@ -730,7 +732,10 @@ def build_result(
         if context.get("review_package") is not None:
             response["review_package"] = context["review_package"]
     if context_activation is not None:
-        for key in ("context_activation_mode", "context_activation_status",
+        for key in ("context_activation_configured_mode", "context_activation_mode",
+                    "context_activation_scope_status",
+                    "context_activation_enforce_allowlist_count",
+                    "context_activation_status",
                     "effective_input_sha256", "effective_input_bytes",
                     "actor_input_sha256", "context_payload_bytes",
                     "gate_reason_codes", "actor_started"):
@@ -891,11 +896,20 @@ def execute_job(job, say):
             # Retain the immutable input snapshot separately from the terminal scan.
             if context_session is not None:
                 context_session["pre_actor_input"] = preflight_context
+        resolution = resolve_activation_mode(
+            CONTEXT_HARNESS_ACTIVATION_MODE,
+            (context_session or {}).get("capability"),
+            has_context_request(job),
+            CONTEXT_HARNESS_ENFORCE_CAPABILITIES,
+        )
         # Some internal legacy test/maintenance jobs predate resolved prompt storage.
         # Real accepted jobs always carry prompt; keep those helpers backward compatible.
         if hasattr(job, "prompt"):
             activation = prepare_context_activation(
-                job, CONTEXT_HARNESS_ACTIVATION_MODE, preflight_context, workdir)
+                job, resolution.mode, preflight_context, workdir,
+                configured_mode=CONTEXT_HARNESS_ACTIVATION_MODE,
+                scope_status=resolution.scope_status,
+                enforce_allowlist_count=len(CONTEXT_HARNESS_ENFORCE_CAPABILITIES))
         if activation is not None and activation["context_activation_status"] == "BLOCKED":
             status = "BLOCKED_CONTEXT"
             context = preflight_context

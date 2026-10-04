@@ -55,6 +55,22 @@ if CONTEXT_HARNESS_ACTIVATION_MODE not in CONTEXT_HARNESS_ACTIVATION_MODES:
         "CONTEXT_HARNESS_ACTIVATION_MODE must be OFF, SHADOW, or ENFORCE_AND_INJECT"
     )
 
+
+def parse_context_harness_enforce_capabilities(value):
+    """Parse exact capability IDs; wildcard authorization is not supported."""
+    capabilities = frozenset(part.strip() for part in (value or "").split(",")
+                             if part.strip())
+    if any("*" in capability for capability in capabilities):
+        raise ValueError(
+            "CONTEXT_HARNESS_ENFORCE_CAPABILITIES does not support wildcards"
+        )
+    return capabilities
+
+
+CONTEXT_HARNESS_ENFORCE_CAPABILITIES = parse_context_harness_enforce_capabilities(
+    os.environ.get("CONTEXT_HARNESS_ENFORCE_CAPABILITIES")
+)
+
 HEARTBEAT_INTERVAL_SECONDS = int(
     os.environ.get(
         "HEARTBEAT_INTERVAL_SECONDS",

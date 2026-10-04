@@ -7,7 +7,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from artifacts.manifest import append_manifest_instruction
-from context_activation import CLOSE, OPEN, compose, evaluate_gate, prepare
+from context_activation import (CLOSE, OPEN, compose, evaluate_gate, prepare,
+                                resolve_activation_mode)
+from config import parse_context_harness_enforce_capabilities
 from actors import codex
 from actors.process_runner import ProcessResult
 import agent_worker
@@ -65,6 +67,38 @@ class ContextActivationTests(unittest.TestCase):
         self.assertEqual(result["actor_input"], expected)
         self.assertEqual(result["context_activation_status"], "LEGACY")
 
+    def test_effective_mode_resolution_matrix(self):
+        allowed = frozenset({"CAP"})
+        cases = [
+            ("OFF", "CAP", True, "OFF", "NOT_APPLICABLE"),
+            ("SHADOW", "CAP", True, "SHADOW", "NOT_APPLICABLE"),
+            ("ENFORCE_AND_INJECT", "CAP", True,
+             "ENFORCE_AND_INJECT", "ALLOWLISTED"),
+            ("ENFORCE_AND_INJECT", "OTHER", True,
+             "SHADOW", "NOT_ALLOWLISTED"),
+            ("ENFORCE_AND_INJECT", None, True,
+             "SHADOW", "NOT_ALLOWLISTED"),
+            ("ENFORCE_AND_INJECT", "CAP", False,
+             None, "NOT_APPLICABLE"),
+        ]
+        for configured, capability, request, mode, scope in cases:
+            with self.subTest(configured=configured, capability=capability, request=request):
+                result = resolve_activation_mode(
+                    configured, capability, request, allowed)
+                self.assertEqual((result.mode, result.scope_status), (mode, scope))
+        self.assertEqual(resolve_activation_mode(
+            "ENFORCE_AND_INJECT", "CAP", True, frozenset()).mode, "SHADOW")
+
+    def test_allowlist_parser_is_trimmed_exact_case_sensitive_and_no_wildcard(self):
+        parsed = parse_context_harness_enforce_capabilities(" CAP,Other,, CAP ")
+        self.assertEqual(parsed, frozenset({"CAP", "Other"}))
+        self.assertNotIn("cap", parsed)
+        self.assertEqual(parse_context_harness_enforce_capabilities(None), frozenset())
+        with self.assertRaises(ValueError):
+            parse_context_harness_enforce_capabilities("CAP, *")
+        with self.assertRaises(ValueError):
+            parse_context_harness_enforce_capabilities("CAP*")
+
     def test_off_request_is_exact_legacy(self):
         result = prepare(self.job, "OFF", None, self.root)
         self.assertEqual(result["actor_input"], append_manifest_instruction(self.instruction).encode())
@@ -82,6 +116,24 @@ class ContextActivationTests(unittest.TestCase):
         result = prepare(self.job, "SHADOW", self.context, self.root)
         self.assertIn("DELTA_NOT_SAFE", result["gate_reason_codes"])
         self.assertEqual(result["context_activation_status"], "SHADOW_PREVIEW")
+
+    def test_nonallowlisted_ready_keeps_legacy_and_records_preview_only(self):
+        resolution = resolve_activation_mode(
+            "ENFORCE_AND_INJECT", "OTHER", True, frozenset({"CAP"}))
+        result = prepare(
+            self.job, resolution.mode, self.context, self.root,
+            configured_mode="ENFORCE_AND_INJECT",
+            scope_status=resolution.scope_status,
+        )
+        legacy = append_manifest_instruction(self.instruction).encode()
+        self.assertEqual(result["context_activation_configured_mode"],
+                         "ENFORCE_AND_INJECT")
+        self.assertEqual(result["context_activation_mode"], "SHADOW")
+        self.assertEqual(result["context_activation_scope_status"], "NOT_ALLOWLISTED")
+        self.assertEqual(result["context_activation_status"], "SHADOW_PREVIEW")
+        self.assertEqual(result["actor_input"], legacy)
+        self.assertEqual(result["actor_input_sha256"], hashlib.sha256(legacy).hexdigest())
+        self.assertNotEqual(result["actor_input_sha256"], result["effective_input_sha256"])
 
     def test_enforce_ready_injects_deterministically_and_preserves_instruction(self):
         one = prepare(self.job, "ENFORCE_AND_INJECT", self.context, self.root)
@@ -140,9 +192,11 @@ class ContextActivationTests(unittest.TestCase):
         before = {"head": "h"}
         with patch.object(agent_worker, "CONTEXT_HARNESS_ACTIVATION_MODE",
                           "ENFORCE_AND_INJECT"), \
+             patch.object(agent_worker, "CONTEXT_HARNESS_ENFORCE_CAPABILITIES",
+                          frozenset({"CAP"})), \
              patch.object(agent_worker, "prepare_execution",
                           return_value=({}, self.root, self.root, before)), \
-             patch.object(agent_worker, "begin_shadow", return_value={}), \
+             patch.object(agent_worker, "begin_shadow", return_value={"capability": "CAP"}), \
              patch.object(agent_worker, "finish_shadow", return_value=blocked), \
              patch.object(agent_worker, "run_agent") as run_actor, \
              patch.object(agent_worker.state_store, "mark_completed"), \
@@ -155,6 +209,36 @@ class ContextActivationTests(unittest.TestCase):
         self.assertEqual(publish.call_args.args[2]["status"], "BLOCKED_CONTEXT")
         self.assertFalse(publish.call_args.args[2]["actor_started"])
         callback.assert_called_once()
+
+    def test_worker_nonallowlisted_gate_failure_does_not_block_actor(self):
+        blocked = json.loads(json.dumps(self.context))
+        blocked["materialized_context"]["projection_freshness"] = [
+            {"freshness_status": "STALE"}]
+        self.job.protocol_version = "3"
+        self.job.callback_type = None
+        self.job.callback_url = None
+        result = ProcessResult(0, "", "")
+        with patch.object(agent_worker, "CONTEXT_HARNESS_ACTIVATION_MODE",
+                          "ENFORCE_AND_INJECT"), \
+             patch.object(agent_worker, "CONTEXT_HARNESS_ENFORCE_CAPABILITIES",
+                          frozenset({"CAP"})), \
+             patch.object(agent_worker, "prepare_execution",
+                          return_value=({}, self.root, self.root, {"head": "h"})), \
+             patch.object(agent_worker, "begin_shadow",
+                          return_value={"capability": "OTHER"}), \
+             patch.object(agent_worker, "finish_shadow", return_value=blocked), \
+             patch.object(agent_worker, "run_agent", return_value=result) as run_actor, \
+             patch.object(agent_worker, "collect_execution_evidence",
+                          return_value=({"head": "h"}, [])), \
+             patch.object(agent_worker, "process_artifacts",
+                          return_value=("ok", "VALID", [], [], [])), \
+             patch.object(agent_worker.state_store, "mark_completed"), \
+             patch.object(agent_worker, "publish_slack_result"), \
+             patch.object(agent_worker, "finalize_browser_callback"), \
+             patch.object(agent_worker, "log_job_end"), \
+             patch.object(agent_worker, "dispatch_next_queued"):
+            agent_worker.execute_job(self.job, lambda **kwargs: None)
+        run_actor.assert_called_once_with(self.job)
 
 
 if __name__ == "__main__":

@@ -1466,6 +1466,14 @@ Worker設定 `CONTEXT_HARNESS_ACTIVATION_MODE` は `OFF`、`SHADOW`、
 Worker全体の上限であり、JOB protocolには上位modeへ引き上げるoverrideを追加しない。
 `context_request` がないJOBは全modeで従来のstdin bytesを維持する。
 
+`CONTEXT_HARNESS_ENFORCE_CAPABILITIES` はcomma-separatedのexact capability ID allowlistで、
+空白をtrimし空entryを無視する。比較はcase-sensitiveで、wildcardはv1では不正としてWorker起動を
+fail closedする。unset/emptyは安全側の空allowlistである。解決済みcapabilityだけを認可に使い、
+workspace名、JOB/protocol値、未解決capabilityを暗黙の認可に使わない。global modeが
+`ENFORCE_AND_INJECT` の場合でも、`context_request` がある非allowlisted capabilityのeffective modeは
+`SHADOW` とし、強制inject/blockは行わない。allowlistはENFORCEだけをgateし、Actor後の既存audit/reportingを
+無効化しない。global `OFF`/`SHADOW` はallowlistにかかわらず従来どおりである。
+
 `SHADOW` と `ENFORCE_AND_INJECT` の `context_request` JOBではActor起動前に既存の
 Context Manifest/delta、Evidence Index、Job Context、Materialized Context生成器を実行する。
 `SHADOW` はgateとeffective-input previewを計算するが、gate成否によらず従来stdinを渡す。
@@ -1495,7 +1503,10 @@ actor-input hashが分離する。
 
 Actor入力に使った生成物は `PRE_ACTOR_INPUT` snapshotとして固定する。Actor終了後の既存terminal
 scanは `POST_ACTOR_VALIDATION` snapshotとしてsource changeを検出するが、pre-actor effective input
-identityを遡及変更しない。Result Manifestのadditive fieldsは `context_activation_mode`、
+identityを遡及変更しない。Result Manifestでは `context_activation_configured_mode` がglobal ceiling、
+`context_activation_mode` がeffective modeを表す。additive fieldsはこれらに加えて
+`context_activation_scope_status` (`ALLOWLISTED`/`NOT_ALLOWLISTED`/`NOT_APPLICABLE`)、
+`context_activation_enforce_allowlist_count`、
 `context_activation_status` (`LEGACY`/`OFF`/`SHADOW_PREVIEW`/`INJECTED`/`BLOCKED`)、
 `effective_input_sha256`、`effective_input_bytes`、`actor_input_sha256`、`context_payload_bytes`、
 `preflight` path/hash、`gate_reason_codes`、`actor_started` である。

@@ -92,6 +92,25 @@ class FooProjectGenericityTests(unittest.TestCase):
         self.assertNotIn(b"Apply the declared", payload)
         self.assertNotIn(b"Return a `classification`", payload)
 
+    def test_authority_candidate_remains_blocked_against_foo_trusted_baseline(self):
+        request = {"context_items": ["analysis-rules"],
+                   "target_files": ["engine/classify.foo"]}
+        _, accepted = self.run_pipeline(request, "trust-cache")
+        trusted = accepted["trust_state"]["trusted_baseline_sha256"]
+        guide = self.root / "context" / "analyzer-guide.md"
+        guide.write_text(guide.read_text(encoding="utf-8") + "\nUnaccepted rule.\n",
+                         encoding="utf-8")
+        for attempt in range(2):
+            job = self.job(request)
+            session = context_harness.begin_shadow(
+                self.root, workspace=job.workspace, actor=job.actor, mode=job.mode,
+                cache_root=self.root / "trust-cache", job=job)
+            result = context_harness.finish_shadow(
+                self.root, session, job_id=f"FOO-BLOCKED-{attempt}")
+            self.assertEqual(result["delta_status"], "POTENTIAL_AUTHORITY_CHANGE")
+            self.assertFalse(result["trust_state"]["baseline_promoted"])
+            self.assertEqual(result["trust_state"]["trusted_baseline_sha256"], trusted)
+
     def test_exact_budget_is_ready_and_one_byte_small_fails_closed(self):
         request = {"context_items": ["analysis-rules"],
                    "target_files": ["engine/classify.foo"]}
@@ -110,6 +129,12 @@ class FooProjectGenericityTests(unittest.TestCase):
         self.set_budget(required - 1)
         _, over = self.run_pipeline(request, "over-cache")
         self.assertEqual(over["materialized_context"]["status"], "NEEDS_EXPANSION")
+        self.assertFalse(over["trust_state"]["baseline_promoted"])
+        self.assertEqual(over["trust_state"]["promotion_reason"],
+                         "MATERIALIZED_CONTEXT_NOT_READY")
+        trusted, _ = context_harness.load_trusted_baseline(
+            self.root / "over-cache", "foo-project", CAPABILITY)
+        self.assertIsNone(trusted)
         over_value = json.loads(
             (self.root / over["materialized_context"]["materialized_context_path"])
             .read_text(encoding="utf-8"))

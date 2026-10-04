@@ -394,6 +394,48 @@ def _baseline_path(cache_root: str | Path, workspace: str, capability: str) -> P
     return Path(cache_root) / "context-baselines" / f"{safe}.json"
 
 
+def _candidate_path(cache_root: str | Path, workspace: str, capability: str) -> Path:
+    safe = hashlib.sha256(f"{workspace}\0{capability}".encode()).hexdigest()
+    return Path(cache_root) / "context-candidates" / f"{safe}.json"
+
+
+def _atomic_write(path: Path, value: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_suffix(".tmp")
+    temp.write_bytes(_canonical(value))
+    os.replace(temp, path)
+
+
+def _promotion_decision(*, baseline: dict | None, report: dict,
+                        evidence_index: dict | None, job_context: dict | None,
+                        materialized_context: dict | None,
+                        review_package: dict | None,
+                        candidate_already_known: bool = False) -> tuple[bool, str]:
+    """Gate every trusted-baseline write after all fail-closed checks complete."""
+    delta = report.get("delta_status")
+    if report.get("would_block") or delta in ("POTENTIAL_AUTHORITY_CHANGE", "UNVERIFIABLE"):
+        return False, "RECONCILIATION_OR_VERIFICATION_REQUIRED"
+    if not evidence_index or evidence_index.get("status") != "READY":
+        return False, "EVIDENCE_INDEX_NOT_READY"
+    if job_context is not None and job_context.get("status") not in ("READY_BOUNDED", "READY"):
+        return False, "JOB_CONTEXT_NOT_READY"
+    if materialized_context is not None and materialized_context.get("status") not in (
+            "READY_BOUNDED", "READY"):
+        return False, "MATERIALIZED_CONTEXT_NOT_READY"
+    # A first observation has no prior actor-diff snapshots by definition.  Its
+    # context identity may bootstrap only after the context-specific gates above;
+    # review attribution ambiguity is not an ambiguity in that observed identity.
+    if baseline is None and not candidate_already_known and delta == "CONTEXT_UPDATE" and \
+            report.get("reasons") == ["NO_TRUSTED_BASELINE"]:
+        return True, "INITIAL_TRUST_BOOTSTRAP"
+    if review_package is not None and review_package.get("status") not in (
+            "READY_PACKAGE", "REUSED"):
+        return False, "REVIEW_PACKAGE_NOT_READY"
+    if baseline is None:
+        return False, "BOOTSTRAP_NOT_SAFE"
+    return True, "NON_AUTHORITY_CHANGE_ACCEPTED"
+
+
 def load_trusted_baseline(cache_root: str | Path, workspace: str,
                           capability: str) -> tuple[dict | None, list[str]]:
     path = _baseline_path(cache_root, workspace, capability)
@@ -437,6 +479,8 @@ def begin_shadow(root: str | Path, *, workspace: str, actor: str, mode: str,
     session = {"capability": capability, "pre": pre, "baseline": baseline,
                "errors": errors, "cache_root": str(cache_root), "workspace": workspace,
                "evidence_roots": evidence_roots or [], "declaration": declaration}
+    session["candidate_already_known"] = _candidate_path(
+        cache_root, workspace, capability).exists()
     session["job"] = job
     return session
 
@@ -498,11 +542,6 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                 report.get("unverifiable_reasons", []) + errors))
         manifest_path, report_path = write_shadow_evidence(
             root, capability, current, report, job_id=job_id)
-        cache = _baseline_path(session["cache_root"], session["workspace"], capability)
-        cache.parent.mkdir(parents=True, exist_ok=True)
-        temp = cache.with_suffix(".tmp")
-        temp.write_bytes(_canonical(current))
-        os.replace(temp, cache)
         evidence_index = refresh_evidence_index(root, session)
         job_context = None
         materialized_context = None
@@ -618,6 +657,26 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                     "package_reused": True, "package_regenerated": False,
                     "diagnostic_only": False,
                 }
+        promote, promotion_reason = _promotion_decision(
+            baseline=session.get("baseline"), report=report,
+            evidence_index=evidence_index, job_context=job_context,
+            materialized_context=materialized_context, review_package=review_package,
+            candidate_already_known=session.get("candidate_already_known", False))
+        trusted = _baseline_path(session["cache_root"], session["workspace"], capability)
+        candidate = _candidate_path(session["cache_root"], session["workspace"], capability)
+        if promote:
+            _atomic_write(trusted, current)
+        else:
+            _atomic_write(candidate, {
+                "schema_version": 1,
+                "trusted_baseline_sha256": (
+                    (session.get("baseline") or {}).get("lifecycle", {}).get(
+                        "manifest_sha256")),
+                "candidate_manifest_sha256": current["lifecycle"]["manifest_sha256"],
+                "candidate": current,
+                "delta": report,
+                "promotion_blocked_reason": promotion_reason,
+            })
         result = {"mode": "SHADOW", "capability": capability,
                 "snapshot": ("POST_ACTOR_VALIDATION" if artifact_phase ==
                              "post-actor-validation" else "PRE_ACTOR_INPUT"),
@@ -630,6 +689,16 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                 "evidence_index": evidence_index, "job_context": job_context,
                 "materialized_context": materialized_context,
                 "review_package": review_package}
+        result["trust_state"] = {
+            "trusted_baseline_sha256": (
+                current["lifecycle"]["manifest_sha256"] if promote else
+                (session.get("baseline") or {}).get("lifecycle", {}).get(
+                    "manifest_sha256")),
+            "observed_candidate_sha256": current["lifecycle"]["manifest_sha256"],
+            "baseline_promoted": promote,
+            "promotion_reason": promotion_reason,
+            "candidate_path": (None if promote else str(candidate)),
+        }
         if session.get("pre_actor_input") is not None:
             prior = session["pre_actor_input"]
             result["snapshots"] = {

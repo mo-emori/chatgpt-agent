@@ -135,6 +135,80 @@ class ContextHarnessTests(unittest.TestCase):
         self.assertTrue((self.root / result["evidence_index"]["report_path"]).is_file())
         self.assertNotIn("prompt", result["evidence_index"])
 
+    def test_unaccepted_authority_candidate_never_replaces_trusted_baseline(self):
+        cache = self.root / "cache"
+        seed = harness.begin_shadow(self.root, workspace="fixture", actor="codex",
+                                    mode="implementation", cache_root=cache)
+        accepted = harness.finish_shadow(self.root, seed, job_id="BOOTSTRAP")
+        trusted_hash = accepted["manifest_sha256"]
+        self.assertTrue(accepted["trust_state"]["baseline_promoted"])
+        self.assertEqual(accepted["trust_state"]["promotion_reason"],
+                         "INITIAL_TRUST_BOOTSTRAP")
+
+        (self.root / "contract.txt").write_text("unaccepted authority\n", encoding="utf-8")
+        candidate_hash = None
+        for attempt in range(3):
+            session = harness.begin_shadow(
+                self.root, workspace="fixture", actor="codex", mode="implementation",
+                cache_root=cache)
+            result = harness.finish_shadow(self.root, session, job_id=f"BLOCKED-{attempt}")
+            self.assertEqual(result["delta_status"], "POTENTIAL_AUTHORITY_CHANGE")
+            self.assertTrue(result["would_block"])
+            self.assertFalse(result["trust_state"]["baseline_promoted"])
+            self.assertEqual(result["trust_state"]["trusted_baseline_sha256"], trusted_hash)
+            candidate_hash = candidate_hash or result["manifest_sha256"]
+            self.assertEqual(result["manifest_sha256"], candidate_hash)
+            baseline, errors = harness.load_trusted_baseline(cache, "fixture", "CAP")
+            self.assertFalse(errors)
+            self.assertEqual(baseline["lifecycle"]["manifest_sha256"], trusted_hash)
+
+        candidate_path = Path(result["trust_state"]["candidate_path"])
+        candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+        self.assertEqual(candidate["trusted_baseline_sha256"], trusted_hash)
+        self.assertEqual(candidate["candidate_manifest_sha256"], candidate_hash)
+        self.assertEqual(candidate["delta"]["delta_status"],
+                         "POTENTIAL_AUTHORITY_CHANGE")
+
+    def test_unverifiable_run_does_not_initialize_trusted_baseline(self):
+        cache = self.root / "cache"
+        (self.root / "contract.txt").unlink()
+        session = harness.begin_shadow(self.root, workspace="fixture", actor="codex",
+                                       mode="implementation", cache_root=cache)
+        result = harness.finish_shadow(self.root, session, job_id="FAILED-BOOTSTRAP")
+        self.assertEqual(result["delta_status"], "UNVERIFIABLE")
+        self.assertFalse(result["trust_state"]["baseline_promoted"])
+        baseline, _ = harness.load_trusted_baseline(cache, "fixture", "CAP")
+        self.assertIsNone(baseline)
+        (self.root / "contract.txt").write_text("now readable\n", encoding="utf-8")
+        retry = harness.begin_shadow(self.root, workspace="fixture", actor="codex",
+                                     mode="implementation", cache_root=cache)
+        retry_result = harness.finish_shadow(self.root, retry, job_id="RETRY")
+        self.assertFalse(retry_result["trust_state"]["baseline_promoted"])
+        self.assertEqual(retry_result["trust_state"]["promotion_reason"],
+                         "BOOTSTRAP_NOT_SAFE")
+        baseline, _ = harness.load_trusted_baseline(cache, "fixture", "CAP")
+        self.assertIsNone(baseline)
+
+    def test_promotion_gate_rejects_stale_failed_and_ambiguous_outputs(self):
+        ready_index = {"status": "READY"}
+        report = {"delta_status": "CONTEXT_UPDATE", "would_block": False,
+                  "reasons": ["benign"]}
+        cases = (
+            ({"status": "UNVERIFIABLE"}, {"status": "READY_BOUNDED"},
+             {"status": "READY_PACKAGE"}, "JOB_CONTEXT_NOT_READY"),
+            ({"status": "READY_BOUNDED"}, {"status": "STALE"},
+             {"status": "READY_PACKAGE"}, "MATERIALIZED_CONTEXT_NOT_READY"),
+            ({"status": "READY_BOUNDED"}, {"status": "READY_BOUNDED"},
+             {"status": "NEEDS_RECONCILIATION"}, "REVIEW_PACKAGE_NOT_READY"),
+        )
+        for job_context, materialized, review, expected in cases:
+            promoted, reason = harness._promotion_decision(
+                baseline={"lifecycle": {}}, report=report,
+                evidence_index=ready_index, job_context=job_context,
+                materialized_context=materialized, review_package=review)
+            self.assertFalse(promoted)
+            self.assertEqual(reason, expected)
+
 
 if __name__ == "__main__":
     unittest.main()

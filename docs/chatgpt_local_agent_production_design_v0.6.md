@@ -598,6 +598,13 @@ affected itemsを記録する。Delta `UNVERIFIABLE`はselectionも `UNVERIFIABL
 `approved_semantics`を変更しない。LLMは将来reconciliationを分析・提案できるが、通常のaccept/update authorityはChatGPT、
 critical/ambiguous/authority-changing decisionはHumanへescalateする。
 
+Trusted baseline は最後に明示的に信頼された状態、observed state は当該 run が観測した状態である。
+初回の検証可能で fail-closed gate をすべて通過した観測だけを `INITIAL_TRUST_BOOTSTRAP` として決定的に初期化する。
+authority change、stale/ambiguous/unverifiable、budget超過、または downstream build failure の観測は trusted baseline を更新せず、
+別の candidate record に trusted hash、candidate hash、delta、promotion blocked reason を保存する。同じ未受理 candidate の再観測は
+常に元の trusted baseline と比較する。Phase 1 に自動 acceptance mechanism はなく、authority-changing candidate の受理には
+ChatGPT または Human による reconciliation と、その decision を実装する明示的な trust-transition 経路が必要である。
+
 authorityは常時必須と同義ではない。authoritative sourceの `always_required` はbooleanであり、省略時はmigration互換のため
 `true` とする。従って既存declarationは従来どおり全authorityをbase authorityとして含める。選択的authorityはdeclarationが
 `always_required: false` を明示し、exact workspace-relative `target_files` または `context_items` と、必要ならsource refを指す

@@ -167,16 +167,9 @@ def prepare(job, mode: str | None, context: dict | None, root: str | Path, *,
         return base
     reasons, payload = evaluate_gate(context, root)
     if payload is not None:
-        # The terminal harness pass rewrites capability-level projections.  Preserve
-        # the exact actor-input data product beside the job-scoped preflight report.
-        manifest_rel = context.get("manifest_path")
-        if isinstance(manifest_rel, str):
-            snapshot = Path(root).resolve() / Path(manifest_rel).parent / \
-                "materialized-context-pre-actor.json"
-            snapshot.write_bytes(payload)
-            base["preflight"]["materialized_context_path"] = snapshot.relative_to(
-                Path(root).resolve()).as_posix()
-            base["preflight"]["materialized_context_file_sha256"] = _sha(payload)
+        # The PRE_ACTOR materializer owns this immutable path.  Record the exact
+        # file-byte identity in addition to its canonical body identity.
+        base["preflight"]["materialized_context_file_sha256"] = _sha(payload)
         stdin, identity = compose(job, context["materialized_context"]["materialized_context_sha256"], payload)
         base.update({"effective_input_sha256": identity, "effective_input_bytes": len(stdin),
                      "context_payload_bytes": len(payload)})

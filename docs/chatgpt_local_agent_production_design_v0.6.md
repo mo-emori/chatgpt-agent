@@ -1515,6 +1515,22 @@ actor-input hashが分離する。
 
 Actor入力に使った生成物は `PRE_ACTOR_INPUT` snapshotとして固定する。Actor終了後の既存terminal
 scanは `POST_ACTOR_VALIDATION` snapshotとしてsource changeを検出するが、pre-actor effective input
+を再生成・再解釈・置換してはならない。artifact lineageは
+`PRE_ACTOR_INPUT -> actor boundary -> POST_ACTOR_VALIDATION` とする。Harnessが生成するcanonical
+Job Context / Materialized Contextはそれぞれ `job-context-pre-actor.json` /
+`materialized-context-pre-actor.json` と `job-context-post-actor-validation.json` /
+`materialized-context-post-actor-validation.json` に分離し、各reportも同じphase suffixを持つ。
+`artifact_snapshot` とpathを含む `artifact_identity_sha256` がlineage identityであり、payloadの
+canonical body identityが偶然同じ場合でもPRE/POST artifact identityは同一ではない。
+
+Actor開始後、PRE_ACTOR artifact bytes、path、canonical hash、artifact identityはimmutableである。
+Result Manifestの `preflight.job_context_*` と `preflight.materialized_context_*` は常に
+PRE_ACTOR_INPUTだけを指す。POST_ACTOR側を公開する場合は `post_actor_validation` と明記し、
+actor input identityとして扱わない。`actor_input_sha256` / `effective_input_sha256` は実際のstdinと
+preview effective inputの意味を維持し、terminal validationで更新しない。`actor_started=false` の
+`BLOCKED_CONTEXT` はPRE_ACTOR gate evidenceだけを持ち、POST_ACTOR_VALIDATIONを公開しない。
+SHADOWではlegacy stdinを維持したまま、preview用PRE identityとterminal POST lineageを分離する。
+
 identityを遡及変更しない。Result Manifestでは `context_activation_configured_mode` がglobal ceiling、
 `context_activation_mode` がeffective modeを表す。additive fieldsはこれらに加えて
 `context_activation_scope_status` (`ALLOWLISTED`/`NOT_ALLOWLISTED`/`NOT_APPLICABLE`)、

@@ -471,6 +471,9 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                 "report_path": None, "changed_sources": [],
                 "unverifiable_reasons": errors or ["CONTEXT_NOT_OBSERVABLE"]}
     try:
+        artifact_phase = ("post-actor-validation"
+                          if session.get("pre_actor_input") is not None
+                          else "pre-actor")
         pre = session["pre"]
         current = observe(root, capability,
                           previous_context_hash=pre["lifecycle"]["manifest_sha256"])
@@ -516,6 +519,7 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                         manifest=current, manifest_path=manifest_path, delta=report,
                         delta_path=report_path, evidence_index=index_value,
                         evidence_index_path=index_rel, declaration=session["declaration"],
+                        artifact_phase=artifact_phase,
                     )
                 except Exception as exc:
                     # Comparison diagnostics are deliberately outside the job
@@ -541,7 +545,8 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                             workspace=session["workspace"], capability=capability,
                             job_context=job_context_value,
                             job_context_path=job_context["job_context_path"],
-                            evidence_index=index_value, evidence_index_path=index_rel)
+                            evidence_index=index_value, evidence_index_path=index_rel,
+                            artifact_phase=artifact_phase)
                     except Exception as exc:
                         materialized_context = {
                             "mode": "COMPARISON_ONLY", "status": "UNVERIFIABLE",
@@ -587,6 +592,8 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                     "diagnostic_only": False,
                 }
         result = {"mode": "SHADOW", "capability": capability,
+                "snapshot": ("POST_ACTOR_VALIDATION" if artifact_phase ==
+                             "post-actor-validation" else "PRE_ACTOR_INPUT"),
                 "manifest_sha256": current["lifecycle"]["manifest_sha256"],
                 "previous_manifest_sha256": current["lifecycle"]["previous_context_hash"],
                 "delta_status": report["delta_status"],
@@ -609,6 +616,15 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                 "post_actor_validation": {
                     "manifest_sha256": result.get("manifest_sha256"),
                     "delta_status": result.get("delta_status"),
+                    "job_context_sha256": (result.get("job_context") or {}).get("sha256"),
+                    "job_context_path": (result.get("job_context") or {}).get(
+                        "job_context_path"),
+                    "materialized_context_sha256": (
+                        result.get("materialized_context") or {}).get(
+                            "materialized_context_sha256"),
+                    "materialized_context_path": (
+                        result.get("materialized_context") or {}).get(
+                            "materialized_context_path"),
                 },
             }
         return result

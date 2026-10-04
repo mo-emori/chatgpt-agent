@@ -741,6 +741,10 @@ def build_result(
                     "gate_reason_codes", "actor_started"):
             response[key] = context_activation.get(key)
         response["preflight"] = context_activation.get("preflight")
+        snapshots = (context or {}).get("snapshots") if context is not None else None
+        if context_activation.get("actor_started") and snapshots:
+            response["post_actor_validation"] = snapshots.get(
+                "post_actor_validation")
     if artifact_result is not None:
         (
             summary,

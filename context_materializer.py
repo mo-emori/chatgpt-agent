@@ -283,15 +283,28 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
     return result, report
 
 
-def generate(root: str | Path, *, generated_root: str, **kwargs) -> dict:
+def generate(root: str | Path, *, generated_root: str,
+             artifact_phase: str | None = None, **kwargs) -> dict:
+    if artifact_phase not in (None, "pre-actor", "post-actor-validation"):
+        raise ValueError(f"unsupported artifact phase: {artifact_phase}")
     root = Path(root).resolve()
     destination = root / safe_relative(generated_root) / kwargs["capability"]
     destination.mkdir(parents=True, exist_ok=True)
     result, report = build(root, **kwargs)
-    context_path = destination / "materialized-context.json"
-    report_path = destination / "materialized-context-report.json"
+    suffix = f"-{artifact_phase}" if artifact_phase else ""
+    context_path = destination / f"materialized-context{suffix}.json"
+    report_path = destination / f"materialized-context-report{suffix}.json"
     context_path.write_bytes(canonical(result))
     report["materialized_context_path"] = context_path.relative_to(root).as_posix()
     report["report_path"] = report_path.relative_to(root).as_posix()
+    if artifact_phase:
+        report["artifact_snapshot"] = (
+            "PRE_ACTOR_INPUT" if artifact_phase == "pre-actor"
+            else "POST_ACTOR_VALIDATION")
+        report["artifact_identity_sha256"] = sha256(canonical({
+            "snapshot": report["artifact_snapshot"],
+            "path": report["materialized_context_path"],
+            "content_sha256": report["sha256"],
+        }))
     report_path.write_bytes(canonical(report))
     return report

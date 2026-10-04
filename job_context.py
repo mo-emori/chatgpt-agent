@@ -708,7 +708,9 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
     return result, report
 
 
-def generate(root: str | Path, **kwargs) -> dict:
+def generate(root: str | Path, *, artifact_phase: str | None = None, **kwargs) -> dict:
+    if artifact_phase not in (None, "pre-actor", "post-actor-validation"):
+        raise ValueError(f"unsupported artifact phase: {artifact_phase}")
     root = Path(root).resolve()
     declaration = kwargs["declaration"]
     capability = kwargs["capability"]
@@ -716,10 +718,20 @@ def generate(root: str | Path, **kwargs) -> dict:
     destination = root / generated / capability
     destination.mkdir(parents=True, exist_ok=True)
     context, report = build(root, **kwargs)
-    context_path = destination / "job-context.json"
-    report_path = destination / "job-context-report.json"
+    suffix = f"-{artifact_phase}" if artifact_phase else ""
+    context_path = destination / f"job-context{suffix}.json"
+    report_path = destination / f"job-context-report{suffix}.json"
     context_path.write_bytes(canonical(context))
     report["report_path"] = report_path.relative_to(root).as_posix()
     report["job_context_path"] = context_path.relative_to(root).as_posix()
+    if artifact_phase:
+        report["artifact_snapshot"] = (
+            "PRE_ACTOR_INPUT" if artifact_phase == "pre-actor"
+            else "POST_ACTOR_VALIDATION")
+        report["artifact_identity_sha256"] = sha256(canonical({
+            "snapshot": report["artifact_snapshot"],
+            "path": report["job_context_path"],
+            "content_sha256": report["sha256"],
+        }))
     report_path.write_bytes(canonical(report))
     return report

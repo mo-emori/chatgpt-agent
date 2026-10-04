@@ -208,6 +208,7 @@ class ContextActivationTests(unittest.TestCase):
         run_actor.assert_not_called()
         self.assertEqual(publish.call_args.args[2]["status"], "BLOCKED_CONTEXT")
         self.assertFalse(publish.call_args.args[2]["actor_started"])
+        self.assertNotIn("post_actor_validation", publish.call_args.args[2])
         callback.assert_called_once()
 
     def test_worker_nonallowlisted_gate_failure_does_not_block_actor(self):

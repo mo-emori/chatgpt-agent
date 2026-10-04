@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 import agent_worker
 import context_harness
-from context_activation import prepare, resolve_activation_mode
+from context_activation import legacy_input, prepare, resolve_activation_mode
 
 
 FIXTURE = Path(__file__).parent / "fixtures" / "foo-project"
@@ -146,6 +146,58 @@ class FooProjectGenericityTests(unittest.TestCase):
                           configured_mode="ENFORCE_AND_INJECT",
                           scope_status=not_allowed.scope_status)
         self.assertEqual(preview["context_activation_status"], "SHADOW_PREVIEW")
+
+    def test_pre_actor_artifacts_are_immutable_across_repeated_post_validation(self):
+        job = self.job({"context_items": ["output-contract"],
+                        "target_files": ["ports/write.foo"]})
+        cache = self.root / "lineage-cache"
+        # Establish a trusted baseline, then create the actor-boundary snapshot.
+        seed = context_harness.begin_shadow(
+            self.root, workspace=job.workspace, actor=job.actor, mode=job.mode,
+            cache_root=cache, job=job)
+        context_harness.finish_shadow(self.root, seed, job_id=job.job_id)
+        session = context_harness.begin_shadow(
+            self.root, workspace=job.workspace, actor=job.actor, mode=job.mode,
+            cache_root=cache, job=job)
+        pre = context_harness.finish_shadow(self.root, session, job_id=job.job_id)
+        session["pre_actor_input"] = pre
+        shadow = prepare(job, "SHADOW", pre, self.root)
+        activation = prepare(job, "ENFORCE_AND_INJECT", pre, self.root)
+
+        pre_job_path = pre["job_context"]["job_context_path"]
+        pre_materialized_path = pre["materialized_context"]["materialized_context_path"]
+        pre_job_bytes = (self.root / pre_job_path).read_bytes()
+        pre_materialized_bytes = (self.root / pre_materialized_path).read_bytes()
+        preflight = dict(activation["preflight"])
+        actor_hash = activation["actor_input_sha256"]
+
+        post = context_harness.finish_shadow(self.root, session, job_id=job.job_id)
+        post_again = context_harness.finish_shadow(self.root, session, job_id=job.job_id)
+
+        legacy = legacy_input(job)
+        self.assertEqual(shadow["actor_input"], legacy)
+        self.assertEqual(shadow["actor_input_sha256"], hashlib.sha256(legacy).hexdigest())
+        self.assertEqual(post["snapshot"], "POST_ACTOR_VALIDATION")
+        self.assertNotEqual(pre_job_path, post["job_context"]["job_context_path"])
+        self.assertNotEqual(pre_materialized_path,
+                            post["materialized_context"]["materialized_context_path"])
+        self.assertNotEqual(pre["materialized_context"]["artifact_identity_sha256"],
+                            post["materialized_context"]["artifact_identity_sha256"])
+        self.assertEqual((self.root / pre_job_path).read_bytes(), pre_job_bytes)
+        self.assertEqual((self.root / pre_materialized_path).read_bytes(),
+                         pre_materialized_bytes)
+        self.assertEqual(post_again["materialized_context"]["materialized_context_path"],
+                         post["materialized_context"]["materialized_context_path"])
+        self.assertEqual(activation["preflight"], preflight)
+        self.assertEqual(activation["actor_input_sha256"], actor_hash)
+        self.assertEqual(actor_hash, activation["effective_input_sha256"])
+
+        activation["actor_started"] = True
+        response = agent_worker.build_result(
+            job, status="DONE", context=post, context_activation=activation)
+        self.assertEqual(response["preflight"], preflight)
+        self.assertEqual(response["post_actor_validation"]["materialized_context_path"],
+                         post["materialized_context"]["materialized_context_path"])
 
     def test_over_budget_worker_blocks_before_actor_without_external_process(self):
         request = {"context_items": ["analysis-rules"],

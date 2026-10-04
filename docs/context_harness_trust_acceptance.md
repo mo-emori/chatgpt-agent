@@ -1,17 +1,16 @@
-# Context Harness trust acceptance
+# Context Harness の trust acceptance
 
-Context Harness separates observed state, an unaccepted candidate, and the trusted
-baseline. Observation never establishes or advances trust. A trusted baseline is
-usable only when its manifest identity is bound to an intact schema-v2 acceptance
-receipt. Missing baselines produce initialization candidates; existing pre-tool
-baselines are classified as legacy/unproven and are usable only as migration
-comparison material.
+Context Harness は、観測済み状態、未受理 candidate、trusted baseline を分離する。
+観測だけで trust が確立・更新されることはない。trusted baseline を利用できるのは、
+manifest identity が破損していない schema-v2 acceptance receipt に結び付いている場合だけである。
+baseline が存在しない場合は初期化 candidate を生成する。現行ツール導入前の baseline は
+legacy/unproven と分類し、移行時の比較材料としてのみ利用する。
 
-## Normal reconciliation
+## 通常の reconciliation
 
-Run the normal Context Harness job to inspect current sources and produce the
-candidate. Review the generated delta and candidate, then copy the exact
-`candidate_manifest_sha256` from the candidate record. Accept it explicitly:
+通常の Context Harness job を実行して現在の source を観測し、candidate を生成する。
+生成された delta と candidate をレビューし、candidate record の正確な
+`candidate_manifest_sha256` を指定して明示的に受理する。
 
 ```powershell
 python -m context_trust accept `
@@ -25,14 +24,15 @@ python -m context_trust accept `
   --reason "Reviewed reconciliation ticket <ticket-id>"
 ```
 
-For first initialization, omit `--expected-current-trusted-sha256`; the absence of
-a baseline is still compared as part of the operation. The command re-observes the
-declared sources, rejects stale or ambiguous candidates, archives the prior
-baseline, writes an immutable receipt, and atomically replaces the baseline. Its
-single stdout line is deterministic JSON (`ACCEPTED` or `REJECTED`). Re-run the
-normal job afterward; unchanged accepted state reports `NO_IMPACT`.
+初回初期化では `--expected-current-trusted-sha256` を省略する。baseline が存在しないことも
+操作中の比較条件に含まれる。コマンドは宣言済み source を再観測し、古い candidate、曖昧な
+trust domain、CAS 不一致を拒否する。通常受理の receipt には
+`acceptance_type = HUMAN_EXPLICIT` が記録される。従来 baseline を archive し、不変 receipt を
+作成してから baseline を atomic に置換する。標準出力は machine-readable な JSON 1 行
+（`ACCEPTED` または `REJECTED`）である。受理後に通常 job を再実行すると、変更がなければ
+`NO_IMPACT` になる。
 
-State is stored below the configured cache root:
+状態は設定済み cache root の次の場所に保存される。
 
 - `context-candidates/<domain-sha256>.json`
 - `context-baselines/<domain-sha256>.json`
@@ -40,20 +40,72 @@ State is stored below the configured cache root:
 - `context-accepted-candidates/<domain-sha256>/<manifest-sha256>.json`
 - `context-baseline-archive/<domain-sha256>/<previous-manifest-sha256>.json`
 
-Receipt bytes and identity are validated on every baseline load. Deleting a
-baseline, copying a manifest, or modifying a receipt cannot establish trust.
+baseline のロード時には毎回 receipt bytes と identity を検証する。baseline の削除、manifest
+のコピー、receipt の改変によって trust を確立することはできない。
 
-## One-time legacy migration
+## v0.1 の一回限り legacy auto-migration 境界
 
-Do not delete or edit the legacy baseline. Deploy the tooling first, restart the
-worker so loaders fail closed on the unproven baseline, then run one normal Context
-Harness inspection. This creates a `LEGACY_MIGRATION` candidate while preserving
-the legacy manifest as comparison material. Review that candidate and accept it
-with the command above, supplying the legacy manifest hash as
-`--expected-current-trusted-sha256`. Acceptance archives the exact legacy baseline
-before writing the receipt-backed baseline.
+v0.1 以前の legacy trust state については、項目ごとの人手承認を要求しない。その代わり、
+明示的な専用コマンド `legacy-auto-migrate` だけが、通常の Context Harness 観測経路で生成された
+現在有効な candidate を一回限り自動受理できる。worker の起動や job 実行からこの操作が
+自動的に呼ばれることはない。
 
-Finally restart the worker if it is a long-running process that imported the old
-code, run an unchanged internal job, and perform the separately authorized external
-smoke. Migration and external smoke are operational actions; they are not performed
-by installing this implementation.
+legacy baseline を削除・編集してはならない。新しい tooling を配備し、長時間稼働 worker が
+旧コードを import 済みなら停止または再起動して、通常の Context Harness inspection を 1 回
+実行する。これにより legacy manifest を比較材料として保持したまま `LEGACY_MIGRATION`
+candidate が生成される。ライブ移行は、次の別途認可された運用コマンドで実施する。
+
+```powershell
+python -m context_trust legacy-auto-migrate `
+  --root C:\path\to\FooProject `
+  --cache-root C:\path\to\worker-cache `
+  --workspace foo-workspace `
+  --capability FOO-CAPABILITY `
+  --candidate-sha256 <observed-candidate-sha256> `
+  --expected-legacy-trusted-sha256 <legacy-trusted-manifest-sha256> `
+  --operator <operator-id> `
+  --reason "v0.1 legacy trust migration"
+```
+
+専用操作は、次の全条件を満たさない限り拒否する。
+
+- 現在の baseline が hash-valid かつ acceptance provenance のない legacy/unproven 状態である。
+- candidate が同一の workspace/capability について通常観測経路から生成されている。
+- candidate identity が `--candidate-sha256` と完全一致する。
+- 宣言・source を再観測した結果が candidate と完全一致し、candidate が stale でない。
+- legacy baseline identity が `--expected-legacy-trusted-sha256` と完全一致する。
+- trust domain が一意で、candidate envelope の domain と一致する。
+- provenance-valid な新形式 baseline/receipt がまだ存在しない。
+- candidate が reconciliation evidence の適格条件を満たす。
+
+`accept` は `LEGACY_MIGRATION` candidate を受理できず、`legacy-auto-migrate` は通常の
+`RECONCILIATION` candidate を受理できない。このため legacy 操作を一般的な auto-accept の
+抜け道として利用できない。
+
+成功時は legacy baseline を content-addressed な固有パスへ先に archive し、同一内容の既存
+archive だけを再利用する。異なる内容での上書きは拒否する。domain lock、expected legacy CAS、
+exclusive receipt、atomic baseline replacement により、中断後も旧状態または新状態のどちらかが
+有効になり、half-state の baseline は生じない。成功後の再実行は、新形式 baseline が既にある
+ため安全に拒否される。
+
+migration receipt は通常受理と永続的に区別され、少なくとも次を記録する。
+
+- `acceptance_type = LEGACY_AUTO_MIGRATION`
+- trust/migration schema version
+- workspace と capability からなる trust domain
+- 以前の legacy trusted manifest identity と archive path
+- 受理した candidate manifest identity と保存 path
+- declaration identity と各 source identity
+- UTC timestamp
+- system migration actor と initiating operator
+- reason
+- tool version と、取得可能な場合は Git commit
+- historical provenance を項目ごとに再検証していないことを示す明示的な `false` marker
+
+移行後の authority change は従来どおり candidate を生成し、
+`POTENTIAL_AUTHORITY_CHANGE` / `NEEDS_RECONCILIATION` として block する。通常受理には引き続き
+明示的な人手ポリシーが必要であり、legacy migration receipt が後続変更を自動受理することはない。
+
+ライブ移行後、worker が旧コードを import したままなら再起動し、変更のない internal job を
+実行する。その後、別途認可された external smoke を行う。tooling の実装・テスト、ライブ移行、
+external smoke はそれぞれ別の操作であり、この実装変更だけではライブ移行を実行しない。

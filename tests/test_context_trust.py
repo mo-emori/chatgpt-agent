@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import context_harness as harness
 import context_trust
@@ -49,6 +50,17 @@ class ContextTrustAcceptanceTests(unittest.TestCase):
         values.update(overrides)
         return context_trust.accept_candidate(**values)
 
+    def migrate(self, result, legacy_hash, **overrides):
+        values = dict(root=self.root, cache_root=self.cache, workspace="foo-project",
+                      capability="FOO-CAP",
+                      expected_candidate_sha256=result["manifest_sha256"],
+                      expected_legacy_trusted_sha256=legacy_hash,
+                      operator="migration-operator@example.invalid",
+                      reason="v0.1 legacy trust migration",
+                      now=dt.datetime(2026, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc))
+        values.update(overrides)
+        return context_trust.legacy_auto_migrate(**values)
+
     def establish_a(self):
         initial = self.candidate("INIT-A")
         self.assertFalse(initial["trust_state"]["baseline_promoted"])
@@ -67,6 +79,7 @@ class ContextTrustAcceptanceTests(unittest.TestCase):
         archive = self.cache / accepted["archive_path"]
         archived_bytes = archive.read_bytes()
         receipt = json.loads((self.cache / accepted["receipt_path"]).read_text("utf-8"))
+        self.assertEqual(receipt["acceptance_type"], "HUMAN_EXPLICIT")
         self.assertEqual(receipt["operator"], "human@example.invalid")
         self.assertEqual(receipt["reason"], "reviewed Foo authority")
         self.assertEqual(receipt["accepted_at"], "2026-01-02T03:04:05Z")
@@ -113,7 +126,7 @@ class ContextTrustAcceptanceTests(unittest.TestCase):
         self.assertFalse(errors)
         self.assertEqual(first["manifest_sha256"], repeated["manifest_sha256"])
 
-    def test_legacy_baseline_is_unproven_but_can_be_explicitly_migrated(self):
+    def test_legacy_baseline_valid_candidate_auto_migrates_with_distinct_receipt(self):
         legacy = harness.observe(self.root, "FOO-CAP")
         harness._atomic_write(harness._baseline_path(
             self.cache, "foo-project", "FOO-CAP"), legacy)
@@ -124,11 +137,104 @@ class ContextTrustAcceptanceTests(unittest.TestCase):
         migration = self.candidate("MIGRATE")
         self.assertEqual(migration["delta_status"], "POTENTIAL_AUTHORITY_CHANGE")
         self.assertTrue(migration["would_block"])
-        result = self.accept(migration, expected_current_trusted_sha256=
-                             legacy["lifecycle"]["manifest_sha256"],
-                             reason="explicitly migrate reviewed legacy Foo baseline")
+        legacy_hash = legacy["lifecycle"]["manifest_sha256"]
+        with self.assertRaisesRegex(context_trust.AcceptanceError,
+                                    "legacy-auto-migrate"):
+            self.accept(migration, expected_current_trusted_sha256=legacy_hash)
+        result = self.migrate(migration, legacy_hash)
         self.assertEqual(result["status"], "ACCEPTED")
         self.assertIsNotNone(result["archive_path"])
+        archive = self.cache / result["archive_path"]
+        self.assertEqual(archive.read_bytes(), harness._canonical(legacy))
+        receipt = json.loads((self.cache / result["receipt_path"]).read_text("utf-8"))
+        self.assertEqual(receipt["acceptance_type"], "LEGACY_AUTO_MIGRATION")
+        self.assertEqual(receipt["migration"]["schema_version"], 1)
+        self.assertFalse(receipt["migration"][
+            "historical_provenance_individually_revalidated"])
+        self.assertEqual(receipt["migration"]["declaration_sha256"],
+                         legacy["observed"]["declaration"]["raw_sha256"])
+        self.assertTrue(receipt["migration"]["source_identities"])
+
+        with self.assertRaisesRegex(context_trust.AcceptanceError,
+                                    "new-format baseline already exists"):
+            self.migrate(migration, legacy_hash)
+
+        archived_bytes = archive.read_bytes()
+        (self.root / "authority.txt").write_text("POST-MIGRATION\n", encoding="utf-8")
+        blocked = self.candidate("POST-MIGRATION")
+        self.assertEqual(blocked["delta_status"], "POTENTIAL_AUTHORITY_CHANGE")
+        self.assertTrue(blocked["would_block"])
+        self.assertEqual(archive.read_bytes(), archived_bytes)
+
+    def test_legacy_migration_rejects_wrong_hash_stale_cas_domain_and_no_candidate(self):
+        legacy = harness.observe(self.root, "FOO-CAP")
+        legacy_hash = legacy["lifecycle"]["manifest_sha256"]
+        harness._atomic_write(harness._baseline_path(
+            self.cache, "foo-project", "FOO-CAP"), legacy)
+        migration = self.candidate("MIGRATE-REJECTIONS")
+        with self.assertRaisesRegex(context_trust.AcceptanceError, "expected candidate"):
+            self.migrate(migration, legacy_hash, expected_candidate_sha256="0" * 64)
+        with self.assertRaisesRegex(context_trust.AcceptanceError, "expected legacy"):
+            self.migrate(migration, "f" * 64)
+        other_cache = self.root / "other-cache"
+        harness._atomic_write(harness._baseline_path(
+            other_cache, "other-project", "FOO-CAP"), legacy)
+        source_candidate = harness._candidate_path(
+            self.cache, "foo-project", "FOO-CAP")
+        target_candidate = harness._candidate_path(
+            other_cache, "other-project", "FOO-CAP")
+        target_candidate.parent.mkdir(parents=True, exist_ok=True)
+        target_candidate.write_bytes(source_candidate.read_bytes())
+        with self.assertRaisesRegex(context_trust.AcceptanceError, "trust domain mismatch"):
+            self.migrate(migration, legacy_hash, cache_root=other_cache,
+                         workspace="other-project")
+        (self.root / "authority.txt").write_text("STALE\n", encoding="utf-8")
+        with self.assertRaisesRegex(context_trust.AcceptanceError, "stale"):
+            self.migrate(migration, legacy_hash)
+
+        empty_cache = self.root / "empty-cache"
+        harness._atomic_write(harness._baseline_path(
+            empty_cache, "foo-project", "FOO-CAP"), legacy)
+        with self.assertRaisesRegex(context_trust.AcceptanceError, "JSON"):
+            context_trust.legacy_auto_migrate(
+                root=self.root, cache_root=empty_cache, workspace="foo-project",
+                capability="FOO-CAP", expected_candidate_sha256="0" * 64,
+                expected_legacy_trusted_sha256=legacy_hash, operator="operator",
+                reason="v0.1 legacy trust migration")
+
+    def test_new_format_baseline_rejects_legacy_migration(self):
+        initial = self.candidate("NEW-FORMAT")
+        accepted = self.accept(initial)
+        with self.assertRaisesRegex(context_trust.AcceptanceError,
+                                    "new-format baseline already exists"):
+            self.migrate(initial, accepted["trusted_manifest_sha256"])
+
+    def test_interruption_after_receipt_is_recoverable(self):
+        legacy = harness.observe(self.root, "FOO-CAP")
+        legacy_hash = legacy["lifecycle"]["manifest_sha256"]
+        baseline_path = harness._baseline_path(self.cache, "foo-project", "FOO-CAP")
+        harness._atomic_write(baseline_path, legacy)
+        migration = self.candidate("INTERRUPTED")
+        real_atomic_write = harness._atomic_write
+
+        def interrupt_promotion(path, value):
+            if Path(path) == baseline_path:
+                raise OSError("simulated interruption")
+            return real_atomic_write(path, value)
+
+        with patch.object(harness, "_atomic_write", side_effect=interrupt_promotion), \
+             self.assertRaisesRegex(OSError, "simulated interruption"):
+            self.migrate(migration, legacy_hash)
+        self.assertEqual(json.loads(baseline_path.read_text("utf-8"))["lifecycle"].get(
+            "acceptance_provenance"), None)
+
+        recovered = self.migrate(migration, legacy_hash)
+        self.assertEqual(recovered["status"], "ACCEPTED")
+        trusted, errors = harness.load_trusted_baseline(
+            self.cache, "foo-project", "FOO-CAP")
+        self.assertFalse(errors)
+        self.assertEqual(trusted["lifecycle"]["manifest_sha256"],
+                         migration["manifest_sha256"])
 
     def test_receipt_tampering_fails_closed(self):
         _, accepted = self.establish_a()

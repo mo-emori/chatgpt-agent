@@ -479,6 +479,8 @@ def load_trusted_baseline(cache_root: str | Path, workspace: str,
         domain = receipt.get("trust_domain", {})
         accepted = receipt.get("accepted_candidate", {})
         if (receipt.get("schema_version") != TRUST_SCHEMA_VERSION or
+                receipt.get("acceptance_type") not in
+                (None, "HUMAN_EXPLICIT", "LEGACY_AUTO_MIGRATION") or
                 domain != {"workspace": workspace, "capability": capability} or
                 accepted.get("manifest_sha256") != value["lifecycle"]["manifest_sha256"] or
                 accepted.get("declaration_sha256") !=

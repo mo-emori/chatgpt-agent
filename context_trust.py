@@ -13,6 +13,9 @@ import context_harness as harness
 
 
 TOOL_VERSION = "context-trust-1"
+MIGRATION_SCHEMA_VERSION = 1
+HUMAN_ACCEPTANCE = "HUMAN_EXPLICIT"
+LEGACY_AUTO_MIGRATION = "LEGACY_AUTO_MIGRATION"
 
 
 class AcceptanceError(ValueError):
@@ -50,6 +53,19 @@ def _manifest_identity(value: dict) -> str:
     return actual
 
 
+def _tool_commit() -> str | None:
+    try:
+        return harness._git(Path(__file__).resolve().parent, "rev-parse", "HEAD")
+    except Exception:
+        return None
+
+
+def _source_identities(candidate: dict) -> list[dict]:
+    return [{"path": fact.get("path"), "raw_sha256": fact.get("raw_sha256"),
+             "type": fact.get("type"), "exists": fact.get("exists")}
+            for fact in candidate.get("observed", {}).get("sources", [])]
+
+
 def _raw_baseline(path: Path, workspace: str, capability: str) -> tuple[dict | None, str | None]:
     if not path.exists():
         return None, None
@@ -64,7 +80,8 @@ def _accept_candidate_locked(*, root: str | Path, cache_root: str | Path, worksp
                      capability: str, expected_candidate_sha256: str,
                      operator: str, reason: str,
                      expected_current_trusted_sha256: str | None = None,
-                     now: dt.datetime | None = None) -> dict:
+                     now: dt.datetime | None = None,
+                     acceptance_type: str = HUMAN_ACCEPTANCE) -> dict:
     """Accept exactly the persisted candidate after re-observing its sources."""
     if not workspace or not capability or not operator.strip() or not reason.strip():
         raise AcceptanceError("workspace, capability, operator, and reason are required")
@@ -82,6 +99,11 @@ def _accept_candidate_locked(*, root: str | Path, cache_root: str | Path, worksp
     candidate = candidate_record.get("candidate")
     if not isinstance(candidate, dict):
         raise AcceptanceError("candidate evidence missing")
+    candidate_kind = candidate_record.get("candidate_kind")
+    if acceptance_type == HUMAN_ACCEPTANCE and candidate_kind == "LEGACY_MIGRATION":
+        raise AcceptanceError("legacy candidate requires legacy-auto-migrate operation")
+    if acceptance_type == LEGACY_AUTO_MIGRATION and candidate_kind != "LEGACY_MIGRATION":
+        raise AcceptanceError("candidate is not a legacy migration candidate")
     candidate_hash = _manifest_identity(candidate)
     if candidate_hash != expected_candidate_sha256:
         raise AcceptanceError("expected candidate hash mismatch")
@@ -137,6 +159,7 @@ def _accept_candidate_locked(*, root: str | Path, cache_root: str | Path, worksp
 
     receipt = {
         "schema_version": harness.TRUST_SCHEMA_VERSION,
+        "acceptance_type": acceptance_type,
         "trust_domain": {"workspace": workspace, "capability": capability},
         "previous_trusted": {"manifest_sha256": old_hash,
                              "archive_path": archive_rel},
@@ -148,20 +171,37 @@ def _accept_candidate_locked(*, root: str | Path, cache_root: str | Path, worksp
         },
         "operator": operator.strip(), "reason": reason.strip(),
         "accepted_at": timestamp, "tool_version": TOOL_VERSION,
+        "tool_commit": _tool_commit(),
     }
+    if acceptance_type == LEGACY_AUTO_MIGRATION:
+        receipt["migration"] = {
+            "schema_version": MIGRATION_SCHEMA_VERSION,
+            "actor": "system:v0.1-legacy-auto-migration",
+            "initiating_operator": operator.strip(),
+            "historical_provenance_individually_revalidated": False,
+            "declaration_sha256": declaration_hash,
+            "source_identities": _source_identities(candidate),
+        }
     receipt["receipt_identity"] = harness._sha(harness._canonical(receipt))
     receipt_path = harness._receipt_path(cache_root, workspace, capability, candidate_hash)
     if receipt_path.exists():
         existing = _read_json(receipt_path)
-        if (old_hash == candidate_hash and
-                existing.get("accepted_candidate", {}).get("manifest_sha256") == candidate_hash):
-            trusted, errors = harness.load_trusted_baseline(cache_root, workspace, capability)
-            if trusted is not None and not errors:
-                return {"status": "ALREADY_ACCEPTED", "workspace": workspace,
-                        "capability": capability, "trusted_manifest_sha256": candidate_hash,
-                        "receipt_identity": existing.get("receipt_identity")}
-        raise AcceptanceError("acceptance receipt already exists")
-    _write_exclusive(receipt_path, receipt)
+        identity_material = dict(existing)
+        existing_identity = identity_material.pop("receipt_identity", None)
+        recoverable = (
+            existing.get("schema_version") == harness.TRUST_SCHEMA_VERSION and
+            existing.get("acceptance_type") == acceptance_type and
+            existing.get("trust_domain") == {"workspace": workspace,
+                                              "capability": capability} and
+            existing.get("previous_trusted", {}).get("manifest_sha256") == old_hash and
+            existing.get("accepted_candidate", {}).get("manifest_sha256") ==
+            candidate_hash and
+            existing_identity == harness._sha(harness._canonical(identity_material)))
+        if not recoverable:
+            raise AcceptanceError("acceptance receipt already exists")
+        receipt = existing
+    else:
+        _write_exclusive(receipt_path, receipt)
 
     promoted = json.loads(harness._canonical(candidate).decode("utf-8"))
     promoted["lifecycle"]["acceptance_provenance"] = {
@@ -204,7 +244,54 @@ def accept_candidate(*, root: str | Path, cache_root: str | Path, workspace: str
             root=root, cache_root=cache, workspace=workspace, capability=capability,
             expected_candidate_sha256=expected_candidate_sha256, operator=operator,
             reason=reason,
-            expected_current_trusted_sha256=expected_current_trusted_sha256, now=now)
+            expected_current_trusted_sha256=expected_current_trusted_sha256, now=now,
+            acceptance_type=HUMAN_ACCEPTANCE)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def legacy_auto_migrate(*, root: str | Path, cache_root: str | Path, workspace: str,
+                        capability: str, expected_candidate_sha256: str,
+                        expected_legacy_trusted_sha256: str, operator: str,
+                        reason: str, now: dt.datetime | None = None) -> dict:
+    """One-time promotion of a current observation over a hash-valid legacy baseline."""
+    cache = Path(cache_root).resolve()
+    baseline_path = harness._baseline_path(cache, workspace, capability)
+    legacy = harness._load_legacy_baseline(cache, workspace, capability)
+    if legacy is None:
+        trusted, errors = harness.load_trusted_baseline(cache, workspace, capability)
+        if trusted is not None:
+            raise AcceptanceError("provenance-valid new-format baseline already exists")
+        if baseline_path.exists():
+            raise AcceptanceError("existing baseline is not an eligible legacy baseline: " +
+                                  "; ".join(errors))
+        raise AcceptanceError("legacy baseline does not exist")
+    legacy_hash = _manifest_identity(legacy)
+    if expected_legacy_trusted_sha256 != legacy_hash:
+        raise AcceptanceError("expected legacy trusted hash mismatch")
+
+    domain_key = hashlib.sha256(f"{workspace}\0{capability}".encode()).hexdigest()
+    lock_path = cache / "context-trust-locks" / f"{domain_key}.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise AcceptanceError("trust domain acceptance is already in progress") from exc
+    try:
+        os.write(descriptor, str(os.getpid()).encode("ascii"))
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = -1
+        return _accept_candidate_locked(
+            root=root, cache_root=cache, workspace=workspace, capability=capability,
+            expected_candidate_sha256=expected_candidate_sha256, operator=operator,
+            reason=reason, expected_current_trusted_sha256=legacy_hash, now=now,
+            acceptance_type=LEGACY_AUTO_MIGRATION)
     finally:
         if descriptor >= 0:
             os.close(descriptor)
@@ -216,7 +303,7 @@ def accept_candidate(*, root: str | Path, cache_root: str | Path, workspace: str
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("accept", nargs="?")
+    parser.add_argument("operation", choices=("accept", "legacy-auto-migrate"))
     parser.add_argument("--root", required=True)
     parser.add_argument("--cache-root", required=True)
     parser.add_argument("--workspace", required=True)
@@ -225,15 +312,27 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--operator", required=True)
     parser.add_argument("--reason", required=True)
     parser.add_argument("--expected-current-trusted-sha256")
+    parser.add_argument("--expected-legacy-trusted-sha256")
     args = parser.parse_args(argv)
-    if args.accept != "accept":
-        parser.error("the 'accept' operation is required")
     try:
-        result = accept_candidate(
-            root=args.root, cache_root=args.cache_root, workspace=args.workspace,
-            capability=args.capability, expected_candidate_sha256=args.candidate_sha256,
-            operator=args.operator, reason=args.reason,
-            expected_current_trusted_sha256=args.expected_current_trusted_sha256)
+        common = dict(root=args.root, cache_root=args.cache_root, workspace=args.workspace,
+                      capability=args.capability,
+                      expected_candidate_sha256=args.candidate_sha256,
+                      operator=args.operator, reason=args.reason)
+        if args.operation == "legacy-auto-migrate":
+            if not args.expected_legacy_trusted_sha256:
+                raise AcceptanceError(
+                    "--expected-legacy-trusted-sha256 is required for legacy-auto-migrate")
+            if args.expected_current_trusted_sha256:
+                raise AcceptanceError(
+                    "--expected-current-trusted-sha256 is not valid for legacy-auto-migrate")
+            result = legacy_auto_migrate(
+                **common, expected_legacy_trusted_sha256=
+                args.expected_legacy_trusted_sha256)
+        else:
+            result = accept_candidate(
+                **common,
+                expected_current_trusted_sha256=args.expected_current_trusted_sha256)
     except AcceptanceError as exc:
         print(json.dumps({"status": "REJECTED", "error": str(exc)}, sort_keys=True))
         return 2

@@ -63,6 +63,69 @@ class TrustControlProtocolTests(unittest.TestCase):
 
 
 class TrustControlWorkerTests(unittest.TestCase):
+    def assert_callback_marker(self, job, status, expected_marker):
+        with patch.object(agent_worker, "notify_chatgpt", return_value="DONE") as notify:
+            result = agent_worker.send_browser_callback(
+                job, status=status, artifact_status="NOT_APPLICABLE",
+                failure_class=("TRUST_CONTROL_REJECTED"
+                               if status == "REJECTED" else None))
+        self.assertEqual(result["status"], "DONE")
+        message = notify.call_args.kwargs["message"]
+        self.assertTrue(message.startswith(expected_marker + "\n"))
+        self.assertIn(f"control_action: {job.control_action}", message)
+        self.assertIn(f"status: {status}", message)
+        if status == "REJECTED":
+            self.assertIn("failure_class: TRUST_CONTROL_REJECTED", message)
+
+    def test_inspected_callback_is_success_and_preserves_control_status(self):
+        self.assert_callback_marker(
+            parse_job(json.dumps(payload(callback={
+                "type": "chatgpt_browser", "url": "https://chatgpt.com/c/test"}))),
+            "INSPECTED", "LOCAL_AGENT_JOB_COMPLETED")
+
+    def test_accepted_callbacks_are_success(self):
+        for action, trust in (
+            ("TRUST_ACCEPT", {"capability": "FOO-CAP",
+                              "expected_candidate_sha256": "a" * 64,
+                              "operator": "operator", "reason": "reviewed"}),
+            ("TRUST_LEGACY_AUTO_MIGRATE", {"capability": "FOO-CAP",
+                              "expected_candidate_sha256": "a" * 64,
+                              "expected_legacy_trusted_sha256": "b" * 64,
+                              "operator": "operator", "reason": "migration"}),
+        ):
+            with self.subTest(action=action):
+                job = parse_job(json.dumps(payload(
+                    action, trust, callback={"type": "chatgpt_browser",
+                                             "url": "https://chatgpt.com/c/test"})))
+                self.assert_callback_marker(
+                    job, "ACCEPTED", "LOCAL_AGENT_JOB_COMPLETED")
+
+    def test_rejected_control_callback_remains_failure(self):
+        job = parse_job(json.dumps(payload(callback={
+            "type": "chatgpt_browser", "url": "https://chatgpt.com/c/test"})))
+        self.assert_callback_marker(
+            job, "REJECTED", "LOCAL_AGENT_JOB_FAILED")
+
+    def test_control_callback_absent_is_not_an_error(self):
+        job = parse_job(json.dumps(payload()))
+        with patch.object(agent_worker, "notify_chatgpt") as notify:
+            result = agent_worker.send_browser_callback(
+                job, status="INSPECTED", artifact_status="NOT_APPLICABLE")
+        self.assertEqual(result, {"type": None, "status": "NOT_REQUESTED"})
+        notify.assert_not_called()
+
+    def test_normal_actor_non_done_status_remains_failure(self):
+        job = Job(protocol_version="3", job_id="NORMAL-CALLBACK", actor="codex",
+                  mode="implementation", workspace="local-agent",
+                  instruction_ref={"type": "notion_page", "page_id": "page"},
+                  callback_type="chatgpt_browser",
+                  callback_url="https://chatgpt.com/c/test")
+        with patch.object(agent_worker, "notify_chatgpt", return_value="DONE") as notify:
+            agent_worker.send_browser_callback(
+                job, status="ACCEPTED", artifact_status="DONE")
+        self.assertTrue(notify.call_args.kwargs["message"].startswith(
+            "LOCAL_AGENT_JOB_FAILED\n"))
+
     def test_inspect_dispatches_before_context_gate_and_never_starts_actor(self):
         job = parse_job(json.dumps(payload()))
         with tempfile.TemporaryDirectory(dir=".tmp-tests") as temp:

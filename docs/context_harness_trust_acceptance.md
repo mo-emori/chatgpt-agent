@@ -149,5 +149,9 @@ workspace root と cache root は Worker 設定から導出され、path、file 
 operator、reason を必須とし、既存 baseline がある場合は `expected_current_trusted_sha256` による
 CAS を指定できる。成功結果には action、trust domain、candidate/old/new identity、receipt/archive
 path が含まれる。拒否結果には stable な `validation_reason_codes` が含まれ、callback は通常どおり
-試行される。control result は actor input を持たないため `effective_input_sha256` や
+試行される。成功時の control status は `TRUST_INSPECT` では `INSPECTED`、`TRUST_ACCEPT` と
+`TRUST_LEGACY_AUTO_MIGRATE` では `ACCEPTED` のまま manifest と callback payload に保持されるが、
+callback event は通常の成功完了 (`LOCAL_AGENT_JOB_COMPLETED`) として分類される。`REJECTED` / `FAILED`
+は失敗完了であり、failure reason を保持する。callback は optional で、未指定はエラーではない。
+control result は actor input を持たないため `effective_input_sha256` や
 `actor_input_sha256` を掲載しない。導入後は実行中 Worker の再起動が必要である。

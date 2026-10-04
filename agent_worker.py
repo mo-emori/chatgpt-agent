@@ -139,9 +139,20 @@ def send_browser_callback(
                 "UNKNOWN_CALLBACK_TYPE",
         }
 
+    callback_succeeded = (
+        status == "DONE"
+        or (
+            getattr(job, "operation", None) == TRUST_CONTROL_OPERATION
+            and status == {
+                "TRUST_INSPECT": "INSPECTED",
+                "TRUST_ACCEPT": "ACCEPTED",
+                "TRUST_LEGACY_AUTO_MIGRATE": "ACCEPTED",
+            }.get(getattr(job, "control_action", None))
+        )
+    )
     terminal_marker = (
         "LOCAL_AGENT_JOB_COMPLETED"
-        if status == "DONE"
+        if callback_succeeded
         else "LOCAL_AGENT_JOB_FAILED"
     )
     failure_line = (
@@ -151,14 +162,21 @@ def send_browser_callback(
     )
     closure = (
         "Inspect the Slack Result Manifest and continue Job Closure."
-        if status == "DONE"
+        if callback_succeeded
         else "Inspect the Slack Result Manifest and continue Failure Closure."
+    )
+    control_lines = (
+        f"operation: {job.operation}\n"
+        f"control_action: {job.control_action}\n"
+        if getattr(job, "operation", None) == TRUST_CONTROL_OPERATION
+        else ""
     )
     message = (
         f"{terminal_marker}\n\n"
         f"job_id: {job.job_id}\n"
         f"actor: {job.actor}\n"
         f"workspace: {job.workspace}\n"
+        f"{control_lines}"
         f"status: {status}\n"
         f"{failure_line}"
         f"artifact_status: {artifact_status}\n\n"

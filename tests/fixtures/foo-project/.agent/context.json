@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "mode": "SHADOW",
+  "generated_root": "build/context-bundles",
+  "capabilities": {
+    "FOO-ANALYZER": {
+      "label": "Foo analyzer",
+      "selectors": {
+        "actors": ["codex"],
+        "modes": ["analyze"]
+      },
+      "context": {
+        "max_text_bytes": 100000
+      },
+      "sources": [
+        {
+          "path": "reference/source-notes.md",
+          "kind": "reference_notes",
+          "authority": "authoritative",
+          "source_role": "PROVENANCE_SOURCE",
+          "required": true
+        },
+        {
+          "path": "context/analyzer-guide.md",
+          "kind": "analyzer_guide",
+          "authority": "authoritative",
+          "source_role": "STRUCTURED_PROJECTION",
+          "required": true,
+          "always_required": false,
+          "context_items": ["analysis-rules", "input-schema", "output-contract"],
+          "target_files": ["engine/classify.foo", "ports/read.foo", "ports/write.foo"],
+          "projection_provenance": [
+            {
+              "source_ref": "reference/source-notes.md",
+              "expected_sha256": "c196c00f70118ac8be9851b735c8bffb6bd0f1b8cf3f7bf07fd1f0fe40c02183"
+            }
+          ],
+          "section_coverage": "COMPLETE_MAPPED",
+          "sections": [
+            {
+              "section_id": "foo-overview",
+              "boundary": {"kind": "heading", "heading": "Foo Overview", "level": 1},
+              "context_items": ["analysis-rules"],
+              "target_files": ["engine/classify.foo"],
+              "depends_on": []
+            },
+            {
+              "section_id": "foo-inputs",
+              "boundary": {"kind": "heading", "heading": "Foo Inputs", "level": 1},
+              "context_items": ["input-schema"],
+              "target_files": ["ports/read.foo"],
+              "depends_on": []
+            },
+            {
+              "section_id": "foo-output",
+              "boundary": {"kind": "heading", "heading": "Foo Output", "level": 1},
+              "context_items": ["output-contract"],
+              "target_files": ["ports/write.foo"],
+              "depends_on": []
+            }
+          ]
+        }
+      ]
+    }
+  }
+}

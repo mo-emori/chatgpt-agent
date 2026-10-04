@@ -1,0 +1,182 @@
+import base64
+import hashlib
+import json
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
+
+import agent_worker
+import context_harness
+from context_activation import prepare, resolve_activation_mode
+
+
+FIXTURE = Path(__file__).parent / "fixtures" / "foo-project"
+CAPABILITY = "FOO-ANALYZER"
+
+
+class FooProjectGenericityTests(unittest.TestCase):
+    def setUp(self):
+        Path(".tmp-tests").mkdir(exist_ok=True)
+        self.temp = tempfile.TemporaryDirectory(dir=".tmp-tests")
+        self.root = Path(self.temp.name).resolve()
+        shutil.copytree(FIXTURE, self.root, dirs_exist_ok=True)
+        subprocess.run(["git", "init", "-q", str(self.root)], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.email",
+                        "foo@example.invalid"], check=True)
+        subprocess.run(["git", "-C", str(self.root), "config", "user.name",
+                        "Foo Fixture"], check=True)
+        self.commit("fixture", all_files=True)
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def commit(self, message, *, all_files=False):
+        pathspec = "." if all_files else ".agent/context.json"
+        subprocess.run(["git", "-C", str(self.root), "add", pathspec], check=True)
+        subprocess.run(["git", "-C", str(self.root), "commit", "-qm", message], check=True)
+
+    def job(self, request):
+        prompt = "Analyze the supplied Foo record."
+        return SimpleNamespace(
+            protocol_version="3", workspace="foo-project", job_id="FOO-JOB-1",
+            actor="codex", mode="analyze", prompt=prompt,
+            prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest(),
+            instruction_ref={"type": "fixture", "context_request": request},
+            callback_type=None, callback_url=None)
+
+    def run_pipeline(self, request, cache_name="cache"):
+        job = self.job(request)
+        result = None
+        # The first observation establishes the trusted baseline.  The second is
+        # the unchanged PRE_ACTOR snapshot used by enforcement.
+        for _ in range(2):
+            session = context_harness.begin_shadow(
+                self.root, workspace=job.workspace, actor=job.actor, mode=job.mode,
+                cache_root=self.root / cache_name, job=job)
+            self.assertEqual(session["capability"], CAPABILITY)
+            result = context_harness.finish_shadow(self.root, session, job_id=job.job_id)
+        return job, result
+
+    def set_budget(self, budget):
+        path = self.root / ".agent/context.json"
+        declaration = json.loads(path.read_text(encoding="utf-8"))
+        declaration["capabilities"][CAPABILITY]["context"]["max_text_bytes"] = budget
+        path.write_text(json.dumps(declaration, indent=2) + "\n", encoding="utf-8")
+        self.commit(f"budget {budget}")
+
+    def test_declaration_drives_projection_mapping_selection_and_section_slice(self):
+        _, result = self.run_pipeline({
+            "context_items": ["input-schema"], "target_files": ["ports/read.foo"]})
+        self.assertEqual(result["delta_status"], "NO_IMPACT")
+        context = json.loads((self.root / result["job_context"]["job_context_path"])
+                             .read_text(encoding="utf-8"))
+        refs = context["authoritative_source_refs"]
+        self.assertEqual([item["source_ref"] for item in refs],
+                         ["context/analyzer-guide.md"])
+        self.assertEqual(refs[0]["selected_section_ids"], ["foo-inputs"])
+        self.assertEqual([item["source_ref"] for item in context["provenance_source_refs"]],
+                         ["reference/source-notes.md"])
+        materialized = json.loads(
+            (self.root / result["materialized_context"]["materialized_context_path"])
+            .read_text(encoding="utf-8"))
+        self.assertEqual(materialized["materialization_status"], "READY_BOUNDED")
+        self.assertEqual(materialized["raw_provenance_payload_bytes"], 0)
+        items = materialized["materialized_items"]
+        self.assertEqual([item["section_ids"] for item in items], [["foo-inputs"]])
+        payload = base64.b64decode(items[0]["content"])
+        self.assertIn(b"Input records", payload)
+        self.assertNotIn(b"Apply the declared", payload)
+        self.assertNotIn(b"Return a `classification`", payload)
+
+    def test_exact_budget_is_ready_and_one_byte_small_fails_closed(self):
+        request = {"context_items": ["analysis-rules"],
+                   "target_files": ["engine/classify.foo"]}
+        _, baseline = self.run_pipeline(request, "baseline-cache")
+        required = baseline["materialized_context"]["required_payload_bytes"]
+
+        self.set_budget(required)
+        _, exact = self.run_pipeline(request, "exact-cache")
+        self.assertEqual(exact["materialized_context"]["status"], "READY_BOUNDED")
+        exact_value = json.loads(
+            (self.root / exact["materialized_context"]["materialized_context_path"])
+            .read_text(encoding="utf-8"))
+        self.assertEqual(exact_value["measurement"]["required_payload_bytes"], required)
+        self.assertTrue(exact_value["materialized_items"])
+
+        self.set_budget(required - 1)
+        _, over = self.run_pipeline(request, "over-cache")
+        self.assertEqual(over["materialized_context"]["status"], "NEEDS_EXPANSION")
+        over_value = json.loads(
+            (self.root / over["materialized_context"]["materialized_context_path"])
+            .read_text(encoding="utf-8"))
+        self.assertEqual(over_value["materialized_items"], [])
+        self.assertEqual(over_value["measurement"]["required_payload_bytes"], required)
+        self.assertTrue(any(item["reason_code"] == "REQUIRED_CONTEXT_OVER_BUDGET"
+                            for item in over_value["expansion_requirements"]))
+
+    def test_activation_modes_and_pre_actor_effective_input_identity(self):
+        job, context = self.run_pipeline({
+            "context_items": ["output-contract"], "target_files": ["ports/write.foo"]})
+
+        shadow = prepare(job, "SHADOW", context, self.root)
+        self.assertEqual(shadow["context_activation_status"], "SHADOW_PREVIEW")
+        self.assertNotEqual(shadow["actor_input_sha256"], shadow["effective_input_sha256"])
+
+        allowed = resolve_activation_mode(
+            "ENFORCE_AND_INJECT", CAPABILITY, True, frozenset({CAPABILITY}))
+        self.assertEqual((allowed.mode, allowed.scope_status),
+                         ("ENFORCE_AND_INJECT", "ALLOWLISTED"))
+        injected = prepare(job, allowed.mode, context, self.root,
+                           configured_mode="ENFORCE_AND_INJECT",
+                           scope_status=allowed.scope_status)
+        self.assertEqual(injected["context_activation_status"], "INJECTED")
+        self.assertEqual(injected["actor_input_sha256"],
+                         hashlib.sha256(injected["actor_input"]).hexdigest())
+        self.assertEqual(injected["actor_input_sha256"], injected["effective_input_sha256"])
+
+        not_allowed = resolve_activation_mode(
+            "ENFORCE_AND_INJECT", CAPABILITY, True, frozenset({"BAR-CAPABILITY"}))
+        self.assertEqual((not_allowed.mode, not_allowed.scope_status),
+                         ("SHADOW", "NOT_ALLOWLISTED"))
+        preview = prepare(job, not_allowed.mode, context, self.root,
+                          configured_mode="ENFORCE_AND_INJECT",
+                          scope_status=not_allowed.scope_status)
+        self.assertEqual(preview["context_activation_status"], "SHADOW_PREVIEW")
+
+    def test_over_budget_worker_blocks_before_actor_without_external_process(self):
+        request = {"context_items": ["analysis-rules"],
+                   "target_files": ["engine/classify.foo"]}
+        _, baseline = self.run_pipeline(request, "measure-cache")
+        self.set_budget(baseline["materialized_context"]["required_payload_bytes"] - 1)
+        job, blocked = self.run_pipeline(request, "blocked-cache")
+        published = {}
+
+        with patch.object(agent_worker, "CONTEXT_HARNESS_ACTIVATION_MODE",
+                          "ENFORCE_AND_INJECT"), \
+             patch.object(agent_worker, "CONTEXT_HARNESS_ENFORCE_CAPABILITIES",
+                          frozenset({CAPABILITY})), \
+             patch.object(agent_worker, "prepare_execution",
+                          return_value=({}, self.root, self.root, {"head": "h"})), \
+             patch.object(agent_worker, "begin_shadow",
+                          return_value={"capability": CAPABILITY}), \
+             patch.object(agent_worker, "finish_shadow", return_value=blocked), \
+             patch.object(agent_worker, "run_agent") as run_actor, \
+             patch.object(agent_worker.state_store, "mark_completed"), \
+             patch.object(agent_worker, "publish_slack_result",
+                          side_effect=lambda _log, _say, value: published.update(value)), \
+             patch.object(agent_worker, "finalize_browser_callback"), \
+             patch.object(agent_worker, "log_job_end"), \
+             patch.object(agent_worker, "dispatch_next_queued"):
+            agent_worker.execute_job(job, lambda **kwargs: None)
+
+        run_actor.assert_not_called()
+        self.assertEqual(published["status"], "BLOCKED_CONTEXT")
+        self.assertFalse(published["actor_started"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -1523,4 +1523,10 @@ identityを遡及変更しない。Result Manifestでは `context_activation_con
 `effective_input_sha256`、`effective_input_bytes`、`actor_input_sha256`、`context_payload_bytes`、
 `preflight` path/hash、`gate_reason_codes`、`actor_started` である。
 
+generic boundaryは、既存ARGUS declarationに加えて、ARGUSと無関係な
+`tests/fixtures/foo-project` declarationでも検証する。このfixtureは独自のworkspace、
+`FOO-ANALYZER` capability、source/projection paths、context items、target files、section IDsを使い、
+同一のmanifest、projection selection/section slicing、bounded materialization、activation code pathを通す。
+FooProject固有のruntime branchは許容しない。
+
 > セキュリティは個人ローカル運用に見合う単純な境界を維持し、停止・Credentialローテーション・復旧容易性を優先する。

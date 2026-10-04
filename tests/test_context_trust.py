@@ -166,6 +166,39 @@ class ContextTrustAcceptanceTests(unittest.TestCase):
         self.assertTrue(blocked["would_block"])
         self.assertEqual(archive.read_bytes(), archived_bytes)
 
+    def test_legacy_pre_actor_candidate_is_eligible_without_actor_products(self):
+        legacy = harness.observe(self.root, "FOO-CAP")
+        legacy_hash = legacy["lifecycle"]["manifest_sha256"]
+        harness._atomic_write(harness._baseline_path(
+            self.cache, "foo-project", "FOO-CAP"), legacy)
+        migration = self.candidate("PRE-ACTOR-BLOCKED")
+        candidate_path = harness._candidate_path(
+            self.cache, "foo-project", "FOO-CAP")
+        record = json.loads(candidate_path.read_text("utf-8"))
+        record["reconciliation_eligible"] = False
+        record["delta"]["delta_status"] = "POTENTIAL_AUTHORITY_CHANGE"
+        record["delta"]["reasons"] = ["LEGACY_BASELINE_UNPROVEN"]
+        record["delta"]["unverifiable_reasons"] = []
+        harness._atomic_write(candidate_path, record)
+        result = self.migrate(migration, legacy_hash)
+        self.assertEqual(result["status"], "ACCEPTED")
+
+    def test_inspect_is_read_only_and_reports_freshness(self):
+        candidate = self.candidate("INSPECT")
+        baseline_path = harness._baseline_path(
+            self.cache, "foo-project", "FOO-CAP")
+        before = harness._candidate_path(
+            self.cache, "foo-project", "FOO-CAP").read_bytes()
+        result = context_trust.inspect_trust(
+            root=self.root, cache_root=self.cache, workspace="foo-project",
+            capability="FOO-CAP")
+        self.assertEqual(result["candidate_manifest_sha256"],
+                         candidate["manifest_sha256"])
+        self.assertTrue(result["candidate_fresh"])
+        self.assertFalse(baseline_path.exists())
+        self.assertEqual(harness._candidate_path(
+            self.cache, "foo-project", "FOO-CAP").read_bytes(), before)
+
     def test_legacy_migration_rejects_wrong_hash_stale_cas_domain_and_no_candidate(self):
         legacy = harness.observe(self.root, "FOO-CAP")
         legacy_hash = legacy["lifecycle"]["manifest_sha256"]

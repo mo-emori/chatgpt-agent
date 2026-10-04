@@ -22,6 +22,75 @@ class AcceptanceError(ValueError):
     """A deterministic refusal to change trust state."""
 
 
+def inspect_trust(*, root: str | Path, cache_root: str | Path, workspace: str,
+                  capability: str) -> dict:
+    """Inspect one derived trust domain without changing any trust state."""
+    if not workspace or not capability:
+        raise AcceptanceError("workspace and capability are required")
+    root, cache = Path(root).resolve(), Path(cache_root).resolve()
+    candidate_path = harness._candidate_path(cache, workspace, capability)
+    baseline_path = harness._baseline_path(cache, workspace, capability)
+    reasons = []
+    candidate_hash = candidate_kind = None
+    candidate_fresh = False
+    if not candidate_path.is_file():
+        reasons.append("CANDIDATE_MISSING")
+    else:
+        record = _read_json(candidate_path)
+        if record.get("schema_version") != harness.TRUST_SCHEMA_VERSION:
+            reasons.append("CANDIDATE_SCHEMA_UNSUPPORTED")
+        if record.get("trust_domain") != {"workspace": workspace,
+                                           "capability": capability}:
+            reasons.append("CANDIDATE_TRUST_DOMAIN_MISMATCH")
+        candidate = record.get("candidate")
+        candidate_kind = record.get("candidate_kind")
+        if not isinstance(candidate, dict):
+            reasons.append("CANDIDATE_EVIDENCE_MISSING")
+        else:
+            try:
+                candidate_hash = _manifest_identity(candidate)
+                if record.get("candidate_manifest_sha256") != candidate_hash:
+                    reasons.append("CANDIDATE_ENVELOPE_IDENTITY_MISMATCH")
+                declaration_hash = candidate.get("observed", {}).get(
+                    "declaration", {}).get("raw_sha256")
+                if record.get("declaration_sha256") != declaration_hash:
+                    reasons.append("CANDIDATE_DECLARATION_IDENTITY_MISMATCH")
+                current = harness.observe(
+                    root, capability,
+                    previous_context_hash=candidate.get("lifecycle", {}).get(
+                        "previous_context_hash"))
+                candidate_fresh = _manifest_identity(current) == candidate_hash
+                if not candidate_fresh:
+                    reasons.append("CANDIDATE_STALE")
+            except AcceptanceError:
+                reasons.append("CANDIDATE_MANIFEST_INVALID")
+
+    trusted, trusted_errors = harness.load_trusted_baseline(
+        cache, workspace, capability)
+    trusted_hash = (trusted or {}).get("lifecycle", {}).get("manifest_sha256")
+    legacy = None if trusted is not None else harness._load_legacy_baseline(
+        cache, workspace, capability)
+    legacy_hash = (legacy or {}).get("lifecycle", {}).get("manifest_sha256")
+    if baseline_path.exists() and trusted is None and legacy is None:
+        reasons.append("BASELINE_INVALID")
+    return {
+        "status": "INSPECTED",
+        "workspace": workspace,
+        "capability": capability,
+        "candidate_manifest_sha256": candidate_hash,
+        "candidate_kind": candidate_kind,
+        "candidate_fresh": candidate_fresh,
+        "trusted_manifest_sha256": trusted_hash,
+        "legacy_trusted_manifest_sha256": legacy_hash,
+        "baseline_format": ("PROVENANCE_VALID" if trusted is not None else
+                            "LEGACY" if legacy is not None else
+                            "INVALID" if baseline_path.exists() else "ABSENT"),
+        "validation_reason_codes": sorted(set(reasons + [
+            "BASELINE_UNTRUSTED" for _ in trusted_errors
+        ])),
+    }
+
+
 def _read_json(path: Path) -> dict:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -110,14 +179,29 @@ def _accept_candidate_locked(*, root: str | Path, cache_root: str | Path, worksp
     if candidate_record.get("candidate_manifest_sha256") != candidate_hash:
         raise AcceptanceError("candidate envelope identity mismatch")
     delta = candidate_record.get("delta", {})
-    if candidate_record.get("reconciliation_eligible") is not True:
-        raise AcceptanceError("candidate lacks completed reconciliation evidence")
     eligible = delta.get("delta_status") in ("CONTEXT_UPDATE", "POTENTIAL_AUTHORITY_CHANGE")
     if candidate_record.get("candidate_kind") == "LEGACY_MIGRATION" and \
             delta.get("delta_status") == "NO_IMPACT":
         eligible = True
     if not eligible:
         raise AcceptanceError("candidate is not eligible for reconciliation")
+    completed_evidence = candidate_record.get("reconciliation_eligible") is True
+    # A legacy baseline itself makes PRE_ACTOR block before actor-owned context
+    # products can exist.  For this one migration action, the persisted scan is
+    # complete evidence when its sole authority reason is the unproven legacy
+    # baseline and every relevant source was reverified.  All identity,
+    # freshness, declaration/source, domain and CAS checks below still apply.
+    legacy_pre_actor_evidence = (
+        acceptance_type == LEGACY_AUTO_MIGRATION and
+        candidate_kind == "LEGACY_MIGRATION" and
+        delta.get("delta_status") == "POTENTIAL_AUTHORITY_CHANGE" and
+        set(delta.get("reasons", [])) == {"LEGACY_BASELINE_UNPROVEN"} and
+        not delta.get("unverifiable_reasons") and
+        candidate.get("observed", {}).get("scan_identity", {}).get(
+            "relevant_sources_reverified") is True
+    )
+    if not (completed_evidence or legacy_pre_actor_evidence):
+        raise AcceptanceError("candidate lacks completed reconciliation evidence")
     declaration_hash = candidate.get("observed", {}).get("declaration", {}).get("raw_sha256")
     if candidate_record.get("declaration_sha256") != declaration_hash:
         raise AcceptanceError("candidate declaration identity mismatch")

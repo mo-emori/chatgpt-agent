@@ -109,3 +109,45 @@ migration receipt は通常受理と永続的に区別され、少なくとも�
 ライブ移行後、worker が旧コードを import したままなら再起動し、変更のない internal job を
 実行する。その後、別途認可された external smoke を行う。tooling の実装・テスト、ライブ移行、
 external smoke はそれぞれ別の操作であり、この実装変更だけではライブ移行を実行しない。
+
+## Worker control plane（protocol v3）
+
+Slack から trust を検査・受理・legacy migration する場合は、通常の actor job ではなく
+`operation: "TRUST_CONTROL"` を使う。許可される `control_action` は
+`TRUST_INSPECT`、`TRUST_ACCEPT`、`TRUST_LEGACY_AUTO_MIGRATE` の閉じた集合だけである。
+control request は `actor`、`mode`、`instruction_ref`、prompt、review metadata を持てず、
+通常 job は control field を持てない。actor 実行への暗黙 fallback や PRE_ACTOR skip flag はない。
+
+trust transition は actor に渡す data-plane context の準備ではなく、Worker 自身の control-plane
+状態遷移である。Worker はこの操作を Context Harness PRE_ACTOR/ENFORCE より前に dispatch し、
+常に `actor_started=false`、`actor=null`、`effective_model=null` として結果を返す。これは検証の
+bypass ではない。mutation は従来と同じ `context_trust` 実装を呼び、workspace/capability domain、
+candidate identity、現 trusted baseline の CAS、現 source の再観測による freshness、declaration/source、
+receipt/provenance、operator、reason、および legacy eligibility をすべて検証する。
+
+リクエストが指定できるのは capability と action ごとの hash/operator/reason だけである。
+workspace root と cache root は Worker 設定から導出され、path、file content、任意 payload は拒否される。
+
+```json
+{
+  "protocol_version": "3",
+  "job_id": "TRUST-LEGACY-MIGRATE-20261004-001",
+  "workspace": "foo-workspace",
+  "operation": "TRUST_CONTROL",
+  "control_action": "TRUST_LEGACY_AUTO_MIGRATE",
+  "trust": {
+    "capability": "FOO-CAPABILITY",
+    "expected_candidate_sha256": "<candidate-sha256>",
+    "expected_legacy_trusted_sha256": "<legacy-baseline-sha256>",
+    "operator": "<operator-id>",
+    "reason": "v0.1 legacy trust migration"
+  }
+}
+```
+
+`TRUST_INSPECT` の `trust` は `capability` だけを持つ。`TRUST_ACCEPT` は candidate hash、
+operator、reason を必須とし、既存 baseline がある場合は `expected_current_trusted_sha256` による
+CAS を指定できる。成功結果には action、trust domain、candidate/old/new identity、receipt/archive
+path が含まれる。拒否結果には stable な `validation_reason_codes` が含まれ、callback は通常どおり
+試行される。control result は actor input を持たないため `effective_input_sha256` や
+`actor_input_sha256` を掲載しない。導入後は実行中 Worker の再起動が必要である。

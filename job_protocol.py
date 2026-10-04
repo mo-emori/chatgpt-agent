@@ -20,6 +20,13 @@ SUPPORTED_PROTOCOL_VERSIONS = {
     "3",
 }
 
+TRUST_CONTROL_OPERATION = "TRUST_CONTROL"
+TRUST_CONTROL_ACTIONS = frozenset({
+    "TRUST_INSPECT",
+    "TRUST_ACCEPT",
+    "TRUST_LEGACY_AUTO_MIGRATE",
+})
+
 
 class JobValidationError(ValueError):
     def __init__(self, message, *, callback_job=None):
@@ -55,8 +62,8 @@ def validated_callback(data):
 class Job:
     protocol_version: str
     job_id: str
-    actor: str
-    mode: str
+    actor: str | None
+    mode: str | None
     workspace: str
     prompt: str | None = None
     prompt_sha256: str | None = None
@@ -66,6 +73,9 @@ class Job:
     measurement_mode: bool = False
     callback_type: str | None = None
     callback_url: str | None = None
+    operation: str | None = None
+    control_action: str | None = None
+    trust_request: dict | None = None
 
 
 def decode_and_verify_prompt(data, *, require_prompt_sha256):
@@ -217,13 +227,10 @@ def parse_job(text: str) -> Job:
             "JOB must be a JSON object"
         )
 
-    base_required = (
-        "protocol_version",
-        "job_id",
-        "actor",
-        "mode",
-        "workspace",
-    )
+    is_control = data.get("operation") == TRUST_CONTROL_OPERATION
+    base_required = ("protocol_version", "job_id", "workspace")
+    if not is_control:
+        base_required += ("actor", "mode")
 
     missing = [
         key
@@ -244,7 +251,7 @@ def parse_job(text: str) -> Job:
         raise JobValidationError("UNKNOWN_PROTOCOL_VERSION")
     if not isinstance(data["job_id"], str) or not data["job_id"].strip():
         raise JobValidationError("job_id must be non-empty")
-    for key in ("actor", "mode", "workspace"):
+    for key in (("workspace",) if is_control else ("actor", "mode", "workspace")):
         if not isinstance(data[key], str) or not data[key].strip():
             raise JobValidationError(f"{key} must be non-empty")
 
@@ -254,8 +261,8 @@ def parse_job(text: str) -> Job:
     callback_job = Job(
         protocol_version=protocol_version,
         job_id=data["job_id"],
-        actor=data["actor"],
-        mode=data["mode"],
+        actor=data.get("actor"),
+        mode=data.get("mode"),
         workspace=data["workspace"],
         callback_type=callback_type,
         callback_url=callback_url,
@@ -266,6 +273,57 @@ def parse_job(text: str) -> Job:
 
     if protocol_version not in SUPPORTED_PROTOCOL_VERSIONS:
         reject("UNKNOWN_PROTOCOL_VERSION")
+
+    if is_control:
+        if protocol_version != "3":
+            reject("CONTROL_OPERATION_REQUIRES_PROTOCOL_V3")
+        if data["workspace"] not in WORKSPACES:
+            reject(f"Unknown workspace: {data['workspace']}")
+        forbidden = {"actor", "mode", "instruction_ref", "prompt", "prompt_encoding",
+                     "prompt_sha256", "review_mode", "review_package_ref",
+                     "measurement_mode"}.intersection(data)
+        if forbidden:
+            reject("CONTROL_ACTOR_FIELDS_NOT_ALLOWED")
+        allowed_top = {"protocol_version", "job_id", "workspace", "operation",
+                       "control_action", "trust", "callback"}
+        if set(data) - allowed_top:
+            reject("CONTROL_REQUEST_UNKNOWN_FIELD")
+        action = data.get("control_action")
+        if action not in TRUST_CONTROL_ACTIONS:
+            reject("UNKNOWN_CONTROL_ACTION")
+        trust = data.get("trust")
+        if not isinstance(trust, dict):
+            reject("TRUST_REQUEST_INVALID")
+        allowed = {"capability", "expected_candidate_sha256",
+                   "expected_current_trusted_sha256", "expected_legacy_trusted_sha256",
+                   "operator", "reason"}
+        if set(trust) - allowed:
+            reject("TRUST_REQUEST_UNKNOWN_FIELD")
+        required = {"capability"}
+        if action == "TRUST_ACCEPT":
+            required |= {"expected_candidate_sha256", "operator", "reason"}
+        elif action == "TRUST_LEGACY_AUTO_MIGRATE":
+            required |= {"expected_candidate_sha256", "expected_legacy_trusted_sha256",
+                         "operator", "reason"}
+        if any(not isinstance(trust.get(key), str) or not trust[key].strip()
+               for key in required):
+            reject("TRUST_REQUEST_REQUIRED_FIELD_MISSING")
+        for key in ("expected_candidate_sha256", "expected_current_trusted_sha256",
+                    "expected_legacy_trusted_sha256"):
+            if key in trust and not SHA256_RE.fullmatch(str(trust[key])):
+                reject("TRUST_REQUEST_INVALID_SHA256")
+        extra_for_inspect = set(trust) - {"capability"}
+        if action == "TRUST_INSPECT" and extra_for_inspect:
+            reject("TRUST_INSPECT_MUTATION_FIELDS_NOT_ALLOWED")
+        return Job(
+            protocol_version=protocol_version, job_id=data["job_id"], actor=None, mode=None,
+            workspace=data["workspace"], callback_type=callback_type,
+            callback_url=callback_url, operation=TRUST_CONTROL_OPERATION,
+            control_action=action, trust_request=dict(trust),
+        )
+
+    if "operation" in data or "control_action" in data or "trust" in data:
+        reject("CONTROL_FIELDS_NOT_ALLOWED")
 
     if protocol_version in {"1", "2"} and "prompt" not in data:
         reject("Missing fields: prompt")
@@ -519,6 +577,9 @@ def parse_job(text: str) -> Job:
         measurement_mode=measurement_mode,
         callback_type=callback_type,
         callback_url=callback_url,
+        operation=None,
+        control_action=None,
+        trust_request=None,
     )
 
 
@@ -526,8 +587,8 @@ def job_from_row(row):
     return Job(
         protocol_version=row["protocol_version"],
         job_id=row["job_id"],
-        actor=row["actor"],
-        mode=row["mode"],
+        actor=row["actor"] or None,
+        mode=row["mode"] or None,
         workspace=row["workspace"],
         prompt=row["prompt"],
         prompt_sha256=row["prompt_sha256"],
@@ -543,5 +604,9 @@ def job_from_row(row):
                           if "measurement_mode" in row.keys() else False),
         callback_type=row["callback_type"],
         callback_url=row["callback_url"],
+        operation=(row["operation"] if "operation" in row.keys() else None),
+        control_action=(row["control_action"] if "control_action" in row.keys() else None),
+        trust_request=(json.loads(row["trust_request"])
+                       if "trust_request" in row.keys() and row["trust_request"] else None),
     )
 

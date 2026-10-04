@@ -75,6 +75,8 @@ from single_instance import SingleInstanceAlreadyRunning, WorkerInstanceGuard
 from context_harness import begin_shadow, finish_shadow, refresh_evidence_index
 from context_activation import (has_context_request, prepare as prepare_context_activation,
                                 resolve_activation_mode)
+import context_trust
+from job_protocol import TRUST_CONTROL_OPERATION
 
 logger = logging.getLogger(__name__)
 _execution_context = threading.local()
@@ -285,7 +287,8 @@ def process_message(
         )
         return
 
-    if job.protocol_version == "3":
+    if (job.protocol_version == "3" and
+            getattr(job, "operation", None) != TRUST_CONTROL_OPERATION):
         try:
             job = resolve_v3_instruction(
                 job
@@ -472,6 +475,13 @@ def validate_recoverable_queued_job(job):
     if job.protocol_version != "3":
         return
 
+    if getattr(job, "operation", None) == TRUST_CONTROL_OPERATION:
+        if job.actor is not None or job.mode is not None or job.instruction_ref is not None:
+            raise ValueError("persisted control operation contains actor fields")
+        if job.control_action not in context_trust_control_actions():
+            raise ValueError("persisted control action is invalid")
+        return
+
     if not isinstance(job.prompt, str) or not job.prompt:
         raise ValueError("persisted v3 prompt snapshot is missing")
 
@@ -496,6 +506,119 @@ def validate_recoverable_queued_job(job):
         or not ref["page_id"].strip()
     ):
         raise ValueError("persisted v3 instruction_ref is missing or invalid")
+
+
+def context_trust_control_actions():
+    return {"TRUST_INSPECT", "TRUST_ACCEPT", "TRUST_LEGACY_AUTO_MIGRATE"}
+
+
+def trust_failure_code(message):
+    value = message.lower()
+    for needle, code in (
+        ("candidate hash", "CANDIDATE_HASH_MISMATCH"),
+        ("current trusted hash", "TRUSTED_BASELINE_CAS_MISMATCH"),
+        ("legacy trusted hash", "LEGACY_BASELINE_CAS_MISMATCH"),
+        ("trust domain", "TRUST_DOMAIN_MISMATCH"),
+        ("stale", "CANDIDATE_STALE"),
+        ("new-format baseline", "LEGACY_MIGRATION_NOT_ELIGIBLE"),
+        ("not a legacy", "LEGACY_MIGRATION_NOT_ELIGIBLE"),
+        ("reconciliation evidence", "RECONCILIATION_EVIDENCE_INCOMPLETE"),
+        ("receipt", "RECEIPT_VALIDATION_FAILED"),
+    ):
+        if needle in value:
+            return code
+    return "TRUST_VALIDATION_FAILED"
+
+
+def execute_trust_control(job, say):
+    """Execute the closed trust control plane before any actor/context activation."""
+    log_dir = create_job_log(job.job_id)
+    request = job.trust_request or {}
+    workspace = WORKSPACES[job.workspace]
+    common = {
+        "root": workspace["path"],
+        "cache_root": Path(__file__).parent / "logs",
+        "workspace": job.workspace,
+        "capability": request["capability"],
+    }
+    save_json(log_dir, "request.json", {
+        "protocol_version": job.protocol_version, "job_id": job.job_id,
+        "workspace": job.workspace, "operation": job.operation,
+        "control_action": job.control_action, "trust": request,
+        "callback": {"type": job.callback_type, "url": job.callback_url},
+    })
+    status = "FAILED"
+    failure_class = None
+    try:
+        if job.control_action == "TRUST_INSPECT":
+            outcome = context_trust.inspect_trust(**common)
+        elif job.control_action == "TRUST_ACCEPT":
+            outcome = context_trust.accept_candidate(
+                **common,
+                expected_candidate_sha256=request["expected_candidate_sha256"],
+                expected_current_trusted_sha256=request.get(
+                    "expected_current_trusted_sha256"),
+                operator=request["operator"], reason=request["reason"])
+        elif job.control_action == "TRUST_LEGACY_AUTO_MIGRATE":
+            outcome = context_trust.legacy_auto_migrate(
+                **common,
+                expected_candidate_sha256=request["expected_candidate_sha256"],
+                expected_legacy_trusted_sha256=request[
+                    "expected_legacy_trusted_sha256"],
+                operator=request["operator"], reason=request["reason"])
+        else:
+            raise context_trust.AcceptanceError("unknown control action")
+        status = "DONE"
+        response = {
+            "protocol_version": job.protocol_version, "job_id": job.job_id,
+            "workspace": job.workspace, "operation": job.operation,
+            "control_action": job.control_action, "status": status,
+            "actor_started": False, "actor": None, "effective_model": None,
+            "trust_domain": {"workspace": job.workspace,
+                             "capability": request["capability"]},
+            **outcome,
+        }
+        if request.get("expected_candidate_sha256") is not None:
+            response.setdefault("candidate_manifest_sha256",
+                                request["expected_candidate_sha256"])
+        if outcome.get("previous_trusted_manifest_sha256") is not None:
+            response.setdefault("old_trusted_manifest_sha256",
+                                outcome["previous_trusted_manifest_sha256"])
+        if outcome.get("trusted_manifest_sha256") is not None:
+            response.setdefault("new_trusted_manifest_sha256",
+                                outcome["trusted_manifest_sha256"])
+    except context_trust.AcceptanceError as exc:
+        failure_class = "TRUST_CONTROL_REJECTED"
+        response = {
+            "protocol_version": job.protocol_version, "job_id": job.job_id,
+            "workspace": job.workspace, "operation": job.operation,
+            "control_action": job.control_action, "status": "REJECTED",
+            "failure_class": failure_class,
+            "validation_reason_codes": [trust_failure_code(str(exc))],
+            "error_summary": str(exc), "actor_started": False, "actor": None,
+            "effective_model": None,
+            "trust_domain": {"workspace": job.workspace,
+                             "capability": request.get("capability")},
+        }
+    except Exception as exc:
+        failure_class = "TRUST_CONTROL_ERROR"
+        response = {
+            "protocol_version": job.protocol_version, "job_id": job.job_id,
+            "workspace": job.workspace, "operation": job.operation,
+            "control_action": job.control_action, "status": "FAILED",
+            "failure_class": failure_class,
+            "validation_reason_codes": ["TRUST_CONTROL_INTERNAL_ERROR"],
+            "error_summary": str(exc)[:4000], "actor_started": False,
+            "actor": None, "effective_model": None,
+            "trust_domain": {"workspace": job.workspace,
+                             "capability": request.get("capability")},
+        }
+    state_store.mark_completed(job.job_id, status=status,
+                               failure_class=failure_class)
+    publish_slack_result(log_dir, say, response)
+    finalize_browser_callback(job, log_dir, response, status=response["status"],
+                              artifact_status="NOT_APPLICABLE",
+                              failure_class=failure_class)
 
 
 def recover_queued_jobs(say):
@@ -877,6 +1000,8 @@ def log_job_end(job, status, exit_code):
 
 
 def execute_job(job, say):
+    if getattr(job, "operation", None) == TRUST_CONTROL_OPERATION:
+        return execute_trust_control(job, say)
     if isinstance(job, Job) and job.actor == "claude" and job.mode == "review":
         return execute_claude_review(job, say)
     status = "RUNNING"

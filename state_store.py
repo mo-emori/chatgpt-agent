@@ -18,6 +18,9 @@ CREATE TABLE IF NOT EXISTS jobs (
     review_mode TEXT,
     review_package_ref TEXT,
     measurement_mode INTEGER NOT NULL DEFAULT 0,
+    operation TEXT,
+    control_action TEXT,
+    trust_request TEXT,
     callback_type TEXT,
     callback_url TEXT,
     status TEXT NOT NULL,
@@ -102,6 +105,12 @@ def initialize():
             db.execute("ALTER TABLE jobs ADD COLUMN review_package_ref TEXT")
         if "measurement_mode" not in columns:
             db.execute("ALTER TABLE jobs ADD COLUMN measurement_mode INTEGER NOT NULL DEFAULT 0")
+        if "operation" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN operation TEXT")
+        if "control_action" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN control_action TEXT")
+        if "trust_request" not in columns:
+            db.execute("ALTER TABLE jobs ADD COLUMN trust_request TEXT")
 
 
 def create_job(job):
@@ -120,20 +129,23 @@ def create_job(job):
                 review_mode,
                 review_package_ref,
                 measurement_mode,
+                operation,
+                control_action,
+                trust_request,
                 callback_type,
                 callback_url,
                 status,
                 received_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVED', ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'RECEIVED', ?)
             """,
             (
                 job.job_id,
                 job.protocol_version,
-                job.actor,
-                job.mode,
+                job.actor or "",
+                job.mode or "",
                 job.workspace,
-                job.prompt,
+                job.prompt or "",
                 job.prompt_sha256,
                 (
                     json.dumps(
@@ -147,6 +159,9 @@ def create_job(job):
                 job.review_mode,
                 json.dumps(job.review_package_ref, ensure_ascii=False) if job.review_package_ref else None,
                 int(job.measurement_mode),
+                job.operation,
+                job.control_action,
+                json.dumps(job.trust_request, ensure_ascii=False) if job.trust_request else None,
                 job.callback_type,
                 job.callback_url,
                 now_iso(),

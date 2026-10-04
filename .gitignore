@@ -21,3 +21,12 @@ sandbox/
 
 # Agent browser runtime profile
 browser-profile/
+
+# Context Harness reproducible capability-level latest/temporary artifacts.
+# Job-scoped audit evidence below these roots remains intentionally trackable.
+**/validation/context/*/evidence-index.json
+**/validation/context/*/evidence-index-report.json
+**/validation/context/*/job-context*.json
+**/validation/context/*/materialized-context*.json
+**/validation/context/*/*.tmp
+**/validation/context/*/*.temp

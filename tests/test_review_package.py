@@ -11,6 +11,7 @@ import evidence_index
 import job_context
 import review_package
 import review_invocation
+from attribution_policy import attribution_paths
 from job_log import get_attributable_changed_paths, get_git_snapshot
 
 
@@ -114,6 +115,47 @@ class ReviewPackageTests(unittest.TestCase):
         self.assertEqual(report["attribution_status"], "ATTRIBUTION_UNCERTAIN")
         self.assertEqual(report["status"], "NEEDS_RECONCILIATION")
         self.assertEqual(payload["diff.patch"], b"")
+
+    def test_generated_infrastructure_alone_is_exact_and_ready(self):
+        generated = "validation/context/CAP/JOB/post-actor/diagnostic.json"
+        paths = attribution_paths(
+            [generated], generated_roots=["validation/context/CAP"],
+            protected_paths=["implementation.py", "authority.md"])
+        payload, report = self.build(changed_paths=paths)
+        self.assertEqual(paths, [])
+        self.assertEqual(report["attribution_status"], "EXACT")
+        self.assertEqual(report["status"], "READY_PACKAGE")
+        reasons = [item["reason"] for item in
+                   json.loads(payload["expansion-plan.json"])["requirements"]]
+        self.assertNotIn("TARGET_PATH_DIRTY_BEFORE_JOB", reasons)
+
+    def test_generated_plus_preexisting_dirty_target_still_reconciles(self):
+        (self.root / "implementation.py").write_text("VALUE = dirty\n", encoding="utf-8")
+        before = get_git_snapshot(self.root)
+        (self.root / "implementation.py").write_text("VALUE = changed again\n", encoding="utf-8")
+        after = get_git_snapshot(self.root)
+        paths = attribution_paths([
+            "validation/context/CAP/JOB/post-actor/diagnostic.json",
+            "implementation.py",
+        ], generated_roots=["validation/context/CAP"],
+            protected_paths=["implementation.py", "authority.md"])
+        payload, report = self.build(before=before, after=after, changed_paths=paths)
+        self.assertEqual(report["attribution_status"], "ATTRIBUTION_UNCERTAIN")
+        self.assertEqual(report["status"], "NEEDS_RECONCILIATION")
+        reasons = [item["reason"] for item in
+                   json.loads(payload["expansion-plan.json"])["requirements"]]
+        self.assertIn("TARGET_PATH_DIRTY_BEFORE_JOB", reasons)
+
+    def test_preexisting_dirty_authority_remains_detected(self):
+        (self.root / "authority.md").write_text("dirty authority\n", encoding="utf-8")
+        before = get_git_snapshot(self.root)
+        (self.root / "authority.md").write_text("changed authority again\n", encoding="utf-8")
+        after = get_git_snapshot(self.root)
+        paths = attribution_paths(
+            ["authority.md"], generated_roots=["validation/context/CAP"],
+            protected_paths=["implementation.py", "authority.md"])
+        with self.assertRaisesRegex(ValueError, "selected authority ref changed"):
+            self.build(before=before, after=after, changed_paths=paths)
 
     def test_structured_six_findings_and_429_is_not_a_verdict(self):
         payload, report = self.build()

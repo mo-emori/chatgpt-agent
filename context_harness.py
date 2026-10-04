@@ -11,6 +11,8 @@ import os
 import subprocess
 from pathlib import Path, PurePosixPath
 
+from attribution_policy import attribution_paths
+
 from evidence_index import generate as generate_evidence_index
 from job_context import generate as generate_job_context
 from context_materializer import generate as generate_materialized_context
@@ -463,6 +465,8 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
     if session is None:
         return None
     capability = session.get("capability")
+    declaration = session.get("declaration") or {}
+    config = declaration.get("capabilities", {}).get(capability, {})
     errors = list(session.get("errors", []))
     if capability is None or session.get("pre") is None:
         return {"mode": "SHADOW", "capability": capability,
@@ -559,6 +563,29 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                                              "detail": str(exc)[:1000]}],
                         }
                     try:
+                        request = (getattr(job, "instruction_ref", None) or {}).get(
+                            "context_request", {})
+                        requested_targets = (request.get("target_files", [])
+                                             if isinstance(request, dict) else [])
+                        targets = list(requested_targets) if isinstance(
+                            requested_targets, list) else []
+                        sources = []
+                        for spec in config.get("sources", []):
+                            if isinstance(spec, dict):
+                                sources.extend(spec.get(key) for key in ("path", "glob")
+                                               if isinstance(spec.get(key), str))
+                                targets.extend(path for path in spec.get("target_files", [])
+                                               if isinstance(path, str))
+                                for section in spec.get("sections", []):
+                                    if isinstance(section, dict):
+                                        targets.extend(
+                                            path for path in section.get("target_files", [])
+                                            if isinstance(path, str))
+                        attributable = attribution_paths(
+                            attributable_changed_paths or [],
+                            generated_roots=[_safe_relative(
+                                f"{session['declaration'].get('generated_root', 'validation/context')}/{capability}")],
+                            protected_paths=list(targets) + sources)
                         review_package = generate_review_package(
                             root, generated_root=session["declaration"].get(
                                 "generated_root", "validation/context"),
@@ -567,7 +594,7 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                             delta_path=report_path, evidence_index=index_value,
                             evidence_index_path=index_rel, job_context=job_context_value,
                             job_context_path=job_context["job_context_path"], before=before,
-                            after=after, changed_paths=attributable_changed_paths,
+                            after=after, changed_paths=attributable,
                         )
                     except Exception as exc:
                         review_package = {

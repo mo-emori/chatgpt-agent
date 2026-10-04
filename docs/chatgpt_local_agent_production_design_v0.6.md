@@ -1529,6 +1529,16 @@ PRE_ACTOR_INPUTだけを指す。POST_ACTOR側を公開する場合は `post_act
 actor input identityとして扱わない。`actor_input_sha256` / `effective_input_sha256` は実際のstdinと
 preview effective inputの意味を維持し、terminal validationで更新しない。`actor_started=false` の
 `BLOCKED_CONTEXT` はPRE_ACTOR gate evidenceだけを持ち、POST_ACTOR_VALIDATIONを公開しない。
+
+Harness/Local-Agent が生成する infrastructure output は、宣言された
+`<generated_root>/<capability>` 配下に限り、source/target の dirty/change attribution
+集合から除外する。これは `validation/` 等の名前を一律無視する規則ではなく、現在の
+workspace/capability の宣言から導出する明示的な root policy である。生成物自体は git
+snapshot、job log、context manifest/review package から削除せず、監査可能な artifact として
+保持する。宣言 target、source、authority（glob の保守的 literal prefix を含む）が生成 root
+と一致または祖先・子孫関係になる場合は構成曖昧性として fail closed とし、要求された実変更を
+除外で隠さない。生成 root 外の pre-existing dirty target/source と actor change は従来どおり
+attribution および reconciliation の対象である。
 SHADOWではlegacy stdinを維持したまま、preview用PRE identityとterminal POST lineageを分離する。
 
 identityを遡及変更しない。Result Manifestでは `context_activation_configured_mode` がglobal ceiling、

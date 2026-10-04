@@ -210,6 +210,14 @@ v1 / v2は既存producerと保存済みJOBのためのcompatibility protocolと�
 - v2はrequest `prompt_sha256` を受け付けず、Workerがdecoded bytesから生成する。
 - v1 / v2のinvalid inputは従来どおりFail Closedとする。
 
+Protocol v1 request-hash enforcement is a generic Workspace Registry policy.
+Every workspace entry must explicitly declare the boolean
+`protocol_v1_require_prompt_sha256`; a missing or non-boolean declaration is a
+startup configuration error (fail closed). When true, v1 requests without
+`prompt_sha256` are rejected with `PROMPT_SHA256_REQUIRED`. The policy is keyed
+only by registry data, so any workspace can opt into the same integrity check.
+Protocol v2 and v3 semantics are unaffected.
+
 ### 4.3 Notion Instruction Resolver / Acceptance Snapshot（IMPLEMENTED_BASELINE）
 
 v3のInstruction sourceはNotion page内のcode block **ちょうど1個** とする。
@@ -277,12 +285,14 @@ Workspace / Browser等のnon-secret installation固有情報は `config.json` �
   "workspaces": {
     "sandbox": {
       "path": "C:\\dev\\chatgpt-agent\\sandbox",
+      "protocol_v1_require_prompt_sha256": false,
       "git_required": false,
       "allow_skip_git_repo_check": true,
       "artifact_roots": []
     },
     "argus": {
       "path": "C:\\dev\\argus",
+      "protocol_v1_require_prompt_sha256": true,
       "git_required": true,
       "allow_skip_git_repo_check": false,
       "artifact_roots": ["validation/reports", "validation/metrics", "tests"]
@@ -298,6 +308,8 @@ Workspace / Browser等のnon-secret installation固有情報は `config.json` �
 `config.py` はload / validate / Path変換 / environment bindingを担当し、Credentialは
 `.env` / environment variables等の既存secret管理を維持する。Actorの `cwd` は必ずRegistryのpathへ固定する。
 `sandbox` のみ `--skip-git-repo-check` を許可し、`git_required=True` のWorkspaceはActor起動前にgit repositoryであることを確認する。
+既存ARGUS deploymentのv1 request-hash enforcementは上記の明示的な `true` declarationで維持する。
+generic runtimeはworkspace名で分岐しない。新しいworkspaceはimplicit defaultを継承せず、policyを必ず選択して宣言する。
 
 ### 5.2 Actor / Mode Policy
 

@@ -1,11 +1,18 @@
 import base64
 import hashlib
 import json
+from unittest.mock import patch
 
 from job_protocol import (
     JobValidationError,
     parse_job,
 )
+
+
+workspace_policy = patch("job_protocol.WORKSPACES", {
+    "integrity-zone": {"protocol_v1_require_prompt_sha256": True},
+})
+workspace_policy.start()
 
 
 def encode_prompt(prompt: str):
@@ -87,12 +94,12 @@ def expect_failure(
 
 
 # ---------------------------------------
-# 1. Valid: ARGUS + correct SHA
+# 1. Valid: configured policy + correct SHA
 # ---------------------------------------
 
 text, sha = make_job(
     job_id="PROTO-V03-VALID-001",
-    workspace="argus",
+    workspace="integrity-zone",
     prompt=(
         '日本語 Prompt\n'
         'JSON: {"a":"b"}\n'
@@ -102,7 +109,7 @@ text, sha = make_job(
 )
 
 expect_success(
-    "valid argus SHA",
+    "valid configured SHA",
     text,
     sha,
 )
@@ -114,7 +121,7 @@ expect_success(
 
 text, _ = make_job(
     job_id="PROTO-V03-BAD-HASH-001",
-    workspace="argus",
+    workspace="integrity-zone",
     prompt="hash mismatch test",
     prompt_sha256="0" * 64,
 )
@@ -127,18 +134,18 @@ expect_failure(
 
 
 # ---------------------------------------
-# 3. Invalid: ARGUS hash missing
+# 3. Invalid: policy-required hash missing
 # ---------------------------------------
 
 text, _ = make_job(
     job_id="PROTO-V03-NO-HASH-001",
-    workspace="argus",
+    workspace="integrity-zone",
     prompt="missing hash test",
     prompt_sha256=False,
 )
 
 expect_failure(
-    "missing ARGUS SHA",
+    "missing required SHA",
     text,
     "PROMPT_SHA256_REQUIRED",
 )
@@ -150,7 +157,7 @@ expect_failure(
 
 text, _ = make_job(
     job_id="PROTO-V03-BAD-FORMAT-001",
-    workspace="argus",
+    workspace="integrity-zone",
     prompt="bad hash format",
     prompt_sha256="abc",
 )
@@ -168,7 +175,7 @@ expect_failure(
 
 text, sha = make_job(
     job_id="PROTO-V03-TAMPER-001",
-    workspace="argus",
+    workspace="integrity-zone",
     prompt="original prompt",
 )
 
@@ -191,3 +198,4 @@ expect_failure(
 
 print()
 print("ALL JOB PROTOCOL v0.3 TESTS PASSED")
+workspace_policy.stop()

@@ -2,12 +2,14 @@
   "workspaces": {
     "sandbox": {
       "path": "C:\\dev\\chatgpt-agent\\sandbox",
+      "protocol_v1_require_prompt_sha256": false,
       "git_required": false,
       "allow_skip_git_repo_check": true,
       "artifact_roots": []
     },
     "argus": {
       "path": "C:\\dev\\argus",
+      "protocol_v1_require_prompt_sha256": true,
       "git_required": true,
       "allow_skip_git_repo_check": false,
       "review_evidence_root": "validation/evidence/external-review",
@@ -24,6 +26,7 @@
     },
     "local-agent": {
         "path": "C:\\dev\\chatgpt-agent",
+        "protocol_v1_require_prompt_sha256": false,
         "git_required": true,
         "allow_skip_git_repo_check": false,
         "artifact_roots": [

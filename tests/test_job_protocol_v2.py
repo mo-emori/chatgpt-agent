@@ -1,5 +1,6 @@
 import base64
 import hashlib
+from unittest.mock import patch
 
 from job_protocol import (
     JobValidationError,
@@ -66,7 +67,7 @@ def test_v2_valid_without_request_sha():
         "Protocol v2 test\n"
         "日本語テスト\n"
         'JSON: {"a":"b"}\n'
-        r"Path: C:\dev\argus"
+        r"Path: C:\dev\example"
     ).encode("utf-8")
 
     data = make_base_job(
@@ -109,7 +110,7 @@ def test_v2_byte_identity():
     original_bytes = (
         b'line1\n'
         b'JSON: {"x":"y"}\n'
-        b'Path: C:\\dev\\argus\n'
+        b'Path: C:\\dev\\example\n'
         b'URL: https://example.com/a?x=1&y=2\n'
         b'Markdown: *bold* _italic_ `code`\n'
     )
@@ -157,7 +158,7 @@ def test_v2_utf8_round_trip():
         "\n"
         'Quote: "hello"\n'
         "SingleQuote: 'hello'\n"
-        r"Backslash: C:\dev\argus"
+        r"Backslash: C:\dev\example"
         "\n"
         'JSON: {"a":"b"}\n'
         "URL: https://chatgpt.com/c/test\n"
@@ -312,7 +313,7 @@ def test_unknown_protocol():
 # v1 compatibility
 # --------------------------------------------------
 
-def test_v1_valid_argus():
+def test_v1_valid_with_hash_policy():
     prompt_bytes = (
         "v1 compatibility test"
     ).encode("utf-8")
@@ -325,12 +326,13 @@ def test_v1_valid_argus():
         protocol_version="1",
         prompt_bytes=prompt_bytes,
         prompt_sha256=sha,
-        workspace="argus",
+        workspace="integrity-zone",
     )
 
-    job = parse_job(
-        to_json(data)
-    )
+    with patch("job_protocol.WORKSPACES", {
+        "integrity-zone": {"protocol_v1_require_prompt_sha256": True},
+    }):
+        job = parse_job(to_json(data))
 
     assert job.protocol_version == "1"
     assert job.prompt_sha256 == sha
@@ -341,33 +343,46 @@ def test_v1_valid_argus():
     )
 
 
-def test_v1_missing_sha_argus():
+def test_v1_missing_sha_with_hash_policy():
     data = make_base_job(
         protocol_version="1",
         prompt_bytes=b"hello",
-        workspace="argus",
+        workspace="integrity-zone",
     )
 
-    expect_error(
-        data,
-        "PROMPT_SHA256_REQUIRED",
-    )
+    with patch("job_protocol.WORKSPACES", {
+        "integrity-zone": {"protocol_v1_require_prompt_sha256": True},
+    }):
+        expect_error(data, "PROMPT_SHA256_REQUIRED")
 
 
-def test_v1_sha_mismatch_argus():
+def test_v1_sha_mismatch_with_hash_policy():
     data = make_base_job(
         protocol_version="1",
         prompt_bytes=b"Prompt A",
         prompt_sha256=hashlib.sha256(
             b"Prompt B"
         ).hexdigest(),
-        workspace="argus",
+        workspace="integrity-zone",
     )
 
-    expect_error(
-        data,
-        "PROMPT_SHA256_MISMATCH",
+    with patch("job_protocol.WORKSPACES", {
+        "integrity-zone": {"protocol_v1_require_prompt_sha256": True},
+    }):
+        expect_error(data, "PROMPT_SHA256_MISMATCH")
+
+
+def test_v1_unrelated_workspace_can_enable_same_hash_policy():
+    data = make_base_job(
+        protocol_version="1",
+        prompt_bytes=b"policy is workspace-configured",
+        workspace="unrelated-project",
     )
+
+    with patch("job_protocol.WORKSPACES", {
+        "unrelated-project": {"protocol_v1_require_prompt_sha256": True},
+    }):
+        expect_error(data, "PROMPT_SHA256_REQUIRED")
 
 
 # --------------------------------------------------
@@ -383,9 +398,10 @@ TESTS = [
     test_v2_empty_prompt,
     test_v2_invalid_utf8,
     test_unknown_protocol,
-    test_v1_valid_argus,
-    test_v1_missing_sha_argus,
-    test_v1_sha_mismatch_argus,
+    test_v1_valid_with_hash_policy,
+    test_v1_missing_sha_with_hash_policy,
+    test_v1_sha_mismatch_with_hash_policy,
+    test_v1_unrelated_workspace_can_enable_same_hash_policy,
 ]
 
 

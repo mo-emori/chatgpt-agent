@@ -91,17 +91,28 @@ with CONFIG_FILE.open(
 ) as f:
     FILE_CONFIG = json.load(f)
 
-WORKSPACES = {}
+def load_workspaces(file_config):
+    workspaces = {}
 
-for name, cfg in FILE_CONFIG[
-    "workspaces"
-].items():
-    WORKSPACES[name] = {
-        **cfg,
-        "path": Path(
-            cfg["path"]
-        ).resolve(),
-    }
+    for name, cfg in file_config["workspaces"].items():
+        require_prompt_sha256 = cfg.get(
+            "protocol_v1_require_prompt_sha256"
+        )
+        if not isinstance(require_prompt_sha256, bool):
+            raise ValueError(
+                "workspace "
+                f"{name!r} must declare boolean "
+                "protocol_v1_require_prompt_sha256"
+            )
+        workspaces[name] = {
+            **cfg,
+            "path": Path(cfg["path"]).resolve(),
+        }
+
+    return workspaces
+
+
+WORKSPACES = load_workspaces(FILE_CONFIG)
 
 BROWSER_CONFIG = FILE_CONFIG[
     "browser"

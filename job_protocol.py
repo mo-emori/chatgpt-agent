@@ -68,7 +68,7 @@ class Job:
     callback_url: str | None = None
 
 
-def decode_and_verify_prompt(data):
+def decode_and_verify_prompt(data, *, require_prompt_sha256):
     encoding = data.get(
         "prompt_encoding",
         "plain",
@@ -107,15 +107,10 @@ def decode_and_verify_prompt(data):
         "prompt_sha256"
     )
 
-    workspace = data.get(
-        "workspace"
-)
-
-    if workspace == "argus":
-        if not expected_hash:
-            raise JobValidationError(
-                "PROMPT_SHA256_REQUIRED"
-            )
+    if require_prompt_sha256 and not expected_hash:
+        raise JobValidationError(
+            "PROMPT_SHA256_REQUIRED"
+        )
 
     if expected_hash is not None:
         if not SHA256_RE.fullmatch(
@@ -305,7 +300,12 @@ def parse_job(text: str) -> Job:
     if protocol_version == "1":
         # 現行処理をそのまま維持
         try:
-            prompt, verified_hash = decode_and_verify_prompt(data)
+            prompt, verified_hash = decode_and_verify_prompt(
+                data,
+                require_prompt_sha256=WORKSPACES[data["workspace"]][
+                    "protocol_v1_require_prompt_sha256"
+                ],
+            )
         except JobValidationError as e:
             reject(str(e))
 

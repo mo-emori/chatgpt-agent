@@ -265,6 +265,7 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
               "declared_max_text_bytes": declared_budget,
               "requested_max_text_bytes": requested_budget,
               "effective_max_text_bytes": effective_budget,
+              "budget_status": body["budget_status"],
               "budget_source": budget_source,
               "required_payload_bytes": required_payload_bytes,
               "over_budget_bytes": over_budget_bytes,
@@ -274,6 +275,9 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
               "selected_section_count": body["measurement"]["selected_section_count"],
               "selected_section_ids": body["measurement"]["selected_section_ids"],
               "section_coverage": body["measurement"]["section_coverage"],
+              "projection_freshness": body["projection_freshness"],
+              "projection_update_required": body["projection_update_required"],
+              "raw_provenance_payload_bytes": body["raw_provenance_payload_bytes"],
               "reason": budget_reason,
               "diagnostics": diagnostics}
     return result, report

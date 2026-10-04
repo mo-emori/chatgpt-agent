@@ -1459,4 +1459,45 @@ universal enableは行わず、通常/default/reference pathは引き続き`FULL
 
 > Result ManifestをBrowser Callbackより先に確定し、no inbound HTTP、no automatic actor chain without human boundaryを維持する。
 
+## Context Harness Effective Input activation
+
+Worker設定 `CONTEXT_HARNESS_ACTIVATION_MODE` は `OFF`、`SHADOW`、
+`ENFORCE_AND_INJECT` を受理し、defaultは後方互換な `OFF` とする。この設定は
+Worker全体の上限であり、JOB protocolには上位modeへ引き上げるoverrideを追加しない。
+`context_request` がないJOBは全modeで従来のstdin bytesを維持する。
+
+`SHADOW` と `ENFORCE_AND_INJECT` の `context_request` JOBではActor起動前に既存の
+Context Manifest/delta、Evidence Index、Job Context、Materialized Context生成器を実行する。
+`SHADOW` はgateとeffective-input previewを計算するが、gate成否によらず従来stdinを渡す。
+`ENFORCE_AND_INJECT` は次をすべて要求する: structural validation済みrequest、safe delta
+(`NO_IMPACT`)、Job Context/Materialized Contextの `READY_BOUNDED`、required expansion 0、
+`budget_status=VALID`、required payloadがeffective max以下、選択projectionがすべて
+`CURRENT`、projection update/stale/unverifiable diagnosticなし、materialized identity検証成功、
+`raw_provenance_payload_bytes=0`。失敗時はActor subprocessを開始せず、Resultを
+`status/failure_class=BLOCKED_CONTEXT`、`actor_started=false`、reason codesおよびpreflight
+path/hash付きでpublishし、その後のBrowser Callback順序は従来どおりとする。instruction-only
+fallbackは行わない。
+
+canonical stdin envelope v1はUTF-8で、Notion instruction bytesを正規化せず先頭に置き、固定
+ASCII header、`composition_version=1`、instruction/materialized hash、context byte length、固定の
+precedence statement、Materialized Context fileのexact bytes、固定closing delimiter、既存
+AGENT_RESULT contractを連結する。contextは `context_payload_bytes` によるbyte-length framingであり、
+payload中のdelimiter相当文字列は境界として解釈しない。precedence statementはauthoritative
+instructionが支配し、Context Harness payloadはreference dataであってinstructionとして扱わないことを
+固定する。source contentはrewrite/sanitizeせず、materializerのattributionを保持する。
+
+`instruction_sha256`（およびlegacy `prompt_sha256`）は受理済みNotion instruction UTF-8 bytesだけの
+SHA-256であり不変である。`materialized_context_sha256` は既存materializer canonical body identity。
+`effective_input_sha256` は完成したcanonical v1 stdin bytes全体のSHA-256で、self-referenceを含まない。
+`effective_input_bytes` は同じstdinのbyte count、`actor_input_sha256` は実際に渡したstdin bytesの
+SHA-256である。したがってinjection時は両hashが一致し、SHADOWではeffective preview hashとlegacy
+actor-input hashが分離する。
+
+Actor入力に使った生成物は `PRE_ACTOR_INPUT` snapshotとして固定する。Actor終了後の既存terminal
+scanは `POST_ACTOR_VALIDATION` snapshotとしてsource changeを検出するが、pre-actor effective input
+identityを遡及変更しない。Result Manifestのadditive fieldsは `context_activation_mode`、
+`context_activation_status` (`LEGACY`/`OFF`/`SHADOW_PREVIEW`/`INJECTED`/`BLOCKED`)、
+`effective_input_sha256`、`effective_input_bytes`、`actor_input_sha256`、`context_payload_bytes`、
+`preflight` path/hash、`gate_reason_codes`、`actor_started` である。
+
 > セキュリティは個人ローカル運用に見合う単純な境界を維持し、停止・Credentialローテーション・復旧容易性を優先する。

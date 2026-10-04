@@ -19,7 +19,7 @@ from actors.process_runner import ProcessResult
 from actors.review_workspace import (
     ReviewPreparationError, cleanup_review, create_review_workspace, diff_head_stat, finish_review,
 )
-from config import HOSTNAME
+from config import HOSTNAME, CONTEXT_HARNESS_ACTIVATION_MODE
 from job_protocol import (
     Job,
     JobValidationError,
@@ -72,6 +72,7 @@ from notion_client import (
 from operational_logging import configure_logging, emit_lifecycle
 from single_instance import SingleInstanceAlreadyRunning, WorkerInstanceGuard
 from context_harness import begin_shadow, finish_shadow, refresh_evidence_index
+from context_activation import has_context_request, prepare as prepare_context_activation
 
 logger = logging.getLogger(__name__)
 _execution_context = threading.local()
@@ -698,6 +699,7 @@ def build_result(
     runtime=None,
     runtime_diagnostics=None,
     context=None,
+    context_activation=None,
 ):
     response = {
         "protocol_version": job.protocol_version,
@@ -727,6 +729,13 @@ def build_result(
             response["materialized_context"] = context["materialized_context"]
         if context.get("review_package") is not None:
             response["review_package"] = context["review_package"]
+    if context_activation is not None:
+        for key in ("context_activation_mode", "context_activation_status",
+                    "effective_input_sha256", "effective_input_bytes",
+                    "actor_input_sha256", "context_payload_bytes",
+                    "gate_reason_codes", "actor_started"):
+            response[key] = context_activation.get(key)
+        response["preflight"] = context_activation.get("preflight")
     if artifact_result is not None:
         (
             summary,
@@ -814,6 +823,7 @@ def handle_execution_failure(
     error_summary=None,
     exception=None,
     context=None,
+    context_activation=None,
 ):
     runtime_diagnostic = None
     if isinstance(exception, FileNotFoundError):
@@ -831,6 +841,7 @@ def handle_execution_failure(
         error_summary=error_summary,
         runtime_diagnostics=runtime_diagnostic,
         context=context,
+        context_activation=context_activation,
     )
     publish_slack_result(log_dir, say, response)
     finalize_browser_callback(
@@ -868,10 +879,44 @@ def execute_job(job, say):
         evidence_roots=_evidence_roots(workspace),
         job=job,
     )
+    activation = None
 
     try:
+        preflight_context = None
+        if (CONTEXT_HARNESS_ACTIVATION_MODE != "OFF" and
+                has_context_request(job)):
+            preflight_context = finish_shadow(
+                workdir, context_session, job_id=job.job_id, before=before, after=before,
+                attributable_changed_paths=[])
+            # Retain the immutable input snapshot separately from the terminal scan.
+            if context_session is not None:
+                context_session["pre_actor_input"] = preflight_context
+        # Some internal legacy test/maintenance jobs predate resolved prompt storage.
+        # Real accepted jobs always carry prompt; keep those helpers backward compatible.
+        if hasattr(job, "prompt"):
+            activation = prepare_context_activation(
+                job, CONTEXT_HARNESS_ACTIVATION_MODE, preflight_context, workdir)
+        if activation is not None and activation["context_activation_status"] == "BLOCKED":
+            status = "BLOCKED_CONTEXT"
+            context = preflight_context
+            state_store.mark_completed(
+                job.job_id, status="FAILED", failure_class="BLOCKED_CONTEXT")
+            response = build_result(
+                job, status="BLOCKED_CONTEXT", failure_class="BLOCKED_CONTEXT",
+                context=context, context_activation=activation)
+            publish_slack_result(log_dir, say, response)
+            finalize_browser_callback(
+                job, log_dir, response, status="BLOCKED_CONTEXT",
+                artifact_status="NOT_RUN", failure_class="BLOCKED_CONTEXT")
+            return
         logger.info("ACTOR START: job_id=%s actor=%s", job.job_id, job.actor)
-        result = run_agent(job)
+        if activation is not None:
+            activation["actor_started"] = True
+        if activation is not None and activation["context_activation_status"] == "INJECTED":
+            result = run_agent(
+                job, prompt=activation["actor_input"].decode("utf-8"), precomposed=True)
+        else:
+            result = run_agent(job)
 
         exit_code = result.returncode
         logger.info(
@@ -922,6 +967,7 @@ def execute_job(job, say):
                 runtime=collect_runtime_evidence(job.actor, result),
                 runtime_diagnostics=runtime_diagnostic,
                 context=context,
+                context_activation=activation,
             )
             publish_slack_result(log_dir, say, response)
             finalize_browser_callback(
@@ -985,6 +1031,7 @@ def execute_job(job, say):
             ),
             runtime=collect_runtime_evidence(job.actor, result),
             context=context,
+            context_activation=activation,
         )
         publish_slack_result(log_dir, say, response)
         finalize_browser_callback(
@@ -1003,6 +1050,8 @@ def execute_job(job, say):
                             artifact_status="NOT_RUN")
         if context is not None:
             failure_args["context"] = context
+        if activation is not None:
+            failure_args["context_activation"] = activation
         handle_execution_failure(job, say, log_dir, **failure_args)
 
     except Exception as e:
@@ -1015,6 +1064,8 @@ def execute_job(job, say):
             artifact_status="UNKNOWN", error_summary=str(e)[:4000], exception=e)
         if context is not None:
             failure_args["context"] = context
+        if activation is not None:
+            failure_args["context_activation"] = activation
         handle_execution_failure(job, say, log_dir, **failure_args)
 
         logger.exception("BRIDGE ERROR: job_id=%s", job.job_id)

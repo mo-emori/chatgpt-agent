@@ -15,14 +15,14 @@ from actors.process_runner import (
     validate_workspace,
 )
 
-def run(job):
+def run(job, *, prompt=None, precomposed=False):
     config = WORKSPACES[job.workspace]
     validate_workspace(config)
 
     workdir = config["path"]
 
-    prompt = append_manifest_instruction(
-        job.prompt
+    prompt = prompt if precomposed else append_manifest_instruction(
+        job.prompt if prompt is None else prompt
     )
 
     args = [

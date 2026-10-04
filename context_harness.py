@@ -586,7 +586,7 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                     "package_reused": True, "package_regenerated": False,
                     "diagnostic_only": False,
                 }
-        return {"mode": "SHADOW", "capability": capability,
+        result = {"mode": "SHADOW", "capability": capability,
                 "manifest_sha256": current["lifecycle"]["manifest_sha256"],
                 "previous_manifest_sha256": current["lifecycle"]["previous_context_hash"],
                 "delta_status": report["delta_status"],
@@ -596,6 +596,22 @@ def finish_shadow(root: str | Path, session: dict | None, *, job_id: str,
                 "evidence_index": evidence_index, "job_context": job_context,
                 "materialized_context": materialized_context,
                 "review_package": review_package}
+        if session.get("pre_actor_input") is not None:
+            prior = session["pre_actor_input"]
+            result["snapshots"] = {
+                "pre_actor_input": {
+                    "manifest_sha256": prior.get("manifest_sha256"),
+                    "job_context_sha256": (prior.get("job_context") or {}).get("sha256"),
+                    "materialized_context_sha256": (
+                        prior.get("materialized_context") or {}).get(
+                            "materialized_context_sha256"),
+                },
+                "post_actor_validation": {
+                    "manifest_sha256": result.get("manifest_sha256"),
+                    "delta_status": result.get("delta_status"),
+                },
+            }
+        return result
     except Exception as exc:
         return {"mode": "SHADOW", "capability": capability,
                 "manifest_sha256": None, "previous_manifest_sha256": None,

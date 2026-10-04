@@ -670,7 +670,29 @@ authorityであり、既知のsilent omissionはない。現行ARGUS declaration
 追加し、missing/ambiguous requestを解消するenrichmentと承認が必要である。Phase 2B/2Cはいずれも引き続き
 `COMPARISON_ONLY` で、actor input activationは行わない。
 
-#### 7.7.1 Authoritative section slicing v1（IMPLEMENTED_COMPARISON_ONLY）
+#### 7.7.1 Projection-first materialization roles（IMPLEMENTED_COMPARISON_ONLY）
+
+source declarationは省略時互換の `source_role: MATERIALIZED_CONTEXT` に加え、
+`STRUCTURED_PROJECTION` と `PROVENANCE_SOURCE` を持てる。`PROVENANCE_SOURCE` はPhase 1でpath/hash/changeを
+監視し、Job Context identityとreconciliationへ参加するupstream provenanceであるが、Phase 2Bのmaterializable refs、
+Phase 2C payload、byte budgetには入らない。normal jobにおける `raw_provenance_payload_bytes` は常に0であり、raw sourceを
+projectionのfallbackとして展開してはならない。Contract、Registry、ADR等のrole未指定sourceは従来どおり扱う。
+
+`STRUCTURED_PROJECTION` は通常の `context_items` / `target_files` / `always_required` / `depends_on` とsection contractで
+選択されるnormal design contextである。`projection_provenance` は一つ以上の
+`{source_ref, expected_sha256}`（または将来の外部version validator用 `expected_version`）linkを表し、upstreamは同じcapabilityに
+`PROVENANCE_SOURCE` として宣言する。Job Contextはprojection path/hash、upstream path/current hash、expected hash/version、
+freshness、選択section offset/hashをidentityへbindする。hash一致は `CURRENT`、不一致は `PROJECTION_STALE`、hash/versionから
+freshnessを確定できない場合は `PROJECTION_PROVENANCE_UNVERIFIABLE` としてfail closedする。
+
+projection declarationまたはそのsection mappingがrequestの `context_items` / `target_files` をcoverしない場合、Job Contextは
+`PROJECTION_UPDATE_REQUIRED` とexact missing items/targetsおよびsection coverage gapを返す。orchestrationは対応するstructured
+recordをupdate/appendし、provenance hashを更新してからnormal jobをretryする。Phase 2Cはこの3状態でmaterialized itemsを空にし、
+raw sourceを自動materializeしない。projection生成・保守capabilityが将来明示的に宣言されるまでraw contentを使用するupdate workflowは
+予約扱いである。Phase 2DのUTF-8 payload byte budget、exact-fit/one-byte-over規則、supplied `DELTA_REVIEW` bypass、actor prompt非接続は
+変更しない。
+
+#### 7.7.2 Authoritative section slicing v1（IMPLEMENTED_COMPARISON_ONLY）
 
 Phase 2B.1がauthoritative source全体を選択した後に限り、v1 section slicerはそのsource内の宣言済みoriginal-byte rangeへ
 第二段階のrefinementを行える。これは独立authorityの生成ではない。親source pathと親raw SHA-256がauthority identityであり、

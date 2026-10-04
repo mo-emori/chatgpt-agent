@@ -22,6 +22,7 @@ SCHEMA_VERSION = 1
 BUILDER_VERSION = "context-harness-phase1-1"
 DECLARATION = Path(".agent/context.json")
 STATES = ("NO_IMPACT", "CONTEXT_UPDATE", "POTENTIAL_AUTHORITY_CHANGE", "UNVERIFIABLE")
+SOURCE_ROLES = ("MATERIALIZED_CONTEXT", "STRUCTURED_PROJECTION", "PROVENANCE_SOURCE")
 
 
 def _canonical(value) -> bytes:
@@ -109,6 +110,27 @@ def _validate_source_mappings(config: dict, capability: str = "") -> None:
         authority = spec.get("authority", "authoritative")
         if authority not in ("authoritative", "non_authority", "observed"):
             raise ValueError(f"invalid authority class: {ref}")
+        role = spec.get("source_role", "MATERIALIZED_CONTEXT")
+        if role not in SOURCE_ROLES:
+            raise ValueError(f"invalid source_role: {ref}")
+        provenance = spec.get("projection_provenance")
+        if role == "STRUCTURED_PROJECTION":
+            if provenance is not None and not isinstance(provenance, list):
+                raise ValueError(f"projection_provenance must be a list: {ref}")
+            for link in provenance or []:
+                if not isinstance(link, dict) or not isinstance(link.get("source_ref"), str):
+                    raise ValueError(f"invalid projection provenance link: {ref}")
+                _safe_relative(link["source_ref"])
+                expected = link.get("expected_sha256")
+                version = link.get("expected_version")
+                if expected is None and version is None:
+                    raise ValueError(f"projection provenance hash or version required: {ref}")
+                if expected is not None and (not isinstance(expected, str) or len(expected) != 64):
+                    raise ValueError(f"invalid projection provenance hash: {ref}")
+                if version is not None and (not isinstance(version, str) or not version):
+                    raise ValueError(f"invalid projection provenance version: {ref}")
+        elif provenance is not None:
+            raise ValueError(f"projection_provenance only allowed for structured projection: {ref}")
         if "always_required" in spec and not isinstance(spec["always_required"], bool):
             raise ValueError(f"always_required must be boolean: {ref}")
         for field in ("context_items", "target_files", "depends_on"):
@@ -123,6 +145,8 @@ def _validate_source_mappings(config: dict, capability: str = "") -> None:
             raise ValueError(f"conditional authority requires a stable path reference: {ref}")
         validate_section_contract(spec, ref)
     known = set(refs)
+    roles = {ref: spec.get("source_role", "MATERIALIZED_CONTEXT")
+             for spec, ref in zip(sources, refs)}
     referenced = set()
     for spec, ref in zip(sources, refs):
         for dependency in spec.get("depends_on", []):
@@ -131,6 +155,10 @@ def _validate_source_mappings(config: dict, capability: str = "") -> None:
             if normalized not in known:
                 raise ValueError(f"unknown source dependency: {ref}->{normalized}")
             referenced.add(normalized)
+        for link in spec.get("projection_provenance") or []:
+            upstream = _safe_relative(link["source_ref"])
+            if upstream not in known or roles.get(upstream) != "PROVENANCE_SOURCE":
+                raise ValueError(f"projection upstream must be a declared provenance source: {ref}->{upstream}")
     for spec, ref in zip(sources, refs):
         if (spec.get("authority", "authoritative") == "authoritative" and
                 spec.get("always_required") is False and
@@ -162,7 +190,10 @@ def _file_fact(root: Path, rel: str, spec: dict) -> tuple[dict, str | None]:
                             else False),
         "target_files": sorted(set(spec.get("target_files", []))),
         "depends_on": sorted(set(spec.get("depends_on", []))),
+        "source_role": spec.get("source_role", "MATERIALIZED_CONTEXT"),
     }
+    if spec.get("projection_provenance") is not None:
+        fact["projection_provenance"] = spec["projection_provenance"]
     if spec.get("sections") is not None:
         fact["section_coverage"] = spec.get("section_coverage")
         fact["sections"] = spec["sections"]

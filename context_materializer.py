@@ -76,7 +76,15 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
         package_claimed = material.pop("package_sha256", None)
         if claimed != package_claimed or sha256(canonical(material)) != claimed:
             raise ValueError("Job Context internal hash mismatch")
-        if job_context.get("selection_status") != "READY_BOUNDED":
+        selection_status = job_context.get("selection_status")
+        if selection_status != "READY_BOUNDED":
+            if selection_status in ("PROJECTION_UPDATE_REQUIRED", "PROJECTION_STALE",
+                                    "PROJECTION_PROVENANCE_UNVERIFIABLE"):
+                status = selection_status
+                diagnostics.append({"code": selection_status,
+                    "projection_update_required": job_context.get("projection_update_required"),
+                    "projection_freshness": job_context.get("projection_freshness", [])})
+                raise RuntimeError("PROJECTION_BLOCKED")
             raise ValueError("Job Context is not READY_BOUNDED")
         if job_context.get("workspace") != workspace or job_context.get("capability") != capability:
             raise ValueError("Job Context workspace/capability mismatch")
@@ -200,9 +208,10 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
             omitted.append({"source_ref": ref.get("evidence_path"), "evidence_ref": ref.get("evidence_id"),
                             "known_bytes": None, "reason": "IRRELEVANT_PHASE_2B_OMISSION"})
     except Exception as exc:
-        status, job_raw, index_raw = "UNVERIFIABLE", b"", b""
-        code = "SECTION_PROVENANCE_MISMATCH" if "SECTION_PROVENANCE_MISMATCH" in str(exc) else "MATERIALIZATION_INPUT_UNVERIFIABLE"
-        diagnostics.append({"code": code, "detail": str(exc)[:1000]})
+        if str(exc) != "PROJECTION_BLOCKED":
+            status, job_raw, index_raw = "UNVERIFIABLE", b"", b""
+            code = "SECTION_PROVENANCE_MISMATCH" if "SECTION_PROVENANCE_MISMATCH" in str(exc) else "MATERIALIZATION_INPUT_UNVERIFIABLE"
+            diagnostics.append({"code": code, "detail": str(exc)[:1000]})
         items = []
     counts = {}
     for item in items:
@@ -239,6 +248,11 @@ def build(root: str | Path, *, workspace: str, capability: str, job_context: dic
             "selected_section_count": len(selected_section_ids),
             "selected_section_ids": selected_section_ids,
             "section_coverage": section_coverage},
+        "provenance_source_refs": job_context.get("provenance_source_refs", []),
+        "materializable_source_refs": [x.get("source_ref") for x in job_context.get("authoritative_source_refs", [])],
+        "projection_freshness": job_context.get("projection_freshness", []),
+        "projection_update_required": job_context.get("projection_update_required", {}),
+        "raw_provenance_payload_bytes": 0,
         "diagnostics": diagnostics}
     identity = sha256(canonical(body))
     result = dict(body); result["materialized_context_sha256"] = identity

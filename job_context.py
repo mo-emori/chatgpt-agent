@@ -19,7 +19,10 @@ SCHEMA = "context-harness-job-context"
 SCHEMA_VERSION = 2
 BUILDER_VERSION = "context-harness-phase2b-2"
 MODE = "COMPARISON_ONLY"
-STATUSES = ("READY_BOUNDED", "NEEDS_RECONCILIATION", "UNVERIFIABLE")
+STATUSES = ("READY_BOUNDED", "NEEDS_RECONCILIATION", "UNVERIFIABLE",
+            "PROJECTION_UPDATE_REQUIRED", "PROJECTION_STALE",
+            "PROJECTION_PROVENANCE_UNVERIFIABLE")
+SOURCE_ROLES = ("MATERIALIZED_CONTEXT", "STRUCTURED_PROJECTION", "PROVENANCE_SOURCE")
 RELEVANCE = ("REQUIRED_RELEVANT", "BOUNDED_CANDIDATE", "IRRELEVANT")
 EXPANSION_REQUIREMENTS = ("REQUIRED_BEFORE_REVIEW", "OPTIONAL_BOUNDED", "NONE")
 
@@ -207,6 +210,9 @@ def _selector_contract(config: dict) -> dict:
         authority = spec.get("authority", "authoritative")
         if authority not in ("authoritative", "non_authority", "observed"):
             raise ValueError(f"invalid authority class: {ref}")
+        role = spec.get("source_role", "MATERIALIZED_CONTEXT")
+        if role not in SOURCE_ROLES:
+            raise ValueError(f"invalid source_role: {ref}")
         if "always_required" in spec and not isinstance(spec["always_required"], bool):
             raise ValueError(f"always_required must be boolean: {ref}")
         fields = {}
@@ -219,7 +225,8 @@ def _selector_contract(config: dict) -> dict:
         if conditional and "glob" in spec:
             raise ValueError(f"conditional authority requires a stable path reference: {ref}")
         validate_section_contract(spec, ref)
-        result.append({"source_ref": ref, "authority": authority,
+        result.append({"source_ref": ref, "authority": authority, "source_role": role,
+                       "projection_provenance": spec.get("projection_provenance", []),
                        "always_required": authority == "authoritative" and bool(spec.get("always_required", True)),
                        **fields})
     referenced = set()
@@ -233,6 +240,26 @@ def _selector_contract(config: dict) -> dict:
             normalized.append(dep)
             referenced.add(dep)
         item["depends_on"] = sorted(set(normalized))
+        if item["source_role"] == "STRUCTURED_PROJECTION":
+            links = item["projection_provenance"]
+            if not isinstance(links, list):
+                raise ValueError(f"projection_provenance must be a list: {item['source_ref']}")
+            for link in links:
+                if not isinstance(link, dict) or not isinstance(link.get("source_ref"), str):
+                    raise ValueError(f"invalid projection provenance link: {item['source_ref']}")
+                upstream = safe_relative(link["source_ref"])
+                expected, version = link.get("expected_sha256"), link.get("expected_version")
+                if upstream not in known:
+                    raise ValueError(f"unknown projection upstream: {item['source_ref']}->{upstream}")
+                upstream_item = next(x for x in result if x["source_ref"] == upstream)
+                if upstream_item["source_role"] != "PROVENANCE_SOURCE":
+                    raise ValueError(f"projection upstream is not provenance source: {upstream}")
+                if expected is None and version is None:
+                    raise ValueError(f"projection provenance hash or version required: {item['source_ref']}")
+                if expected is not None and (not isinstance(expected, str) or len(expected) != 64):
+                    raise ValueError(f"invalid projection provenance hash: {item['source_ref']}")
+        elif item["projection_provenance"]:
+            raise ValueError(f"projection_provenance only allowed for structured projection: {item['source_ref']}")
     for item in result:
         if (item["authority"] == "authoritative" and not item["always_required"] and
                 not item["target_files"] and not item["context_items"] and
@@ -288,6 +315,7 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
         selector_contract = {"version": 1, "sources": []}
         unresolved.append({"code": "INVALID_DECLARATION_REFERENCE", "detail": str(exc)[:1000]})
     sources, omitted_sources, dependency_states = [], [], []
+    projection_section_gaps = []
     changed = {x.get("source"): x for x in stored_delta.get("changed_sources", [])}
     target_files = set(request["target_files"])
     wanted_items = set(request["context_items"])
@@ -304,10 +332,12 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
             continue
     conditional_refs = {ref for ref, spec in spec_by_ref.items()
                         if spec.get("authority", "authoritative") == "authoritative"
+                        and spec.get("source_role", "MATERIALIZED_CONTEXT") != "PROVENANCE_SOURCE"
                         and spec.get("always_required") is False}
     selected_reasons: dict[str, set[str]] = {}
     for ref, spec in spec_by_ref.items():
         if (spec.get("authority", "authoritative") == "authoritative" and
+                spec.get("source_role", "MATERIALIZED_CONTEXT") != "PROVENANCE_SOURCE" and
                 spec.get("always_required", True)):
             selected_reasons.setdefault(ref, set()).add("BASE_AUTHORITY")
 
@@ -346,7 +376,8 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
 
     # Authority changes are always required, independently of request selection.
     for ref, spec in spec_by_ref.items():
-        if spec.get("authority", "authoritative") != "authoritative":
+        if (spec.get("authority", "authoritative") != "authoritative" or
+                spec.get("source_role", "MATERIALIZED_CONTEXT") == "PROVENANCE_SOURCE"):
             continue
         declared = spec.get("path")
         if declared in changed:
@@ -386,6 +417,11 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
                     if declared is None and v.get("kind") == spec.get("kind")])
         items = sorted(set(spec.get("context_items", [])))
         authoritative = spec.get("authority", "authoritative") == "authoritative"
+        role = spec.get("source_role", "MATERIALIZED_CONTEXT")
+        if role == "PROVENANCE_SOURCE":
+            omitted_sources.append({"source_ref": declared or spec.get("glob"),
+                                    "reason": "PROVENANCE_SOURCE_NOT_MATERIALIZABLE"})
+            continue
         direct_non_authority = (not authoritative and (bool(wanted_items.intersection(items)) or
             declared in target_files or any(fact.get("path") in target_files for fact in matches)))
         relevant = spec_ref in selected_reasons or direct_non_authority
@@ -394,6 +430,7 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
                 reasons = sorted(selected_reasons.get(spec_ref) or {"EXPLICIT_DEPENDENCY_OR_TARGET"})
                 source_ref = {"source_ref": fact.get("path"), "kind": fact.get("kind"),
                                 "authority": fact.get("authority"), "raw_sha256": fact.get("raw_sha256"),
+                                "source_role": role,
                                 "context_items": fact.get("context_items", []),
                                 "reason": reasons[0], "reason_codes": reasons}
                 if authoritative and spec.get("sections"):
@@ -416,6 +453,11 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
                     })
                     source_ref["avoided_bytes"] = (len(raw) - source_ref["selected_slice_bytes"]
                         if section_result["coverage_status"] == "COMPLETE_MAPPED" else 0)
+                    if role == "STRUCTURED_PROJECTION" and section_result["coverage_status"] != "COMPLETE_MAPPED":
+                        projection_section_gaps.append({"projection_ref": spec_ref,
+                            "coverage_status": section_result["coverage_status"],
+                            "context_items": request["context_items"],
+                            "target_files": request["target_files"]})
                 sources.append(source_ref)
                 for item in fact.get("context_items", []):
                     dependency_states.append({"context_item": item, "source_ref": fact.get("path"),
@@ -495,7 +537,50 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
     if delta_status == "POTENTIAL_AUTHORITY_CHANGE":
         approved_refs = []
 
-    status = ("UNVERIFIABLE" if unresolved and any(x["code"] in
+    projection_specs = {ref: spec for ref, spec in spec_by_ref.items()
+                        if spec.get("source_role") == "STRUCTURED_PROJECTION"}
+    provenance_specs = {ref: spec for ref, spec in spec_by_ref.items()
+                        if spec.get("source_role") == "PROVENANCE_SOURCE"}
+    projection_freshness = []
+    projection_failure = None
+    for ref, spec in sorted(projection_specs.items()):
+        links = spec.get("projection_provenance") or []
+        if not links:
+            projection_freshness.append({"projection_ref": ref, "upstream_source_ref": None,
+                "projection_sha256": observed_by_path.get(ref, {}).get("raw_sha256"),
+                "expected_upstream_sha256": None, "actual_upstream_sha256": None,
+                "expected_version": None, "freshness_status": "UNVERIFIABLE",
+                "upstream_hash_match": None})
+            projection_failure = "PROJECTION_PROVENANCE_UNVERIFIABLE"
+        for link in links:
+            upstream = safe_relative(link["source_ref"])
+            fact = observed_by_path.get(upstream)
+            expected = link.get("expected_sha256")
+            actual = fact.get("raw_sha256") if fact else None
+            freshness = "CURRENT" if expected and actual == expected else (
+                "STALE" if expected and actual else "UNVERIFIABLE")
+            projection_freshness.append({"projection_ref": ref, "upstream_source_ref": upstream,
+                "projection_sha256": observed_by_path.get(ref, {}).get("raw_sha256"),
+                "expected_upstream_sha256": expected, "actual_upstream_sha256": actual,
+                "expected_version": link.get("expected_version"), "freshness_status": freshness,
+                "upstream_hash_match": actual == expected if actual and expected else None})
+            if freshness == "STALE": projection_failure = "PROJECTION_STALE"
+            elif freshness == "UNVERIFIABLE" and projection_failure is None:
+                projection_failure = "PROJECTION_PROVENANCE_UNVERIFIABLE"
+    projection_items = {x for spec in projection_specs.values() for x in spec.get("context_items", [])}
+    projection_targets = {x for spec in projection_specs.values() for x in spec.get("target_files", [])}
+    missing_projection_items = sorted(wanted_items - projection_items) if projection_specs else []
+    missing_projection_targets = sorted(target_files - projection_targets) if projection_specs else []
+    if missing_projection_items or missing_projection_targets or projection_section_gaps:
+        projection_failure = "PROJECTION_UPDATE_REQUIRED"
+        reconciliation.append({"code": projection_failure,
+            "missing_context_items": missing_projection_items,
+            "missing_target_files": missing_projection_targets,
+            "section_coverage_gaps": projection_section_gaps})
+        expansion.append(_expansion(reason=projection_failure, requirement="REQUIRED_BEFORE_REVIEW",
+            authority_class="structured_projection", suggested_scope=sorted(projection_specs)))
+
+    status = (projection_failure if projection_failure else "UNVERIFIABLE" if unresolved and any(x["code"] in
               ("INPUT_UNVERIFIABLE", "DELTA_UNVERIFIABLE", "INVALID_DECLARATION_REFERENCE") for x in unresolved)
               else "NEEDS_RECONCILIATION" if reconciliation or unresolved or any(
                   x["requirement"] == "REQUIRED_BEFORE_REVIEW" for x in expansion)
@@ -532,6 +617,12 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
                 "mode": getattr(job, "mode", None),
                 "instruction_sha256": getattr(job, "prompt_sha256", None)},
         "selection_status": status, "authoritative_source_refs": sources,
+        "provenance_source_refs": [{"source_ref": ref,
+            "raw_sha256": observed_by_path.get(ref, {}).get("raw_sha256"),
+            "kind": spec.get("kind")} for ref, spec in sorted(provenance_specs.items())],
+        "projection_freshness": projection_freshness,
+        "projection_update_required": {"context_items": missing_projection_items,
+                                       "target_files": missing_projection_targets},
         "approved_semantics": approved_refs,
         "dependency_states": sorted(dependency_states, key=lambda x: (x["context_item"], x["source_ref"])),
         "evidence_refs": sorted(evidence_refs, key=lambda x: (x["evidence_id"], x["evidence_path"])),
@@ -582,7 +673,15 @@ def build(root: str | Path, *, workspace: str, capability: str, job,
     body["diagnostics"] = {"required_expansion_count": len(required_expansions),
         "optional_candidate_count": len(optional_candidates),
         "omitted_irrelevant_count": len(omitted_evidence),
-        "expansion_reason_code_counts": dict(sorted(reason_counts.items()))}
+        "expansion_reason_code_counts": dict(sorted(reason_counts.items())),
+        "provenance_source_count": len(provenance_specs),
+        "provenance_source_refs": sorted(provenance_specs),
+        "materializable_source_count": len(sources),
+        "materializable_source_refs": sorted(x["source_ref"] for x in sources),
+        "projection_freshness": projection_freshness,
+        "projection_update_required_context_items": missing_projection_items,
+        "projection_update_required_target_files": missing_projection_targets,
+        "raw_provenance_payload_bytes": 0}
     package_hash = sha256(canonical(body))
     result = dict(body)
     result["package_sha256"] = package_hash
